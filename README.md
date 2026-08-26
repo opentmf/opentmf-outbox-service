@@ -270,6 +270,12 @@ surface):
 Both list endpoints render through the TMF630 toolkit (bare array + count
 headers); an unknown filter field is a strict 400.
 
+The `tmf630-toolkit-all` dependency is **optional, honestly**: without it on
+the classpath the `/ops` controller is not registered at all (a guarded,
+documented absence — never a silently degraded endpoint). A toolkit-less
+consumer keeps the full `OutboxMaintenanceService` API and can wire its own
+endpoints.
+
 ### Seal rule (ArchUnit)
 
 The public contract is the `org.opentmf.outbox` package: `OutboxWriter`,

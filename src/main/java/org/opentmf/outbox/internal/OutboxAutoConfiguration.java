@@ -146,8 +146,23 @@ public class OutboxAutoConfiguration {
         environment.getProperty("spring.application.name", "unknown"));
   }
 
+  /**
+   * The /ops surface requires BOTH spring-web AND tmf630-toolkit-all on the classpath (the
+   * controller's list endpoint is toolkit-rendered). The toolkit dependency is {@code optional},
+   * and this guard is what makes that label honest — and the hazard it prevents is a QUIET one:
+   * absent annotation classes are silently skipped by the JVM, so without the toolkit the
+   * controller would still register and the list endpoint would serve WITHOUT its TMF630
+   * rendering — a silent degradation no log line names. With the guard: no toolkit, no /ops
+   * controller, a clean documented absence. Both conditions are name-based so this
+   * auto-configuration class itself never links either. A toolkit-less consumer keeps the full
+   * {@link org.opentmf.outbox.OutboxMaintenanceService} API and can wire its own endpoints.
+   */
   @Bean
-  @ConditionalOnClass(name = "org.springframework.web.bind.annotation.RestController")
+  @ConditionalOnClass(
+      name = {
+        "org.springframework.web.bind.annotation.RestController",
+        "org.opentmf.query.tmf630.annotation.Tmf630Response"
+      })
   @ConditionalOnProperty(
       name = "opentmf.outbox.ops-endpoints", havingValue = "true", matchIfMissing = true)
   public OutboxOpsController outboxOpsController(OutboxMaintenanceService maintenance) {
