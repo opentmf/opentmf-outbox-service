@@ -19,10 +19,13 @@ they migrate to this at their next touch.
   ahead/behind claim. Central publishing is Gökhan's (namespace verified under
   his Portal account) — the session prepares, he cuts.
 
-## CURRENT TASK — 1.1.0 (ruled 2026-08-26, NOT STARTED)
+## CURRENT TASK — 1.1.0 (ruled 2026-08-26, IMPLEMENTED, awaiting review)
 
-The previous session was lost to a Claude Code crash before its first edit.
-`develop` is clean at the 1.0.0 release commit; nothing partial exists.
+Branch `feature/hold-and-cancel` (local, unpushed — pushes only on Gökhan's
+word) carries the whole block in one commit on top of develop; gate green
+(52 unit + 3 IT, JaCoCo met, Sonar 0 open / gate OK). Ready ping sent to the
+analysis session with the plan-conformance table. Next: its review → Gökhan
+merges + cuts 1.1.0 → BOM 2.1.21.
 
 1.0.0 shipped without two plan-mandated fields. 1.1.0 adds both, **additively**:
 
