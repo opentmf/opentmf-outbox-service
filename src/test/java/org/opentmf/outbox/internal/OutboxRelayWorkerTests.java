@@ -8,6 +8,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import jakarta.persistence.Column;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -114,6 +115,29 @@ class OutboxRelayWorkerTests {
     assertThat(event.getLastError()).isEqualTo("IllegalStateException: bookkeeping refused");
     // the success metric was NOT booked for the failed round
     assertThat(registry.find(OutboxMetrics.RELAYED).counters()).isEmpty();
+  }
+
+  /**
+   * THE named regression for the scheduled-send hold: a delivery failure's backoff reschedules
+   * {@code next_attempt_on} and must NEVER move {@code release_at} - repurposing the hold as
+   * the retry slot would release a scheduled send early on its first failure.
+   */
+  @Test
+  void backoff_neverTouchesTheReleaseHold() throws NoSuchFieldException {
+    OffsetDateTime hold = OffsetDateTime.now().minusSeconds(1); // released, so claimable
+    OutboxEvent event = pending(1L, 0);
+    event.setReleaseAt(hold);
+    when(repository.claimBatch(any(), anyInt(), any(Limit.class))).thenReturn(List.of(event));
+    doThrow(new RuntimeException("broker down")).when(router).publish(event);
+
+    worker.relayBatch();
+
+    assertThat(event.getNextAttemptOn()).isAfter(OffsetDateTime.now()); // backoff booked...
+    assertThat(event.getReleaseAt()).isEqualTo(hold); // ...the hold untouched
+    // and structurally: the mapping itself refuses to UPDATE the column, whatever the code does
+    assertThat(OutboxEvent.class.getDeclaredField("releaseAt").getAnnotation(Column.class))
+        .extracting(Column::updatable)
+        .isEqualTo(false);
   }
 
   @Test

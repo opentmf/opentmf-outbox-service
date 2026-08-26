@@ -69,20 +69,40 @@ public class OutboxWriter {
         aggregateType, aggregateId, eventType, destination, clientProfile, payload, headers);
   }
 
+  /**
+   * The request-shaped append - the ONE entry that says everything, including the
+   * scheduled-send HOLD ({@link OutboxAppend#withReleaseAt}): a row with a future
+   * {@code releaseAt} is not claimable before that instant (null or past = deliverable now).
+   * The positional overloads above are conveniences over this.
+   */
+  @Transactional(propagation = Propagation.MANDATORY)
+  public OutboxEvent append(OutboxAppend request) {
+    return doAppend(request);
+  }
+
   /** Un-annotated on purpose: the overloads delegate here, never to each other (proxy rule). */
   private OutboxEvent doAppend(
       String aggregateType, String aggregateId, String eventType, String destination,
       String clientProfile, Object payload, Map<String, String> headers) {
+    return doAppend(
+        OutboxAppend.of(aggregateType, aggregateId, eventType, destination, payload)
+            .withClientProfile(clientProfile)
+            .withHeaders(headers));
+  }
+
+  private OutboxEvent doAppend(OutboxAppend request) {
     OutboxEvent event = new OutboxEvent();
-    event.setAggregateType(aggregateType);
-    event.setAggregateId(aggregateId);
-    event.setEventType(eventType);
-    event.setDestination(destination);
-    event.setClientProfile(clientProfile);
-    event.setPayload(objectMapper.writeValueAsString(payload));
+    event.setAggregateType(request.aggregateType());
+    event.setAggregateId(request.aggregateId());
+    event.setEventType(request.eventType());
+    event.setDestination(request.destination());
+    event.setClientProfile(request.clientProfile());
+    event.setPayload(objectMapper.writeValueAsString(request.payload()));
+    Map<String, String> headers = request.headers();
     event.setHeaders(headers.isEmpty() ? null : objectMapper.writeValueAsString(headers));
     event.setCreatedOn(OffsetDateTime.now(ZoneOffset.UTC));
     event.setNextAttemptOn(OffsetDateTime.now(ZoneOffset.UTC));
+    event.setReleaseAt(request.releaseAt());
     OutboxEvent saved = repository.save(event);
     eventPublisher.publishEvent(new OutboxAppended(saved.getId()));
     return saved;

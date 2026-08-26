@@ -1,6 +1,7 @@
 package org.opentmf.outbox;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
 import static org.awaitility.Awaitility.await;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -8,6 +9,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.time.Duration;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -22,6 +25,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Bean;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -36,8 +40,10 @@ import org.testcontainers.kafka.KafkaContainer;
 /**
  * The library's contract end to end on the REAL engines (no H2):
  * a business transaction appends through the writer; the relay delivers to Kafka with the
- * headers; the /ops trio serves the TMF630 list + inspect + prune over the same rows. Postgres
- * rides the {@code jdbc:tc:} URL so the REAL library changelog runs.
+ * headers; the /ops surface serves the TMF630 list + inspect + prune + cancel over the same
+ * rows; the claim predicate honours the hold and the cancellation on the REAL query. Postgres
+ * rides the {@code jdbc:tc:} URL so the REAL library changelog (both changesets) runs, and
+ * {@code ddl-auto=validate} proves the entity matches it.
  */
 @Testcontainers
 @AutoConfigureMockMvc
@@ -176,5 +182,80 @@ class OutboxRoundTripIT {
         .perform(post("/ops/outbox/maintenance/prune"))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.outboxRowsPruned").isNumber());
+  }
+
+  /**
+   * The two claim-predicate properties on the real query: a HELD row is not claimed before
+   * its {@code release_at} and IS claimed after; a CANCELLED row is never claimed - and the
+   * cancel guard refuses a relayed row.
+   */
+  @Test
+  void aHeldRow_relaysOnlyAfterItsHold_andACancelledRow_never() throws Exception {
+    String topic = "it-hold-" + UUID.randomUUID();
+    OffsetDateTime hold = OffsetDateTime.now(ZoneOffset.UTC).plusSeconds(4);
+    OutboxEvent held =
+        tx.execute(
+            status ->
+                writer.append(
+                    OutboxAppend.of("it-aggregate", "a-held", "it.event.v1", topic, Map.of())
+                        .withReleaseAt(hold)));
+    // the row to cancel carries a SHORT hold (the scheduled-send-then-withdraw use case): an
+    // unheld row races the after-commit nudge, and the cancel guard would rightly refuse it
+    OffsetDateTime shortHold = OffsetDateTime.now(ZoneOffset.UTC).plusSeconds(2);
+    OutboxEvent toCancel =
+        tx.execute(
+            status ->
+                writer.append(
+                    OutboxAppend.of("it-aggregate", "a-cancel", "it.event.v1", topic, Map.of())
+                        .withReleaseAt(shortHold)));
+    OutboxEvent plain =
+        tx.execute(
+            status -> writer.append("it-aggregate", "a-plain", "it.event.v1", topic, Map.of()));
+
+    // cancel over the wire while the row is held
+    mockMvc
+        .perform(post("/ops/outbox/{id}/cancel", toCancel.getId()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.action").value("cancelled"));
+
+    // the plain row relays; at that moment the held row is still pending (hold not passed)
+    await()
+        .atMost(Duration.ofSeconds(10))
+        .untilAsserted(
+            () -> assertThat(maintenance.inspect(plain.getId()).relayedOn()).isNotNull());
+    OutboxRowView heldView = maintenance.inspect(held.getId());
+    assertThat(heldView.releaseAt()).isNotNull();
+    if (OffsetDateTime.now(ZoneOffset.UTC).isBefore(hold)) {
+      assertThat(heldView.relayedOn()).isNull();
+    }
+
+    // the hold passes: the SAME row relays with the hold untouched
+    await()
+        .atMost(Duration.ofSeconds(20))
+        .untilAsserted(
+            () -> assertThat(maintenance.inspect(held.getId()).relayedOn()).isNotNull());
+    assertThat(maintenance.inspect(held.getId()).relayedOn()).isAfterOrEqualTo(hold);
+    assertThat(maintenance.inspect(held.getId()).releaseAt()).isEqualTo(heldView.releaseAt());
+
+    // the cancelled row's own hold has long passed (the 4s hold above was awaited) - and it
+    // still never relayed: cancellation, not the hold, kept it out of the claim
+    OutboxRowView cancelledView = maintenance.inspect(toCancel.getId());
+    assertThat(cancelledView.relayedOn()).isNull();
+    assertThat(cancelledView.cancelledOn()).isNotNull();
+    assertThat(
+            maintenance
+                .list(null, OutboxStateFilter.CANCELLED, PageRequest.of(0, 50))
+                .map(OutboxRowView::id))
+        .contains(toCancel.getId());
+    assertThat(
+            maintenance
+                .list(null, OutboxStateFilter.PENDING, PageRequest.of(0, 50))
+                .map(OutboxRowView::id))
+        .doesNotContain(toCancel.getId(), held.getId(), plain.getId());
+
+    // the guard: a relayed effect has left - it cannot be cancelled
+    assertThatIllegalStateException()
+        .isThrownBy(() -> maintenance.cancel(plain.getId()))
+        .withMessageContaining("already relayed");
   }
 }

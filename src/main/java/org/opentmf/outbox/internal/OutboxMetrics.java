@@ -13,9 +13,11 @@ import org.opentmf.outbox.OutboxProperties;
  * common tags / scrape identity, never by a per-service metric prefix):
  *
  * <ul>
- *   <li>{@code opentmf.outbox.pending} - gauge, rows not yet relayed
+ *   <li>{@code opentmf.outbox.pending} - gauge, rows not yet relayed nor cancelled (held rows
+ *       included)
  *   <li>{@code opentmf.outbox.parked} - gauge, alert when above 0
- *   <li>{@code opentmf.outbox.relay-lag} - gauge, age of the oldest pending row (seconds)
+ *   <li>{@code opentmf.outbox.relay-lag} - gauge, how long the oldest RELEASED pending row has
+ *       been deliverable (seconds) - a held row is not lagging until its hold passes
  *   <li>{@code opentmf.outbox.relayed} - counter by {@code destination} (closed tag set)
  *   <li>{@code opentmf.outbox.attempts} - summary, delivery attempts a relayed row took
  * </ul>
@@ -36,18 +38,21 @@ class OutboxMetrics {
       MeterRegistry registry, OutboxEventRepository repository, OutboxProperties properties) {
     this.registry = registry;
     this.repository = repository;
-    Gauge.builder(PENDING, repository, OutboxEventRepository::countByRelayedOnIsNull)
-        .description("Outbox rows not yet relayed (pending = relayed_on is null)")
+    Gauge.builder(
+            PENDING, repository, OutboxEventRepository::countByRelayedOnIsNullAndCancelledOnIsNull)
+        .description("Outbox rows not yet relayed nor cancelled (pending)")
         .register(registry);
     Gauge.builder(
             PARKED,
             repository,
-            r -> r.countByRelayedOnIsNullAndAttemptsGreaterThanEqual(properties.getMaxAttempts()))
+            r ->
+                r.countByRelayedOnIsNullAndCancelledOnIsNullAndAttemptsGreaterThanEqual(
+                    properties.getMaxAttempts()))
         .description("Outbox rows parked at max-attempts - alert when > 0")
         .register(registry);
     Gauge.builder(RELAY_LAG, this, OutboxMetrics::relayLagSeconds)
         .baseUnit("seconds")
-        .description("Age of the oldest pending outbox row")
+        .description("How long the oldest released pending outbox row has been deliverable")
         .register(registry);
   }
 
@@ -58,9 +63,10 @@ class OutboxMetrics {
   }
 
   double relayLagSeconds() {
+    OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
     return repository
-        .findOldestPendingCreatedOn()
-        .map(o -> Math.max(0d, Duration.between(o, OffsetDateTime.now(ZoneOffset.UTC)).toMillis() / 1000d))
+        .findOldestPendingSince(now)
+        .map(since -> Math.max(0d, Duration.between(since, now).toMillis() / 1000d))
         .orElse(0d);
   }
 }
