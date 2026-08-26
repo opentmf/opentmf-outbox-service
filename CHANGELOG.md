@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.0 (unreleased)
+## 1.1.0 - 2026-08-27
 
 Additive — a 1.0.0 consumer upgrades with zero changes; the included changelog
 applies changeset `002-outbox-hold-and-cancel` (two nullable columns) on the
