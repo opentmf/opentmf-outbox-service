@@ -1,6 +1,8 @@
 --liquibase formatted sql
 
 --changeset opentmf-outbox:001-outbox
+--preconditions onFail:HALT onError:HALT onFailMessage:PostgreSQL is the shipped DDL dialect of opentmf-outbox-service; this changelog must not run against another engine. For other databases see the README (a per-dialect changelog is the extension path). onErrorMessage:PostgreSQL is the shipped DDL dialect of opentmf-outbox-service (the dialect probe errored - this is not a PostgreSQL database). For other databases see the README (a per-dialect changelog is the extension path).
+--precondition-sql-check expectedResult:1 SELECT CASE WHEN current_setting('server_version_num') IS NOT NULL THEN 1 ELSE 0 END
 -- Transactional outbox — the LIBRARY-OWNED table (opentmf-outbox-service). One per owning
 -- service's schema: the
 -- business transaction writes its state change AND one row here in the same local transaction;
