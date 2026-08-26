@@ -13,6 +13,7 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxProperties;
+import org.opentmf.outbox.OutboxRelayedListener;
 import org.springframework.data.domain.Limit;
 
 /** Success stamps relayed_on; failure books attempts+backoff; park at max-attempts. */
@@ -22,13 +23,15 @@ class OutboxRelayWorkerTests {
   private final OutboxPublisherRouter router = mock(OutboxPublisherRouter.class);
   private final OutboxProperties properties = new OutboxProperties();
   private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
+  private final List<OutboxRelayedListener> listeners = new java.util.ArrayList<>();
   private final OutboxRelayWorker worker =
       new OutboxRelayWorker(
           repository,
           router,
           new OutboxBackoff(properties),
           new OutboxMetrics(registry, repository, properties),
-          properties);
+          properties,
+          listeners);
 
   private static OutboxEvent pending(long id, int attempts) {
     OutboxEvent event = new OutboxEvent();
@@ -75,6 +78,41 @@ class OutboxRelayWorkerTests {
     assertThat(failing.getLastError()).isEqualTo("RuntimeException: broker down");
     assertThat(failing.getNextAttemptOn()).isAfter(OffsetDateTime.now());
     assertThat(fine.getRelayedOn()).isNotNull();
+  }
+
+  @Test
+  void relayedListeners_runInsideTheSuccessPath_withTheStampVisible() {
+    OutboxEvent event = pending(1L, 0);
+    when(repository.claimBatch(any(), anyInt(), any(Limit.class))).thenReturn(List.of(event));
+    List<Object> seenRelayedOn = new java.util.ArrayList<>();
+    listeners.add(e -> seenRelayedOn.add(e.getRelayedOn()));
+
+    worker.relayBatch();
+
+    // the listener saw relayedOn ALREADY SET - the atomic-with-the-stamp contract
+    assertThat(seenRelayedOn).hasSize(1);
+    assertThat(seenRelayedOn.get(0)).isNotNull();
+    assertThat(event.getRelayedOn()).isNotNull();
+  }
+
+  @Test
+  void aThrowingListener_undoesTheStamp_andBooksAnOrdinaryFailure() {
+    OutboxEvent event = pending(1L, 0);
+    when(repository.claimBatch(any(), anyInt(), any(Limit.class))).thenReturn(List.of(event));
+    listeners.add(
+        e -> {
+          throw new IllegalStateException("bookkeeping refused");
+        });
+
+    worker.relayBatch();
+
+    // NOT relayed-with-attempts++ nonsense: the stamp is undone, the failure books normally
+    // and the publish will repeat (at-least-once - the destination dedups on the key)
+    assertThat(event.getRelayedOn()).isNull();
+    assertThat(event.getAttempts()).isEqualTo(1);
+    assertThat(event.getLastError()).isEqualTo("IllegalStateException: bookkeeping refused");
+    // the success metric was NOT booked for the failed round
+    assertThat(registry.find(OutboxMetrics.RELAYED).counters()).isEmpty();
   }
 
   @Test

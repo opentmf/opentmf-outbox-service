@@ -7,6 +7,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxProperties;
+import org.opentmf.outbox.OutboxRelayedListener;
 import org.springframework.data.domain.Limit;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -34,6 +35,7 @@ class OutboxRelayWorker {
   private final OutboxBackoff backoff;
   private final OutboxMetrics metrics;
   private final OutboxProperties properties;
+  private final List<OutboxRelayedListener> relayedListeners;
 
   /**
    * Claims and relays one batch.
@@ -61,8 +63,16 @@ class OutboxRelayWorker {
     try {
       router.publish(event);
       event.setRelayedOn(OffsetDateTime.now(ZoneOffset.UTC));
+      // the post-relay seam (OutboxRelayedListener): consumer bookkeeping stamped in the SAME
+      // claim transaction, with relayedOn already set. A throwing listener falls through to
+      // the ordinary failure path below - which must then UNDO the stamp, or the row would
+      // commit as relayed-with-attempts++ nonsense.
+      for (OutboxRelayedListener listener : relayedListeners) {
+        listener.onRelayed(event);
+      }
       metrics.recordRelayed(event.getDestination(), event.getAttempts() + 1);
     } catch (RuntimeException ex) {
+      event.setRelayedOn(null); // a listener may have failed AFTER the stamp - the row retries
       registerFailure(event, ex);
     }
   }

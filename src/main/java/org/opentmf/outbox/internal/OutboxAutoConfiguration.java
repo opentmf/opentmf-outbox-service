@@ -7,6 +7,7 @@ import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxMaintenanceService;
 import org.opentmf.outbox.OutboxProperties;
 import org.opentmf.outbox.OutboxPublisher;
+import org.opentmf.outbox.OutboxRelayedListener;
 import org.opentmf.outbox.OutboxWriter;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
@@ -86,8 +87,13 @@ public class OutboxAutoConfiguration {
       OutboxPublisherRouter router,
       OutboxBackoff backoff,
       OutboxMetrics metrics,
-      OutboxProperties properties) {
-    return new OutboxRelayWorker(repository, router, backoff, metrics, properties);
+      OutboxProperties properties,
+      ObjectProvider<OutboxRelayedListener> relayedListeners) {
+    // the post-relay seam: zero or more consumer beans, invoked in bean order inside the
+    // claim transaction (see OutboxRelayedListener)
+    return new OutboxRelayWorker(
+        repository, router, backoff, metrics, properties,
+        relayedListeners.orderedStream().toList());
   }
 
   @Bean
