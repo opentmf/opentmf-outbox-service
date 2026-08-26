@@ -1,4 +1,4 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -8,8 +8,9 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.OffsetDateTime;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
+import org.opentmf.outbox.OutboxProperties;
 
-/** The S23 gauge family: pending/parked wired to the repository, lag from the oldest pending. */
+/** The gauge family: pending/parked wired to the repository, lag from the oldest pending. */
 class OutboxMetricsTests {
 
   private final OutboxEventRepository repository = mock(OutboxEventRepository.class);

@@ -32,10 +32,10 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.kafka.KafkaContainer;
 
 /**
- * The library's §23 contract end to end on the REAL engines (estate §17 posture — no H2):
- * a business transaction appends through the writer; the relay delivers to Kafka with the §14
+ * The library's contract end to end on the REAL engines (no H2):
+ * a business transaction appends through the writer; the relay delivers to Kafka with the
  * headers; the /ops trio serves the TMF630 list + inspect + prune over the same rows. Postgres
- * rides the {@code jdbc:tc:} URL (the adapter precedent) so the REAL library changelog runs.
+ * rides the {@code jdbc:tc:} URL so the REAL library changelog runs.
  */
 @Testcontainers
 @AutoConfigureMockMvc

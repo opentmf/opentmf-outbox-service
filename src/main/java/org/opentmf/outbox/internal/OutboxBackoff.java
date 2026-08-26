@@ -1,10 +1,11 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import java.time.Duration;
 import lombok.RequiredArgsConstructor;
+import org.opentmf.outbox.OutboxProperties;
 
 /**
- * The S23 retry-backoff arithmetic: exponential, {@code base * factor^(attempts-1)}, capped -
+ * The retry-backoff arithmetic: exponential, {@code base * factor^(attempts-1)}, capped -
  * logical defaults base 5s, factor 2, cap 10min (all from {@link OutboxProperties}).
  */
 @RequiredArgsConstructor

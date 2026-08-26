@@ -1,12 +1,14 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import org.opentmf.outbox.OutboxProperties;
 
 /**
- * The S23 mandatory outbox meter family under the LIBRARY-STABLE names ({@code opentmf.outbox.*}
+ * The outbox meter family under the LIBRARY-STABLE names ({@code opentmf.outbox.*}
  * - one name across every consumer; the emitting service is distinguished by the registry's
  * common tags / scrape identity, never by a per-service metric prefix):
  *
@@ -58,7 +60,7 @@ class OutboxMetrics {
   double relayLagSeconds() {
     return repository
         .findOldestPendingCreatedOn()
-        .map(o -> Math.max(0d, Duration.between(o, OffsetDateTime.now()).toMillis() / 1000d))
+        .map(o -> Math.max(0d, Duration.between(o, OffsetDateTime.now(ZoneOffset.UTC)).toMillis() / 1000d))
         .orElse(0d);
   }
 }

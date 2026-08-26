@@ -1,4 +1,6 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
+
+import org.opentmf.outbox.OutboxEvent;
 
 /**
  * Application event published when an outbox row is appended (or unparked) inside a business
@@ -8,4 +10,4 @@ package org.opentmf.outbox;
  * @param outboxId the appended {@link OutboxEvent} id (tracing only - the relay always claims
  *     from the table, never from this event)
  */
-record OutboxAppended(long outboxId) {}
+public record OutboxAppended(long outboxId) {}

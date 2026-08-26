@@ -5,7 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException
 
 import org.junit.jupiter.api.Test;
 
-/** The CLOSED state vocabulary (2026-08-25 wire-vocabulary rule): three states, loud unknown. */
+/** The CLOSED state vocabulary: three states, loud unknown. */
 class OutboxStateFilterTests {
 
   @Test

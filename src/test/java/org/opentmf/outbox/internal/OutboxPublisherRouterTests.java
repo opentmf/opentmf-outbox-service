@@ -1,4 +1,4 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
@@ -6,6 +6,8 @@ import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxPublisher;
 
 /** First supporting publisher wins; an unroutable destination fails LOUD into backoff/park. */
 class OutboxPublisherRouterTests {

@@ -1,6 +1,6 @@
 # OpenTMF Outbox Service
 
-Transactional outbox (the §23 pattern) as a Spring Boot starter, using the client
+Transactional outbox pattern as a Spring Boot starter, using the client
 application's JDBC datasource and Kafka/HTTP infrastructure.
 
 The business transaction writes its state change AND one outbox row in the same
@@ -251,8 +251,13 @@ headers); an unknown filter field is a strict 400.
 
 ### Seal rule (ArchUnit)
 
-Business code touches the outbox only through the public seams. One line in the
-consumer's ArchUnit suite keeps it that way:
+The public contract is the `org.opentmf.outbox` package: `OutboxWriter`,
+`OutboxMaintenanceService`, `OutboxEvent` / `OutboxRowView`, `OutboxStateFilter`,
+`OutboxProperties` and the SPI pair (`OutboxPublisher`,
+`OutboxClientProfileResolver`). Everything under `org.opentmf.outbox.internal`
+(relay, repository, publishers, auto-configuration, ops controller) is
+implementation with no compatibility promise. One line in the consumer's
+ArchUnit suite keeps business code on the contract side:
 
 ```java
 @ArchTest
@@ -260,9 +265,9 @@ static final ArchRule outbox_isTouchedOnlyThroughTheSeams =
     OutboxArchRules.consumersUseOnlyTheSeams();
 ```
 
-It forbids consumer-owned Spring Data repositories over the `OutboxEvent`
-entity — the one misuse the compiler cannot stop (the library's own repository
-is package-private). Requires ArchUnit ≥ 1.5.0 on Java 25 bytecode (older ASM
+It forbids any dependency on `org.opentmf.outbox.internal..` from outside the
+library, and consumer-owned Spring Data repositories over the `OutboxEvent`
+entity — the one misuse the package boundary cannot see. Requires ArchUnit ≥ 1.5.0 on Java 25 bytecode (older ASM
 parses nothing and the rule silently checks NOTHING).
 
 ### Testing your integration
@@ -284,9 +289,8 @@ The library is self-contained for consumer testing — no test-jar needed:
    are yours to transition (schema rebuild or a local one-off).
    **Sharp edge — the id sequence IS the idempotency key.** A schema rebuild
    restarts the identity at 1, so new rows REUSE old
-   `<service>:outbox:<id>` keys — and every §14-disciplined consumer will
-   silently drop your new events as replays (no error, no lag, no reaction;
-   found the hard way on the dnms e2e cluster, 2026-08-26). After any table
+   `<service>:outbox:<id>` keys — and every idempotency-disciplined consumer will
+   silently drop your new events as replays (no error, no lag, no reaction). After any table
    rebuild in an environment with live consumers, restart the identity above
    the used range:
    `alter table outbox alter column id restart with <safely-high-value>;`
@@ -297,22 +301,20 @@ The library is self-contained for consumer testing — no test-jar needed:
    missing-module smell.
 5. Wire the seal rule into your ArchUnit suite.
 
-The reference adoption is dnms-email-adapter (the service this library was
-extracted from) — its adoption commit shows the complete pattern including the
-ops-controller slimming and the IT rewrite.
-
 ## Development
 
 Quality gates on this repo:
 
 - JaCoCo bundle gate **90/90/90** (line/instruction/branch), unit + IT
   execution merged; generated Querydsl classes excluded from the denominator.
+- SonarQube (`mvn -Psonar clean verify` against a local server on
+  `localhost:9000`, token via `SONAR_TOKEN`): zero open findings is the bar.
 - PIT (`mvn -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage`)
-  on the ruled 1.19.6 hold with incremental history (1.20+ moved free
+  on the pinned 1.19.6 hold with incremental history (1.20+ moved free
   `withHistory` behind the commercial arcmutate plugin). No mutation threshold:
   survivor review is the unit of work.
 
-### PIT survivor review (2026-08-26, 123 mutations, 97 killed)
+### PIT survivor review (123 mutations, 97 killed)
 
 Accepted survivors, each reviewed:
 

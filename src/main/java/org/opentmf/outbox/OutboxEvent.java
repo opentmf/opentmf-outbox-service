@@ -15,16 +15,15 @@ import org.hibernate.annotations.DynamicUpdate;
 import org.hibernate.type.SqlTypes;
 
 /**
- * One §23 outbox row — an effect frozen at commit time, delivered at-least-once by the relay.
+ * One outbox row — an effect frozen at commit time, delivered at-least-once by the relay.
  * State is DERIVED, no status column: pending = {@code relayedOn == null}; parked = pending AND
  * {@code attempts >= max-attempts}; relayed = {@code relayedOn != null}.
  *
  * <p>Part of the library's public seam (with {@link OutboxWriter} and
  * {@link OutboxMaintenanceService}); it is also the Querydsl root of the ops list endpoint —
- * inside the LIBRARY that exposure breaks no service's seal (the 2026-08-26 ruling's toolkit
- * amendment).
+ * inside the LIBRARY that exposure breaks no consumer's seal.
  *
- * <p>Deliberately standalone (no audit superclass): the §23 table shape has no
+ * <p>Deliberately standalone (no audit superclass): the outbox table shape has no
  * {@code created_by}/{@code update_count} columns, and an optimistic {@code @Version} would
  * fight the relay's pessimistic {@code FOR UPDATE SKIP LOCKED} claim.
  */
@@ -58,10 +57,10 @@ public class OutboxEvent {
   private String destination;
 
   /**
-   * OPTIONAL named client profile for HTTP delivery (the 2026-08-26 hub ruling: a subscriber
-   * requiring auth is onboarded under a named opentmf-http-clients profile; the row may select
-   * it explicitly). Null = the publisher's own resolution (base-url longest-prefix match, else
-   * plain POST). Ignored by the Kafka publisher.
+   * OPTIONAL named client profile for HTTP delivery: a subscriber requiring authentication is
+   * onboarded under a named client profile, and the row may select it explicitly. Null = the
+   * resolver's decision (longest-prefix base-url match), else plain POST. Ignored by the Kafka
+   * publisher.
    */
   @Column(updatable = false, length = 64)
   private String clientProfile;
@@ -70,7 +69,7 @@ public class OutboxEvent {
   @Column(nullable = false, updatable = false)
   private String payload;
 
-  /** Optional serialized header map (§14 conventions), frozen at write time; TEXT. */
+  /** Optional serialized header map, frozen at write time; TEXT. */
   @Column(updatable = false)
   private String headers;
 

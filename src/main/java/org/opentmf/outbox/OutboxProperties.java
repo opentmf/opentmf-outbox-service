@@ -10,16 +10,15 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
 
 /**
- * Typed configuration for the S23 transactional outbox, bound under the LIBRARY prefix
- * ({@code opentmf.outbox.*} - env {@code OPENTMF_OUTBOX_*}, one underscore per word: the
- * 2026-08-25 spelling finding says the collapsed compound form does not bind on Boot 4). All
- * defaults are the S23 logical defaults.
+ * Typed configuration for the transactional outbox, bound under the LIBRARY prefix
+ * ({@code opentmf.outbox.*} - env {@code OPENTMF_OUTBOX_*}, one underscore per word: a
+ * collapsed compound form does not bind on Boot 4).
  */
 @Getter
 @Setter
 @Validated
 @ConfigurationProperties(prefix = "opentmf.outbox")
-class OutboxProperties {
+public class OutboxProperties {
 
   /** Fixed delay between relay sweep passes - the safety net behind the nudge. Default 5s. */
   @NotNull private Duration sweepInterval = Duration.ofSeconds(5);

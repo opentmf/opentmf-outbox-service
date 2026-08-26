@@ -1,4 +1,4 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -8,10 +8,11 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.opentmf.outbox.OutboxProperties;
 
 /**
- * The S23 relay driver - in-service, no extra deployable. Two triggers feed ONE single-threaded
- * executor (the S23 ordering rule: one claimer at a time per pod; {@code SKIP LOCKED} is the
+ * The relay driver - in-service, no extra deployable. Two triggers feed ONE single-threaded
+ * executor (the ordering rule: one claimer at a time per pod; {@code SKIP LOCKED} is the
  * cross-pod guard): the after-commit nudge (normal path, milliseconds) and a fixed-delay sweep
  * (default 5s - "timers are for the tail"). Each pass drains: it keeps claiming batches while
  * full batches come back.
@@ -76,7 +77,7 @@ class OutboxRelay {
       if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
         executor.shutdownNow();
       }
-    } catch (InterruptedException ex) {
+    } catch (InterruptedException _) {
       Thread.currentThread().interrupt();
       executor.shutdownNow();
     }

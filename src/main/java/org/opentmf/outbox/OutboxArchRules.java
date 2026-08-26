@@ -1,41 +1,69 @@
 package org.opentmf.outbox;
 
 import com.tngtech.archunit.lang.ArchRule;
+import com.tngtech.archunit.lang.CompositeArchRule;
 import com.tngtech.archunit.lang.syntax.ArchRuleDefinition;
+import org.springframework.data.repository.Repository;
 
 /**
- * The library-provided SEAL rule: consumers assert with one line that their business code
- * touches the outbox only through the public seams ({@link OutboxWriter},
- * {@link OutboxMaintenanceService}, {@link OutboxEvent}/{@link OutboxRowView} and the SPI
- * types). Everything else is package-private already - this rule additionally catches
- * reflection-free MISUSE such as a consumer's own JPA repository over the outbox table.
+ * The library-provided SEAL rule: consumers assert with one line that their code touches the
+ * outbox only through the public contract of {@code org.opentmf.outbox} - {@link OutboxWriter},
+ * {@link OutboxMaintenanceService}, {@link OutboxEvent}/{@link OutboxRowView}, the state
+ * vocabulary and the SPI types. Everything under {@code org.opentmf.outbox.internal} is an
+ * implementation detail with no compatibility promise.
  *
  * <p>Usage in a consumer's ArchUnit suite:
  * {@code OutboxArchRules.consumersUseOnlyTheSeams().check(importedClasses);}
  */
 public final class OutboxArchRules {
 
+  /** The public contract package. */
+  public static final String PUBLIC_PACKAGE = "org.opentmf.outbox";
+
+  /** The implementation package - never referenced by consumer code. */
+  public static final String INTERNAL_PACKAGE = PUBLIC_PACKAGE + ".internal";
+
   private OutboxArchRules() {}
 
   /**
-   * No consumer class declares its own persistence over the outbox table. The library's own
-   * repository is package-private (unnameable outside), so the reachable misuse is a consumer
-   * Spring Data repository over the PUBLIC {@link OutboxEvent} entity - that is what this rule
-   * forbids. {@code allowEmptyShould}: a clean consumer has no such repositories at all.
+   * Both halves of the seal: (1) no class outside the library depends on the internal package -
+   * the boundary is package-shaped, so relay, repository, publishers, auto-configuration and
+   * the ops controller are all covered structurally; (2) no consumer class declares its own
+   * Spring Data persistence over the public {@link OutboxEvent} entity - the one misuse the
+   * package boundary alone cannot see. {@code allowEmptyShould}: a clean consumer has no such
+   * classes at all.
    */
   public static ArchRule consumersUseOnlyTheSeams() {
+    return CompositeArchRule.of(noConsumerDependsOnInternals())
+        .and(noConsumerRepositoryOverTheOutboxTable())
+        .as("consumers use only the outbox seams");
+  }
+
+  private static ArchRule noConsumerDependsOnInternals() {
     return ArchRuleDefinition.noClasses()
         .that()
-        .resideOutsideOfPackage("org.opentmf.outbox")
-        .and()
-        .areAssignableTo(org.springframework.data.repository.Repository.class)
+        .resideOutsideOfPackages(PUBLIC_PACKAGE, INTERNAL_PACKAGE)
         .should()
         .dependOnClassesThat()
-        .haveFullyQualifiedName("org.opentmf.outbox.OutboxEvent")
+        .resideInAPackage(INTERNAL_PACKAGE + "..")
         .because(
-            "the outbox table is library-owned (S23): business code appends through"
-                + " OutboxWriter and operates through OutboxMaintenanceService, never through"
-                + " its own persistence over the outbox table")
+            "the outbox implementation is internal: business code appends through OutboxWriter"
+                + " and operates through OutboxMaintenanceService")
+        .allowEmptyShould(true);
+  }
+
+  private static ArchRule noConsumerRepositoryOverTheOutboxTable() {
+    return ArchRuleDefinition.noClasses()
+        .that()
+        .resideOutsideOfPackages(PUBLIC_PACKAGE, INTERNAL_PACKAGE)
+        .and()
+        .areAssignableTo(Repository.class)
+        .should()
+        .dependOnClassesThat()
+        .haveFullyQualifiedName(PUBLIC_PACKAGE + ".OutboxEvent")
+        .because(
+            "the outbox table is library-owned: business code never declares its own persistence"
+                + " over it")
         .allowEmptyShould(true);
   }
 }

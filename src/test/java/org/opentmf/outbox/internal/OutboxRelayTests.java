@@ -1,6 +1,7 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -8,6 +9,7 @@ import static org.mockito.Mockito.when;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
+import org.opentmf.outbox.OutboxProperties;
 
 /** One relay thread; pokes drain; a pass survives worker exceptions; lifecycle is safe. */
 class OutboxRelayTests {
@@ -15,8 +17,12 @@ class OutboxRelayTests {
   @Test
   void pokeBeforeStart_isIgnored() {
     OutboxRelay relay = new OutboxRelay(mock(OutboxRelayWorker.class), new OutboxProperties());
-    relay.poke(); // no executor yet - must not throw
-    relay.stop(); // stop before start - must not throw
+    assertThatCode(
+            () -> {
+              relay.poke(); // no executor yet
+              relay.stop(); // stop before start
+            })
+        .doesNotThrowAnyException();
   }
 
   @Test

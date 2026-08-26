@@ -1,8 +1,12 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import com.querydsl.core.types.Predicate;
 import java.util.Map;
 import lombok.RequiredArgsConstructor;
+import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxMaintenanceService;
+import org.opentmf.outbox.OutboxRowView;
+import org.opentmf.outbox.OutboxStateFilter;
 import org.opentmf.query.tmf630.annotation.Tmf630Response;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -15,10 +19,9 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * The library-provided /ops TRIO (2026-08-26 ruling): prune (the S25.5 CronJob+kicker target),
- * unpark (break-glass) and the TMF630 list. Consumers own the SECURITY rows - the library
- * documents the expected shape (dnms-admin on POST /ops/maintenance/**, POST+GET
- * /ops/outbox/**) and their config-security must state it; the endpoints themselves carry no
+ * The library-provided /ops trio: prune (the scheduled-job target), unpark (break-glass) and
+ * the TMF630 list. Consumers own the SECURITY rows - the library documents the expected shape
+ * (an admin role on POST+GET /ops/outbox/**) and their security configuration must state it; the endpoints themselves carry no
  * security so the consumer's deny-by-default posture governs. Disable entirely with
  * {@code opentmf.outbox.ops-endpoints=false} for consumers wiring their own surface.
  */
@@ -64,7 +67,7 @@ public class OutboxOpsController {
    * <p>{@code @Tmf630Response} here is about RENDERING consistency, not filtering: without it
    * a {@code Page} serializes as raw {@code PageImpl} JSON ({@code {"content":[...]}}) while
    * the list sibling renders the toolkit's bare array + count headers - one surface, two wire
-   * shapes (caught by the adapter adoption's OpsIT, 2026-08-26).
+   * shapes.
    */
   @Tmf630Response
   @GetMapping(path = "/outbox/parked", produces = MediaType.APPLICATION_JSON_VALUE)

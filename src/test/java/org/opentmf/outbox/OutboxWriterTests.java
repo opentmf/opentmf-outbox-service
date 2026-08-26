@@ -1,7 +1,6 @@
 package org.opentmf.outbox;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -9,6 +8,8 @@ import static org.mockito.Mockito.when;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.opentmf.outbox.internal.OutboxAppended;
+import org.opentmf.outbox.internal.OutboxEventRepository;
 import org.springframework.context.ApplicationEventPublisher;
 import tools.jackson.databind.ObjectMapper;
 

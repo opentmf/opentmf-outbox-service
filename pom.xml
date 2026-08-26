@@ -2,7 +2,7 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
-  <!-- Spring Boot via <parent> (combined-rules §1): the library compiles against the
+  <!-- Spring Boot via <parent>: the library compiles against the
        same Boot line its consumers run; consumers' own parents win at runtime. -->
   <parent>
     <groupId>org.springframework.boot</groupId>
@@ -17,17 +17,46 @@
   <packaging>jar</packaging>
 
   <name>opentmf-outbox-service</name>
-  <description>Transactional outbox as a Spring Boot starter (CR §23, extracted from
-    dnms-email-adapter's sealed module per the 2026-08-26 ruling): library-owned
+  <url>https://github.com/opentmf/opentmf-outbox-service</url>
+  <description>Transactional outbox as a Spring Boot starter: library-owned
     Liquibase DDL, an at-least-once single-relay with SKIP LOCKED claims, a pluggable
     publisher SPI (Kafka default, HTTP with per-row client-profile selection), and the
     /ops maintenance TRIO — prune, unpark, and a TMF630-shaped pending list.</description>
+
+  <organization>
+    <name>PiA Group</name>
+    <url>https://www.pia-group.net/</url>
+  </organization>
+
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+      <comments>A permissive open-source license</comments>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <id>gokhanus</id>
+      <name>Gokhan Demir</name>
+      <email>gokhan@opentmf.org</email>
+    </developer>
+  </developers>
+
+  <scm>
+    <url>https://github.com/opentmf/opentmf-outbox-service</url>
+    <connection>scm:git:git@github.com:opentmf/opentmf-outbox-service.git</connection>
+    <developerConnection>scm:git:git@github.com:opentmf/opentmf-outbox-service.git</developerConnection>
+    <tag>HEAD</tag>
+  </scm>
 
   <properties>
     <java.version>25</java.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-    <!-- §5 explicit-name rule (ArchUnit-enforced in consumers): keep -parameters off
+    <!-- Explicit-name rule (ArchUnit-enforced in consumers): keep -parameters off
          so a missing annotation name fails here too, not at a consumer. -->
     <maven.compiler.parameters>false</maven.compiler.parameters>
 
@@ -35,22 +64,29 @@
     <maven.version.ignore>.*-M\d+,.*-RC\d+,.*-SNAPSHOT,(?i).*-(alpha|beta)\d*</maven.version.ignore>
 
     <!-- opentmf BOM — the de-facto inventory of opentmf artifacts; never pin an
-         opentmf artifact's version directly. 2.1.19 = Central's latest at extraction
-         time (2026-08-26, per Cezmi: always the latest release). -->
+         opentmf artifact's version directly; always the latest release. -->
     <opentmf-versions.version>2.1.19</opentmf-versions.version>
 
     <!-- jakarta classifier needs the explicit version (shared with querydsl-apt). -->
     <querydsl.version>5.1.0</querydsl.version>
 
-    <!-- Quality-gate branch statement (combined-rules pitest rule): THIS REPO RUNS
-         THE RULED 1.19.6 HOLD WITH INCREMENTAL HISTORY (Cezmi 2026-08-26) — the
-         estate's branch, not a stale version: free withHistory moved behind the
+    <!-- Quality-gate branch statement: THIS REPO RUNS THE 1.19.6 HOLD WITH
+         INCREMENTAL HISTORY — a deliberate branch, not a stale version: free
+         withHistory moved behind the
          commercial arcmutate plugin from 1.20, where the bare flag FAILS the run.
          The junit5 plugin stays at 1.2.3 WITH it (1.2.1 crashes JDK 25 with
          "Coverage generation minion exited abnormally"). Quote both versions
          whenever the pin is. -->
     <pitest.version>1.19.6</pitest.version>
     <pitest-junit5.version>1.2.3</pitest-junit5.version>
+
+    <!-- Release machinery (donor: opentmf-db-lock-service). The Boot parent manages
+         source/javadoc/deploy; it pins maven-release-plugin at 3.0.1, overridden here to
+         3.3.1. gpg + central-publishing are not Boot-managed. -->
+    <maven-release-plugin.version>3.3.1</maven-release-plugin.version>
+    <sonar-maven-plugin.version>5.7.0.6970</sonar-maven-plugin.version>
+    <maven-gpg-plugin.version>3.2.8</maven-gpg-plugin.version>
+    <central-publishing-maven-plugin.version>0.11.0</central-publishing-maven-plugin.version>
   </properties>
 
   <dependencyManagement>
@@ -81,12 +117,10 @@
     <!-- ================================================================ -->
     <!-- Publisher SPI implementations — both OPTIONAL: the consumer's     -->
     <!-- classpath decides which auto-configure (Kafka default; HTTP for   -->
-    <!-- adapter-call destinations with the per-row client-profile         -->
-    <!-- selector, per the 2026-08-26 hub ruling)                          -->
+    <!-- HTTP destinations with the per-row client-profile selector)       -->
     <!-- ================================================================ -->
     <!-- Boot 4 split: spring-kafka alone is NOT auto-configured - a consumer using
-         Kafka destinations needs BOTH spring-kafka and spring-boot-kafka (dnms
-         services get both via their platform starters). -->
+         Kafka destinations needs BOTH spring-kafka and spring-boot-kafka. -->
     <dependency>
       <groupId>org.springframework.kafka</groupId>
       <artifactId>spring-kafka</artifactId>
@@ -99,13 +133,13 @@
     </dependency>
     <!-- NO opentmf-http-clients dependency here, deliberately: the HTTP publisher
          works through Spring's RestClient + the OutboxClientProfileResolver SPI.
-         A consumer wanting NAMED authenticated clients (the hub ruling) brings the
+         A consumer wanting NAMED authenticated clients brings the
          opentmf-http-clients starter itself and implements the resolver - the
          library stays free of that starter's mandatory configuration surface. -->
 
     <!-- ================================================================ -->
-    <!-- The /ops trio: REST + the TMF630 toolkit list (ruling 7.3         -->
-    <!-- amendment: the list endpoint carries the FULL toolkit surface —   -->
+    <!-- The /ops trio: REST + the TMF630 toolkit list (the list endpoint  -->
+    <!-- carries the FULL toolkit surface —                                -->
     <!-- Page + Pageable + @QuerydslPredicate + @Tmf630Response)           -->
     <!-- ================================================================ -->
     <dependency>
@@ -125,14 +159,14 @@
       <classifier>jakarta</classifier>
     </dependency>
 
-    <!-- Observability: the §23 gauges (pending / parked / relay-lag / relayed). -->
+    <!-- Observability: the gauges (pending / parked / relay-lag / relayed). -->
     <dependency>
       <groupId>io.micrometer</groupId>
       <artifactId>micrometer-core</artifactId>
     </dependency>
 
     <!-- The library-provided seal rule (OutboxArchRules) — optional: only test
-         classpaths ever see it. 1.5.0 = the dnms estate's version; anything older
+         classpaths ever see it. anything older
          (<=1.4.x ASM) cannot parse Java 25 bytecode (class file major 69) and the
          rule silently checks NOTHING — caught by OutboxArchRulesTests. -->
     <dependency>
@@ -150,7 +184,7 @@
 
     <!-- ================================================================ -->
     <!-- Tests: H2-free by principle — the DDL is PostgreSQL, so the ITs   -->
-    <!-- run the real engine via Testcontainers (estate §17 posture).      -->
+    <!-- run the real engine via Testcontainers.                          -->
     <!-- ================================================================ -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
@@ -169,7 +203,7 @@
       <scope>test</scope>
     </dependency>
     <!-- Boot 4 split: MockMvc autoconfiguration lives in the webmvc test starter
-         (the 2026-08-21 adapter finding). -->
+         -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-webmvc-test</artifactId>
@@ -185,7 +219,7 @@
       <artifactId>awaitility</artifactId>
       <scope>test</scope>
     </dependency>
-    <!-- Testcontainers 2.x — Boot-managed versions (the adapter precedent): the
+    <!-- Testcontainers 2.x — Boot-managed versions: the
          jdbc:tc: postgres driver + the Kafka container. -->
     <dependency>
       <groupId>org.testcontainers</groupId>
@@ -212,8 +246,7 @@
       <artifactId>liquibase-core</artifactId>
       <scope>test</scope>
     </dependency>
-    <!-- Boot 4 split: liquibase-core alone is NOT auto-configured (the adapter's
-         documented finding) — the Boot liquibase module carries the auto-config. -->
+    <!-- Boot 4 split: liquibase-core alone is NOT auto-configured — the Boot liquibase module carries the auto-config. -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-liquibase</artifactId>
@@ -223,7 +256,7 @@
 
   <build>
     <plugins>
-      <!-- Annotation processing (the dnms-catalog precedent): Lombok FIRST, then the
+      <!-- Annotation processing: Lombok FIRST, then the
            Querydsl jakarta APT for the toolkit's Q-classes. An apt-maven-plugin would
            hijack processing and silently drop Lombok - hence processor paths. -->
       <plugin>
@@ -249,9 +282,8 @@
           </annotationProcessorPaths>
         </configuration>
       </plugin>
-      <!-- Coverage gate: 90% line / instruction / branch - the HIGHER of the two
-           estates (dnms services run 90/90/90, opentmf-db-lock-service runs 80/60;
-           Cezmi's 2026-08-26 rule: the library holds the stricter bar). -->
+      <!-- Coverage gate: 90% line / instruction / branch - a library holds the
+           stricter bar of its consumers. -->
       <plugin>
         <groupId>org.jacoco</groupId>
         <artifactId>jacoco-maven-plugin</artifactId>
@@ -269,10 +301,12 @@
           </execution>
           <execution>
             <id>report</id>
-            <!-- verify, not test: the agent appends failsafe (IT) coverage to the same exec
-                 file, so reporting after integration-test folds the ITs in. check (below,
-                 default phase verify, declared after report) then gates on the merged data. -->
-            <phase>verify</phase>
+            <!-- post-integration-test, not test: the agent appends failsafe (IT) coverage
+                 to the same exec file, so reporting after integration-test folds the ITs in.
+                 Not verify either: the sonar profile's delayed scan runs in verify and must
+                 find the XML already written. check (default phase verify) then gates on the
+                 merged data. -->
+            <phase>post-integration-test</phase>
             <goals><goal>report</goal></goals>
           </execution>
           <execution>
@@ -293,6 +327,18 @@
           </execution>
         </executions>
       </plugin>
+      <!-- Release cut: mvn release:prepare release:perform. The release profile below
+           (sources, javadoc, signing, Central publishing) is activated via
+           releaseProfiles - never useReleaseProfile. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-release-plugin</artifactId>
+        <version>${maven-release-plugin.version}</version>
+        <configuration>
+          <releaseProfiles>release</releaseProfiles>
+          <goals>deploy</goals>
+        </configuration>
+      </plugin>
       <!-- *IT classes (Testcontainers round-trips) run under failsafe at verify. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -310,11 +356,11 @@
   </build>
 
   <profiles>
-    <!-- Mutation testing (Cezmi 2026-08-26: PIT rides the library from day one).
+    <!-- Mutation testing (PIT rides the library from day one).
          Run: mvn -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage
-         Branch statement: the RULED 1.19.6 hold WITH incremental history (see the pin
+         Branch statement: the pinned 1.19.6 hold WITH incremental history (see the pin
          comment in <properties>). NO mutationThreshold - survivor review is the unit
-         of work (the dnms posture); the JACOCO 90/90/90 gate is the enforced floor. -->
+         of work; the JACOCO 90/90/90 gate is the enforced floor. -->
     <profile>
       <id>mutation</id>
       <build>
@@ -336,13 +382,106 @@
               <excludedTestClasses><param>org.opentmf.outbox.*IT</param></excludedTestClasses>
               <outputFormats><param>HTML</param></outputFormats>
               <timestampedReports>false</timestampedReports>
-              <!-- withHistory is WHY the 1.19.6 hold exists (CR §17). KNOWN COST
+              <!-- withHistory is WHY the 1.19.6 hold exists. KNOWN COST
                    (the un-retired <=1.19 gotcha): the history file is keyed on
                    mutated-class hashes ONLY — strengthening a TEST does not
                    invalidate an entry, so DELETE the history file before a survivor
                    review or after material test changes. -->
               <withHistory>true</withHistory>
-              <!-- NO mutationThreshold — survivor review is the unit of work (§17). -->
+              <!-- NO mutationThreshold — survivor review is the unit of work. -->
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <!-- Local SonarQube analysis as part of the normal build: mvn -Psonar clean verify.
+         sonar.host.url MUST be explicit (SonarScanner 5.x targets SonarQube Cloud when
+         absent). Credentials via -Dsonar.token=... or the SONAR_TOKEN environment
+         variable, never the pom. Coverage: the scanner auto-discovers
+         target/site/jacoco/jacoco.xml; xmlReportPaths is intentionally not set. The
+         scan binds to verify, after the jacoco report - see the report execution. -->
+    <profile>
+      <id>sonar</id>
+      <properties>
+        <sonar.host.url>http://localhost:9000</sonar.host.url>
+        <sonar.projectKey>opentmf-outbox-service</sonar.projectKey>
+        <sonar.scanner.skipJreProvisioning>true</sonar.scanner.skipJreProvisioning>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.sonarsource.scanner.maven</groupId>
+            <artifactId>sonar-maven-plugin</artifactId>
+            <version>${sonar-maven-plugin.version}</version>
+            <executions>
+              <execution>
+                <id>sonar-scan</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sonar</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <!-- Release-only plugins live HERE, not in the default build: normal builds do
+         not generate source/javadoc jars, sign, or publish. -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals>
+                  <goal>jar-no-fork</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+                <configuration>
+                  <failOnWarnings>false</failOnWarnings>
+                  <failOnError>false</failOnError>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>${maven-gpg-plugin.version}</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>${central-publishing-maven-plugin.version}</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>publish-to-central</publishingServerId>
+              <autoPublish>true</autoPublish>
             </configuration>
           </plugin>
         </plugins>
