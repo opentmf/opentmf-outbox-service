@@ -5,7 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException
 
 import org.junit.jupiter.api.Test;
 
-/** The CLOSED state vocabulary: three states, loud unknown. */
+/** The CLOSED state vocabulary: four states, loud unknown. */
 class OutboxStateFilterTests {
 
   @Test
@@ -13,12 +13,13 @@ class OutboxStateFilterTests {
     assertThat(OutboxStateFilter.fromWire("parked")).isEqualTo(OutboxStateFilter.PARKED);
     assertThat(OutboxStateFilter.fromWire("Pending")).isEqualTo(OutboxStateFilter.PENDING);
     assertThat(OutboxStateFilter.fromWire("RELAYED")).isEqualTo(OutboxStateFilter.RELAYED);
+    assertThat(OutboxStateFilter.fromWire("cancelled")).isEqualTo(OutboxStateFilter.CANCELLED);
   }
 
   @Test
   void unknownState_failsLoud_theClosureIsTheContract() {
     assertThatIllegalArgumentException()
         .isThrownBy(() -> OutboxStateFilter.fromWire("dead-lettered"))
-        .withMessageContaining("pending|parked|relayed");
+        .withMessageContaining("pending|parked|relayed|cancelled");
   }
 }

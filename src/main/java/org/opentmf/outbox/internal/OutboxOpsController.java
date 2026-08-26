@@ -19,10 +19,11 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * The library-provided /ops trio: prune (the scheduled-job target), unpark (break-glass) and
- * the TMF630 list. Consumers own the SECURITY rows - the library documents the expected shape
- * (an admin role on POST+GET /ops/outbox/**) and their security configuration must state it; the endpoints themselves carry no
- * security so the consumer's deny-by-default posture governs. Disable entirely with
+ * The library-provided /ops surface: prune (the scheduled-job target), unpark (break-glass),
+ * cancel (withdraw an unreleased effect) and the TMF630 list. Consumers own the SECURITY rows
+ * - the library documents the expected shape (an admin role on POST+GET /ops/outbox/**) and
+ * their security configuration must state it; the endpoints themselves carry no security so
+ * the consumer's deny-by-default posture governs. Disable entirely with
  * {@code opentmf.outbox.ops-endpoints=false} for consumers wiring their own surface.
  */
 @RestController
@@ -32,10 +33,20 @@ public class OutboxOpsController {
 
   private final OutboxMaintenanceService maintenance;
 
-  /** One retention-pruning pass over relayed rows. Returns {@code {"outboxRowsPruned": n}}. */
+  /**
+   * One retention-pruning pass over terminal (relayed + cancelled) rows. Returns
+   * {@code {"outboxRowsPruned": n}}.
+   */
   @PostMapping(path = "/outbox/maintenance/prune", produces = MediaType.APPLICATION_JSON_VALUE)
   public Map<String, Long> prune() {
-    return Map.of("outboxRowsPruned", maintenance.pruneRelayed());
+    return Map.of("outboxRowsPruned", maintenance.prune());
+  }
+
+  /** Cancels one unreleased row - never relayed from now on, retained for audit. */
+  @PostMapping(path = "/outbox/{id}/cancel", produces = MediaType.APPLICATION_JSON_VALUE)
+  public Map<String, Object> cancel(@PathVariable(name = "id") long id) {
+    maintenance.cancel(id);
+    return Map.of("action", "cancelled", "id", id);
   }
 
   /** Unparks one parked row - attempts reset, due now, relay nudged on commit. */
@@ -47,7 +58,8 @@ public class OutboxOpsController {
 
   /**
    * The TMF630 triage list: toolkit predicate over the row fields (aggregateId, eventType,
-   * destination, createdOn ranges, and pending/relayed via {@code relayedOn} null-filtering -
+   * destination, createdOn ranges, and relayed/cancelled via {@code relayedOn} /
+   * {@code cancelledOn} null-filtering -
    * all toolkit-native, so its strict unknown-field validation stays intact). The one state
    * the toolkit CANNOT express - {@code parked}, derived against the CONFIGURED max-attempts -
    * has the dedicated sub-resource below. Payloads omitted; use the inspect sibling.

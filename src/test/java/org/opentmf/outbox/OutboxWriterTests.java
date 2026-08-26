@@ -5,6 +5,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.time.OffsetDateTime;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -48,6 +49,7 @@ class OutboxWriterTests {
     assertThat(saved.getClientProfile()).isNull();
     assertThat(saved.getCreatedOn()).isNotNull();
     assertThat(saved.getNextAttemptOn()).isNotNull();
+    assertThat(saved.getReleaseAt()).isNull(); // no hold = deliverable now
     verify(events).publishEvent(new OutboxAppended(42L));
   }
 
@@ -71,5 +73,26 @@ class OutboxWriterTests {
 
     assertThat(saved.getClientProfile()).isEqualTo("hub-subscriber-7");
     assertThat(saved.getDestination()).isEqualTo("https://hub/cb");
+  }
+
+  @Test
+  void append_withReleaseAt_freezesTheHold_andStillNudges() {
+    stubSave();
+    OffsetDateTime hold = OffsetDateTime.now().plusHours(2);
+
+    OutboxEvent saved =
+        writer.append(
+            OutboxAppend.of("agg", "a-1", "e.v1", "topic", Map.of("k", "v"))
+                .withHeaders(Map.of("x-schema-version", "1"))
+                .withReleaseAt(hold));
+
+    assertThat(saved.getReleaseAt()).isEqualTo(hold);
+    assertThat(saved.getHeaders()).contains("x-schema-version");
+    assertThat(saved.getClientProfile()).isNull();
+    assertThat(saved.getCancelledOn()).isNull();
+    // the row is written due-now; eligibility is the claim predicate's job (release_at), so
+    // the nudge is harmless - the relay simply finds nothing claimable
+    assertThat(saved.getNextAttemptOn()).isBeforeOrEqualTo(OffsetDateTime.now());
+    verify(events).publishEvent(new OutboxAppended(42L));
   }
 }

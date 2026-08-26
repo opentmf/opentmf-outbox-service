@@ -37,7 +37,9 @@ erDiagram
         timestamptz created_on         "feeds the relay-lag gauge"
         smallint    attempts           "failed deliveries; at max-attempts the row parks"
         timestamptz next_attempt_on    "earliest next delivery (exponential backoff)"
+        timestamptz release_at         "scheduled-send hold, frozen at write (nullable, 1.1.0)"
         timestamptz relayed_on         "delivery completion; null while pending/parked"
+        timestamptz cancelled_on       "cancellation of an unreleased effect (nullable, 1.1.0)"
         text        last_error         "last failure, truncated — ops forensics (nullable)"
     }
 ```
@@ -46,12 +48,23 @@ State is **derived** — there is no status column to corrupt:
 
 ```mermaid
 flowchart LR
-    P["PENDING\nrelayed_on is null"] -->|"relay succeeds"| R["RELAYED\nrelayed_on set"]
+    P["PENDING\nrelayed_on is null\nAND cancelled_on is null"] -->|"relay succeeds"| R["RELAYED\nrelayed_on set"]
     P -->|"attempts reaches max-attempts"| K["PARKED\npending AND attempts >= max"]
     K -->|"POST /ops/outbox/{id}/unpark\n(operator break-glass)"| P
+    P -->|"POST /ops/outbox/{id}/cancel"| C["CANCELLED\ncancelled_on set"]
+    K -->|"POST /ops/outbox/{id}/cancel"| C
     R -->|"retention passes\n(prune)"| G(("deleted"))
+    C -->|"retention passes\n(prune)"| G
     K -.->|"never auto-pruned"| K
 ```
+
+A pending row whose `release_at` lies in the future is **held**: it is not
+claimable until that instant. The hold is frozen at write time — the retry
+backoff moves `next_attempt_on` only and can never move `release_at` (the
+mapping itself is `updatable = false`; a named regression test,
+`backoff_neverTouchesTheReleaseHold`, guards the property). A cancelled row is
+never relayed, is retained for audit, and is pruned on the same retention as
+relayed rows.
 
 A partial index (`ix_outbox_pending` on `next_attempt_on where relayed_on is
 null`) keeps the relay's claim query cheap regardless of the relayed backlog.
@@ -91,6 +104,15 @@ sequenceDiagram
   exponential next attempt. At `max-attempts` the row parks: excluded from
   claims, the `parked` gauge alerts, unparking is an explicit ops action.
   Parked rows are never auto-pruned.
+- **Claim eligibility lives in ONE place** — the claim query:
+  `relayed_on is null and cancelled_on is null and (release_at is null or
+  release_at <= now) and next_attempt_on <= now and attempts < max-attempts`,
+  in `id` order. A held row waits for its hold; a cancelled row never comes
+  back. The ops actions (`cancel`, `unpark`) read their row under a waiting
+  `FOR UPDATE`, so one that races a claim in flight serializes behind it and
+  sees the row as the relay left it — a cancel that arrives while the relay
+  holds the row fails with "already relayed" rather than silently marking a
+  delivered effect cancelled.
 - **Publisher routing.** Everything that is not an `http(s)://` URL is a Kafka
   topic (the Kafka publisher registers at lowest precedence as the default).
   HTTP destinations are POSTed the payload with the relay headers. Consumers
@@ -131,7 +153,7 @@ opentmf:
 | `backoff-base`   | `Duration` | `5s`    | Delay after the first failure.                                        |
 | `backoff-factor` | `int`      | `2`     | `delay = base * factor^(attempts-1)`, capped.                         |
 | `backoff-cap`    | `Duration` | `10m`   | Ceiling for the exponential delay.                                    |
-| `retention`      | `Duration` | `7d`    | Used by the prune (`OutboxMaintenanceService.pruneRelayed()`).        |
+| `retention`      | `Duration` | `7d`    | Used by the prune (`OutboxMaintenanceService.prune()`): relayed AND cancelled rows. |
 | `send-timeout`   | `Duration` | `10s`   | Non-transactional Kafka sends await the ack this long.                |
 | `ops-endpoints`  | `boolean`  | `true`  | `false` removes the library's `/ops` controller entirely.             |
 
@@ -144,9 +166,9 @@ per-service metric prefix. Without a `MeterRegistry` bean the relay still works
 
 | Metric                     | Type    | Meaning                                            |
 |----------------------------|---------|----------------------------------------------------|
-| `opentmf.outbox.pending`   | gauge   | Rows not yet relayed                               |
+| `opentmf.outbox.pending`   | gauge   | Rows not yet relayed nor cancelled (held included)  |
 | `opentmf.outbox.parked`    | gauge   | Rows parked at max-attempts — **alert when > 0**   |
-| `opentmf.outbox.relay-lag` | gauge   | Age of the oldest pending row, seconds             |
+| `opentmf.outbox.relay-lag` | gauge   | Seconds the oldest *released* pending row has been deliverable (a held row is not lagging) |
 | `opentmf.outbox.relayed`   | counter | Successful relays, tagged by `destination`         |
 | `opentmf.outbox.attempts`  | summary | Delivery attempts a relayed row took               |
 
@@ -185,9 +207,17 @@ From your master changelog — by reference, never copied:
 <include file="db/changelog/opentmf-outbox.sql" relativeToChangelogFile="false"/>
 ```
 
-The changelog is ONE clean create. A service whose environments already carry a
-pre-library `outbox` table owns its own transition (rebuild the schema, or a
-local one-off) — the library ships no onboarding shims.
+The changelog is ONE clean create (changeset `001-outbox`) plus additive
+evolution (`002-outbox-hold-and-cancel`, 1.1.0: the two nullable columns). A
+service whose environments already carry a pre-library `outbox` table owns its
+own transition (rebuild the schema, or a local one-off) — the library ships no
+onboarding shims.
+
+**Upgrading 1.0.0 → 1.1.0** needs no consumer change: the included changelog
+applies changeset 002 on the next start (two nullable columns, no rewrite), the
+existing `append` overloads keep their meaning (no hold), and existing rows are
+unaffected — `release_at` and `cancelled_on` are null, so they stay eligible
+exactly as before.
 
 ### Append events
 
@@ -206,7 +236,19 @@ outboxWriter.append("hub-subscription", subscriptionId,
 // HTTP destination through a NAMED client profile (authenticated subscriber)
 outboxWriter.append("hub-subscription", subscriptionId,
     "hub.event.v1", callbackUrl, "hub-subscriber-7", eventFact, Map.of());
+
+// Scheduled send: the request shape carries the HOLD - not deliverable before
+// releaseAt (every optional selector is a wither; null hold = deliverable now)
+outboxWriter.append(
+    OutboxAppend.of("comm-schedule", scheduleId, "comm.send.v1", "comm.send.v1", sendFact)
+        .withReleaseAt(releaseAt));
 ```
+
+The hold is frozen at write time and has no reschedule API — to move a
+scheduled send, cancel the row (`OutboxMaintenanceService.cancel(id)` or the
+`/ops` endpoint) and append a new one. Cancelling is possible only while the
+effect has not left: a relayed row refuses with an `IllegalStateException`
+("already relayed"), as does an already-cancelled one.
 
 Pass the payload as a fact object — it is serialized at write time. Extra
 headers frozen at write time ride the `Map<String,String>` overload; the relay
@@ -261,14 +303,17 @@ surface):
 
 | Method | Path                          | What                                                                  |
 |--------|-------------------------------|-----------------------------------------------------------------------|
-| POST   | `/ops/outbox/maintenance/prune` | Deletes relayed rows past retention; wire to a CronJob kicker        |
+| POST   | `/ops/outbox/maintenance/prune` | Deletes relayed + cancelled rows past retention; wire to a CronJob kicker |
 | POST   | `/ops/outbox/{id}/unpark`     | Break-glass after the root cause is fixed: attempts reset, due now    |
+| POST   | `/ops/outbox/{id}/cancel`     | Withdraws an unreleased effect: never relayed, retained for audit     |
 | GET    | `/ops/outbox`                 | TMF630 triage list (attribute filtering + paging), payloads omitted   |
 | GET    | `/ops/outbox/parked`          | The derived state a wire filter cannot express (config comparison)    |
 | GET    | `/ops/outbox/{id}`            | One row in full — payload + `last_error`, the pre-unpark forensic read|
 
 Both list endpoints render through the TMF630 toolkit (bare array + count
-headers); an unknown filter field is a strict 400.
+headers); an unknown filter field is a strict 400. The state legs on the list
+are the toolkit's null-filtering over `relayedOn` / `cancelledOn`; each row
+carries `releaseAt` and `cancelledOn`, and `parked` stays the one derived flag.
 
 The `tmf630-toolkit-all` dependency is **optional, honestly**: without it on
 the classpath the `/ops` controller is not registered at all (a guarded,
@@ -347,7 +392,7 @@ Accepted survivors, each reviewed:
 
 | Where | Mutant | Verdict |
 |---|---|---|
-| `OutboxMaintenanceService.pruneRelayed` | `pruned > 0` boundary/negation | Log-only guard; row deletion is unaffected |
+| `OutboxMaintenanceService.prune` | `relayed + cancelled > 0` boundary/negation | Log-only guard; row deletion is unaffected |
 | `OutboxRelayWorker.registerFailure` | `attempts >= max` boundary/negation | Log-level-only; parked state is *derived* from attempts, not this branch |
 | `OutboxRelayWorker.truncate` | `<=` vs `<` boundary | Equivalent mutant at exactly 4000 chars |
 | `OutboxRelay.stop` | awaitTermination conditional | Shutdown-timing leg; a kill needs a 5s hanging-task test for no insight |

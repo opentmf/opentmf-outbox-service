@@ -16,8 +16,10 @@ import org.hibernate.type.SqlTypes;
 
 /**
  * One outbox row — an effect frozen at commit time, delivered at-least-once by the relay.
- * State is DERIVED, no status column: pending = {@code relayedOn == null}; parked = pending AND
- * {@code attempts >= max-attempts}; relayed = {@code relayedOn != null}.
+ * State is DERIVED, no status column: pending = {@code relayedOn == null && cancelledOn == null};
+ * parked = pending AND {@code attempts >= max-attempts}; relayed = {@code relayedOn != null};
+ * cancelled = {@code cancelledOn != null}. A pending row whose {@code releaseAt} lies in the
+ * future is HELD - not claimable until then.
  *
  * <p>Part of the library's public seam (with {@link OutboxWriter} and
  * {@link OutboxMaintenanceService}); it is also the Querydsl root of the ops list endpoint —
@@ -89,8 +91,23 @@ public class OutboxEvent {
   @Column(nullable = false)
   private OffsetDateTime nextAttemptOn;
 
+  /**
+   * Optional scheduled-send HOLD: the row is not claimable before this instant; null = no hold.
+   * Frozen at write time ({@code updatable = false}) - the retry backoff reschedules
+   * {@link #nextAttemptOn} and can structurally never move the hold.
+   */
+  @Column(updatable = false)
+  private OffsetDateTime releaseAt;
+
   /** Set once the effect is delivered — the row's terminal state; null while pending. */
   private OffsetDateTime relayedOn;
+
+  /**
+   * Cancellation time of an UNRELEASED effect - the other terminal state; null = not cancelled.
+   * Set only through {@link OutboxMaintenanceService#cancel(long)}, which refuses relayed rows,
+   * so relayed and cancelled never overlap.
+   */
+  private OffsetDateTime cancelledOn;
 
   /** Last delivery failure, truncated — ops forensics for parked rows. */
   private String lastError;

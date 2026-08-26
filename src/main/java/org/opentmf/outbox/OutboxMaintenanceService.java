@@ -14,10 +14,15 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * The housekeeping + read surface behind the /ops trio (prune / unpark / list): a scheduled
- * job (e.g. a CronJob hitting the prune endpoint) triggers {@link #pruneRelayed()};
- * {@link #unpark(long)} is the explicit break-glass; {@link #list} and {@link #inspect} are the
- * no-direct-DB read half.
+ * The housekeeping + read surface behind the /ops endpoints (prune / unpark / cancel / list): a
+ * scheduled job (e.g. a CronJob hitting the prune endpoint) triggers {@link #prune()};
+ * {@link #unpark(long)} is the explicit break-glass; {@link #cancel(long)} withdraws an
+ * unreleased effect; {@link #list} and {@link #inspect} are the no-direct-DB read half.
+ *
+ * <p>The row-mutating actions read their row under a WAITING {@code for update} lock, so they
+ * serialize against a relay claim in flight: an action that races the relay sees the row as
+ * the relay LEFT it (and refuses a now-relayed row) - never a stale snapshot, never a silent
+ * no-op.
  */
 @Slf4j
 @RequiredArgsConstructor
@@ -28,19 +33,62 @@ public class OutboxMaintenanceService {
   private final ApplicationEventPublisher eventPublisher;
 
   /**
-   * Prunes relayed rows older than {@code opentmf.outbox.retention} (default 7 days). Parked
-   * rows are structurally never pruned ({@code relayed_on is null}).
+   * Prunes the TERMINAL rows older than {@code opentmf.outbox.retention} (default 7 days):
+   * relayed rows by {@code relayed_on}, cancelled rows by {@code cancelled_on} - one retention
+   * for both, cancelled rows being kept that long for audit. Parked (and held) rows are
+   * structurally never pruned: both timestamps are null.
    *
    * @return the number of rows deleted
    */
   @Transactional
+  public long prune() {
+    return doPrune();
+  }
+
+  /**
+   * The 1.0.0 name of {@link #prune()}, kept for source compatibility; since 1.1.0 it prunes
+   * cancelled rows too (there is one retention for terminal rows).
+   */
+  @Transactional
   public long pruneRelayed() {
+    return doPrune();
+  }
+
+  /** Un-annotated on purpose: both public names delegate here, never to each other. */
+  private long doPrune() {
     OffsetDateTime cutoff = OffsetDateTime.now(ZoneOffset.UTC).minus(properties.getRetention());
-    long pruned = repository.deleteByRelayedOnBefore(cutoff);
-    if (pruned > 0) {
-      log.info("Pruned {} relayed outbox rows older than {}", pruned, cutoff);
+    long relayed = repository.deleteByRelayedOnBefore(cutoff);
+    long cancelled = repository.deleteByCancelledOnBefore(cutoff);
+    if (relayed + cancelled > 0) {
+      log.info(
+          "Pruned {} relayed and {} cancelled outbox rows older than {}",
+          relayed,
+          cancelled,
+          cutoff);
     }
-    return pruned;
+    return relayed + cancelled;
+  }
+
+  /**
+   * Cancels one UNRELEASED effect: the row is stamped {@code cancelled_on}, becomes
+   * unclaimable for good, and is retained for audit until the retention prunes it. Only a row
+   * that is not yet relayed and not already cancelled is cancellable - the guard is by name:
+   *
+   * @throws IllegalArgumentException when no row has the given id
+   * @throws IllegalStateException when the row is already relayed (the effect has left - a
+   *     cancel cannot recall it) or already cancelled
+   */
+  @Transactional
+  public void cancel(long outboxId) {
+    OutboxEvent event = lock(outboxId);
+    if (event.getRelayedOn() != null) {
+      throw new IllegalStateException("Outbox row %d is already relayed".formatted(outboxId));
+    }
+    if (event.getCancelledOn() != null) {
+      throw new IllegalStateException("Outbox row %d is already cancelled".formatted(outboxId));
+    }
+    event.setCancelledOn(OffsetDateTime.now(ZoneOffset.UTC));
+    log.info("Outbox row {} cancelled - it will never be relayed", outboxId);
   }
 
   /**
@@ -49,17 +97,17 @@ public class OutboxMaintenanceService {
    * kept for forensics until the row relays.
    *
    * @throws IllegalArgumentException when no row has the given id
-   * @throws IllegalStateException when the row is not parked (already relayed, or retrying)
+   * @throws IllegalStateException when the row is not parked (already relayed, cancelled, or
+   *     retrying)
    */
   @Transactional
   public void unpark(long outboxId) {
-    OutboxEvent event =
-        repository
-            .findById(outboxId)
-            .orElseThrow(
-                () -> new IllegalArgumentException("Outbox row %d not found".formatted(outboxId)));
+    OutboxEvent event = lock(outboxId);
     if (event.getRelayedOn() != null) {
       throw new IllegalStateException("Outbox row %d is already relayed".formatted(outboxId));
+    }
+    if (event.getCancelledOn() != null) {
+      throw new IllegalStateException("Outbox row %d is cancelled".formatted(outboxId));
     }
     if (event.getAttempts() < properties.getMaxAttempts()) {
       throw new IllegalStateException(
@@ -70,6 +118,13 @@ public class OutboxMaintenanceService {
     event.setNextAttemptOn(OffsetDateTime.now(ZoneOffset.UTC));
     eventPublisher.publishEvent(new OutboxAppended(outboxId));
     log.info("Outbox row {} unparked - delivery will be retried", outboxId);
+  }
+
+  private OutboxEvent lock(long outboxId) {
+    return repository
+        .lockById(outboxId)
+        .orElseThrow(
+            () -> new IllegalArgumentException("Outbox row %d not found".formatted(outboxId)));
   }
 
   /**
@@ -87,10 +142,14 @@ public class OutboxMaintenanceService {
     }
     if (state != null) {
       switch (state) {
-        case PENDING -> composed.and(row.relayedOn.isNull());
+        case PENDING -> composed.and(row.relayedOn.isNull()).and(row.cancelledOn.isNull());
         case PARKED ->
-            composed.and(row.relayedOn.isNull()).and(row.attempts.goe(properties.getMaxAttempts()));
+            composed
+                .and(row.relayedOn.isNull())
+                .and(row.cancelledOn.isNull())
+                .and(row.attempts.goe(properties.getMaxAttempts()));
         case RELAYED -> composed.and(row.relayedOn.isNotNull());
+        case CANCELLED -> composed.and(row.cancelledOn.isNotNull());
       }
     }
     return repository

@@ -21,7 +21,9 @@ import org.springframework.transaction.annotation.Transactional;
  * <p>On failure: {@code attempts++}, {@code last_error} recorded, {@code next_attempt_on}
  * pushed out by exponential backoff; at {@code max-attempts} the row PARKS (excluded from
  * claims, the {@code parked} gauge alerts, unparking is an explicit ops action). A failed row
- * does not stop the batch.
+ * does not stop the batch. The failure bookkeeping NEVER touches {@code release_at}: the
+ * scheduled-send hold and the retry schedule are separate facts (the entity maps the hold
+ * {@code updatable = false}, and a regression test names the property).
  */
 @Slf4j
 @RequiredArgsConstructor

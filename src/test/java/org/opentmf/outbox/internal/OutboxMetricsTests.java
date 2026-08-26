@@ -1,6 +1,7 @@
 package org.opentmf.outbox.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -20,21 +21,23 @@ class OutboxMetricsTests {
 
   @Test
   void gauges_readTheRepository() {
-    when(repository.countByRelayedOnIsNull()).thenReturn(4L);
-    when(repository.countByRelayedOnIsNullAndAttemptsGreaterThanEqual(10)).thenReturn(1L);
+    when(repository.countByRelayedOnIsNullAndCancelledOnIsNull()).thenReturn(4L);
+    when(repository.countByRelayedOnIsNullAndCancelledOnIsNullAndAttemptsGreaterThanEqual(10))
+        .thenReturn(1L);
 
     assertThat(registry.get(OutboxMetrics.PENDING).gauge().value()).isEqualTo(4d);
     assertThat(registry.get(OutboxMetrics.PARKED).gauge().value()).isEqualTo(1d);
   }
 
   @Test
-  void relayLag_isTheOldestPendingAge_zeroWhenNonePending() {
-    when(repository.findOldestPendingCreatedOn())
+  void relayLag_isTheOldestReleasedPendingAge_zeroWhenNonePending() {
+    when(repository.findOldestPendingSince(any(OffsetDateTime.class)))
         .thenReturn(Optional.of(OffsetDateTime.now().minusSeconds(90)));
     // bounded BOTH ways: ~90s, in SECONDS (the millis-to-seconds division is load-bearing)
     assertThat(metrics.relayLagSeconds()).isBetween(85d, 95d);
 
-    when(repository.findOldestPendingCreatedOn()).thenReturn(Optional.empty());
+    when(repository.findOldestPendingSince(any(OffsetDateTime.class)))
+        .thenReturn(Optional.empty());
     assertThat(metrics.relayLagSeconds()).isZero();
   }
 

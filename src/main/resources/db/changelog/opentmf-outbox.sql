@@ -49,3 +49,19 @@ comment on column outbox.relayed_on is 'Delivery completion time; null while pen
 comment on column outbox.last_error is 'Last delivery failure (truncated) — ops forensics for parked rows.';
 comment on index ix_outbox_pending is 'Partial index over pending rows only — the relay claim query stays cheap regardless of relayed backlog.';
 --rollback drop table outbox;
+
+--changeset opentmf-outbox:002-outbox-hold-and-cancel
+-- 1.1.0, ADDITIVE (001 is never edited): the scheduled-send HOLD and the cancellation of an
+-- unreleased effect. Both nullable; a 1.0.0 consumer upgrades with zero changes. The state
+-- model gains its fourth leg: cancelled = cancelled_on is not null (only unrelayed rows can be
+-- cancelled, so relayed and cancelled never overlap); pending/parked now also require
+-- cancelled_on is null. Neither column is touched by the retry backoff - the hold is frozen at
+-- write time and the failure bookkeeping lives in next_attempt_on alone.
+alter table outbox add column release_at timestamp with time zone;
+alter table outbox add column cancelled_on timestamp with time zone;
+
+comment on table outbox is 'Transactional outbox (library-owned, opentmf-outbox-service): effects frozen at commit, relayed at-least-once in id order. Pending = relayed_on is null and cancelled_on is null; parked = pending and attempts >= max-attempts; relayed = relayed_on is not null; cancelled = cancelled_on is not null. A pending row with a future release_at is HELD (not claimable until then). Relayed and cancelled rows pruned after the configured retention (default 7 days), parked rows never pruned automatically.';
+comment on column outbox.release_at is 'Optional scheduled-send hold, frozen at write time: the row is not claimable before this instant. Null = no hold. Never moved by the retry backoff (that is next_attempt_on).';
+comment on column outbox.cancelled_on is 'Cancellation time of an UNRELEASED effect (ops action); null = not cancelled. A cancelled row is never relayed, is retained for audit and pruned with the relayed retention.';
+--rollback alter table outbox drop column cancelled_on;
+--rollback alter table outbox drop column release_at;
