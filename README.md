@@ -230,6 +230,27 @@ OutboxClientProfileResolver outboxClientProfileResolver(MyNamedClients clients) 
 
 Returning `null` falls back to the plain default client.
 
+### Post-relay bookkeeping (`OutboxRelayedListener`)
+
+Consumer bookkeeping that must commit **atomically with the delivery** — e.g.
+stamping a business record's state together with `relayed_on` — registers an
+`OutboxRelayedListener` bean (any number; invoked in bean order):
+
+```java
+@Bean
+OutboxRelayedListener recordStateStamp(RecordRepository records) {
+  return event -> records.markInProgress(event.getAggregateId());
+}
+```
+
+The listener runs inside the claim transaction, after the effect is delivered,
+with `relayedOn` already set on the managed entity. A thrown exception undoes
+the stamp and books an ordinary delivery failure (backoff, park at max) — the
+publish then repeats, so the destination dedups via the idempotency key as for
+any at-least-once redelivery — and a listener that keeps failing parks the row
+only after `max-attempts` republishes, so make it idempotent and reliable. Keep
+implementations same-database and fast: they run on the single relay thread.
+
 ### Ops endpoints
 
 Served under `/ops` on the main port (disable with

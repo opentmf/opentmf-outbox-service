@@ -11,7 +11,9 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -60,11 +62,19 @@ class OutboxRoundTripIT {
     registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
   }
 
+  /** Rows the post-relay seam saw — proves the auto-config collects listener beans. */
+  static final Set<Long> RELAYED_SEEN = ConcurrentHashMap.newKeySet();
+
   @TestConfiguration
   static class TxTemplateConfig {
     @Bean
     TransactionTemplate transactionTemplate(PlatformTransactionManager txManager) {
       return new TransactionTemplate(txManager);
+    }
+
+    @Bean
+    OutboxRelayedListener recordingRelayedListener() {
+      return event -> RELAYED_SEEN.add(event.getId());
     }
   }
 
@@ -122,6 +132,9 @@ class OutboxRoundTripIT {
         .atMost(Duration.ofSeconds(10))
         .untilAsserted(
             () -> assertThat(maintenance.inspect(appended.getId()).relayedOn()).isNotNull());
+
+    // the post-relay seam fired for this row (auto-config collected the listener bean)
+    assertThat(appended.getId()).isIn(RELAYED_SEEN);
   }
 
   @Test
