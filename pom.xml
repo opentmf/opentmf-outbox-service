@@ -70,9 +70,10 @@
     <!-- Stable-only filter for versions:display-* goals. -->
     <maven.version.ignore>.*-M\d+,.*-RC\d+,.*-SNAPSHOT,(?i).*-(alpha|beta)\d*</maven.version.ignore>
 
-    <!-- opentmf BOM — the de-facto inventory of opentmf artifacts; never pin an
-         opentmf artifact's version directly; always the latest release. -->
-    <opentmf-versions.version>2.1.19</opentmf-versions.version>
+    <!-- An opentmf library never imports the opentmf-versions BOM (the BOM
+         aggregates the libraries — a library importing it would be a cycle in
+         spirit and a lockstep coupling in practice). Direct property pin. -->
+    <tmf630-toolkit.version>3.1.1</tmf630-toolkit.version>
 
     <!-- Non-BOM-managed pins live here so versions:display-property-updates sees them. -->
     <archunit.version>1.5.0</archunit.version>
@@ -100,18 +101,6 @@
     <maven-gpg-plugin.version>3.2.8</maven-gpg-plugin.version>
     <central-publishing-maven-plugin.version>0.11.0</central-publishing-maven-plugin.version>
   </properties>
-
-  <dependencyManagement>
-    <dependencies>
-      <dependency>
-        <groupId>org.opentmf</groupId>
-        <artifactId>opentmf-versions</artifactId>
-        <version>${opentmf-versions.version}</version>
-        <type>pom</type>
-        <scope>import</scope>
-      </dependency>
-    </dependencies>
-  </dependencyManagement>
 
   <dependencies>
     <!-- ================================================================ -->
@@ -162,6 +151,7 @@
     <dependency>
       <groupId>org.opentmf.query</groupId>
       <artifactId>tmf630-toolkit-all</artifactId>
+      <version>${tmf630-toolkit.version}</version>
       <optional>true</optional>
     </dependency>
     <dependency>
