@@ -13,7 +13,7 @@
 
   <groupId>org.opentmf.util</groupId>
   <artifactId>opentmf-outbox-service</artifactId>
-  <version>1.1.0-SNAPSHOT</version>
+  <version>1.1.0</version>
   <packaging>jar</packaging>
 
   <name>opentmf-outbox-service</name>
@@ -55,7 +55,7 @@
     <url>https://github.com/opentmf/opentmf-outbox-service</url>
     <connection>scm:git:git@github.com:opentmf/opentmf-outbox-service.git</connection>
     <developerConnection>scm:git:git@github.com:opentmf/opentmf-outbox-service.git</developerConnection>
-    <tag>HEAD</tag>
+    <tag>opentmf-outbox-service-1.1.0</tag>
   </scm>
 
   <properties>
@@ -434,8 +434,7 @@
               </outputFormats>
               <timestampedReports>false</timestampedReports>
               <!-- withHistory is WHY the 1.19.6 hold exists. KNOWN COST
-                   (the un-retired <=1.19 gotcha): the history file is keyed on mutated-class hashes ONLY — strengthening a TEST does not invalidate an entry, so DELETE the history file before a survivor
-                   review or after material test changes. -->
+                   (the un-retired <=1.19 gotcha): the history file is keyed on mutated-class hashes ONLY — strengthening a TEST does not invalidate an entry, so DELETE the history file before a survivor review or after material test changes. -->
               <withHistory>true</withHistory>
               <!-- NO mutationThreshold — survivor review is the unit of work. -->
             </configuration>
