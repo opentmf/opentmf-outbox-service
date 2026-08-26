@@ -22,7 +22,7 @@ public enum OutboxStateFilter {
   public static OutboxStateFilter fromWire(String wire) {
     try {
       return valueOf(wire.toUpperCase(Locale.ROOT));
-    } catch (IllegalArgumentException _) {
+    } catch (IllegalArgumentException ignored) {
       throw new IllegalArgumentException(
           "Unknown outbox state '%s' - the closed set is pending|parked|relayed".formatted(wire));
     }

@@ -77,7 +77,7 @@ class OutboxRelay {
       if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
         executor.shutdownNow();
       }
-    } catch (InterruptedException _) {
+    } catch (InterruptedException ignored) {
       Thread.currentThread().interrupt();
       executor.shutdownNow();
     }

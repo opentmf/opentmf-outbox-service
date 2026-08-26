@@ -53,7 +53,7 @@
   </scm>
 
   <properties>
-    <java.version>25</java.version>
+    <java.version>17</java.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
     <!-- Explicit-name rule (ArchUnit-enforced in consumers): keep -parameters off
@@ -70,6 +70,7 @@
     <!-- Non-BOM-managed pins live here so versions:display-property-updates sees them. -->
     <archunit.version>1.5.0</archunit.version>
     <jacoco-maven-plugin.version>0.8.15</jacoco-maven-plugin.version>
+    <maven-enforcer-plugin.version>3.6.2</maven-enforcer-plugin.version>
 
     <!-- jakarta classifier needs the explicit version (shared with querydsl-apt). -->
     <querydsl.version>5.1.0</querydsl.version>
@@ -356,7 +357,32 @@
           </execution>
         </executions>
       </plugin>
-    </plugins>
+          <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-enforcer-plugin</artifactId>
+        <version>${maven-enforcer-plugin.version}</version>
+        <executions>
+          <execution>
+            <id>enforce-toolchain</id>
+            <goals>
+              <goal>enforce</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <requireJavaVersion>
+                  <version>[17,18)</version>
+                  <message>This library builds with JDK 17.x (its bytecode/API baseline). Use a 17 JDK.</message>
+                </requireJavaVersion>
+                <requireMavenVersion>
+                  <version>[3.9,3.10)</version>
+                  <message>This library builds with Maven 3.9.x.</message>
+                </requireMavenVersion>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+</plugins>
   </build>
 
   <profiles>
@@ -409,7 +435,6 @@
       <properties>
         <sonar.host.url>http://localhost:9000</sonar.host.url>
         <sonar.projectKey>opentmf-outbox-service</sonar.projectKey>
-        <sonar.scanner.skipJreProvisioning>true</sonar.scanner.skipJreProvisioning>
       </properties>
       <build>
         <plugins>
