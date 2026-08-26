@@ -282,6 +282,14 @@ The library is self-contained for consumer testing — no test-jar needed:
 1. Include the library changelog and delete your own `outbox` changeset file —
    fold, never migrate. Environments that already ran a pre-library changeset
    are yours to transition (schema rebuild or a local one-off).
+   **Sharp edge — the id sequence IS the idempotency key.** A schema rebuild
+   restarts the identity at 1, so new rows REUSE old
+   `<service>:outbox:<id>` keys — and every §14-disciplined consumer will
+   silently drop your new events as replays (no error, no lag, no reaction;
+   found the hard way on the dnms e2e cluster, 2026-08-26). After any table
+   rebuild in an environment with live consumers, restart the identity above
+   the used range:
+   `alter table outbox alter column id restart with <safely-high-value>;`
 2. Replace your writer/relay/park classes with `OutboxWriter` + configuration.
    The idempotency-key format is `<spring.application.name>:outbox:<id>`.
 3. Move dashboards and alerts to the library-stable metric names above.
