@@ -1,7 +1,7 @@
 package org.opentmf.outbox;
 
 /**
- * Post-relay hook (the 681 trial-fit finding, 2026-08-26): consumer bookkeeping that must ride
+ * Post-relay hook: consumer bookkeeping that must ride
  * the SAME claim transaction as the delivery — e.g. stamping a business record's state
  * atomically with {@code relayed_on}, so the effect and its book entry commit or repeat
  * together. Register any number of beans; the relay invokes them in bean order right after the
@@ -9,8 +9,10 @@ package org.opentmf.outbox;
  *
  * <p>A thrown exception books an ordinary delivery failure on the row ({@code relayed_on} is
  * cleared, attempts++, backoff, park at max) — the publish then REPEATS, so the destination
- * must dedup via the {@code x-idempotency-key} exactly as for any at-least-once redelivery.
- * Keep implementations same-database and fast: this runs on the single relay thread, and its
+ * must dedup via the {@code x-idempotency-key} exactly as for any at-least-once redelivery. A
+ * listener that keeps failing parks the row only after {@code max-attempts} REPUBLISHES of the
+ * effect - so a listener must be idempotent and reliable, not merely fast. Keep implementations
+ * same-database and fast: this runs on the single relay thread, and its
  * writes share the claim transaction by design.
  *
  * <p>Without this seam, per-destination bookkeeping forces a decorating {@link OutboxPublisher}

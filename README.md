@@ -247,8 +247,9 @@ The listener runs inside the claim transaction, after the effect is delivered,
 with `relayedOn` already set on the managed entity. A thrown exception undoes
 the stamp and books an ordinary delivery failure (backoff, park at max) — the
 publish then repeats, so the destination dedups via the idempotency key as for
-any at-least-once redelivery. Keep implementations same-database and fast: they
-run on the single relay thread.
+any at-least-once redelivery — and a listener that keeps failing parks the row
+only after `max-attempts` republishes, so make it idempotent and reliable. Keep
+implementations same-database and fast: they run on the single relay thread.
 
 ### Ops endpoints
 

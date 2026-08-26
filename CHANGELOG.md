@@ -17,7 +17,7 @@ Initial release of the transactional outbox as a Spring Boot starter.
   derived-state sub-resource, forensic inspect. Consumers own the security rows.
 - `OutboxRelayedListener` post-relay seam: consumer bookkeeping inside the claim
   transaction, atomic with `relayed_on`; a throwing listener books an ordinary
-  delivery failure and the publish repeats (dnms-681 trial-fit finding).
+  delivery failure and the publish repeats (found during a consumer trial fit).
 - Library-owned Liquibase changelog (one clean create); library-stable
   `opentmf.outbox.*` metrics.
 - Public contract in `org.opentmf.outbox`; implementation in

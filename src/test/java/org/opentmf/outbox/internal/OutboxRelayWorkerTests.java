@@ -9,6 +9,7 @@ import static org.mockito.Mockito.when;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxEvent;
@@ -23,7 +24,7 @@ class OutboxRelayWorkerTests {
   private final OutboxPublisherRouter router = mock(OutboxPublisherRouter.class);
   private final OutboxProperties properties = new OutboxProperties();
   private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
-  private final List<OutboxRelayedListener> listeners = new java.util.ArrayList<>();
+  private final List<OutboxRelayedListener> listeners = new ArrayList<>();
   private final OutboxRelayWorker worker =
       new OutboxRelayWorker(
           repository,
@@ -84,7 +85,7 @@ class OutboxRelayWorkerTests {
   void relayedListeners_runInsideTheSuccessPath_withTheStampVisible() {
     OutboxEvent event = pending(1L, 0);
     when(repository.claimBatch(any(), anyInt(), any(Limit.class))).thenReturn(List.of(event));
-    List<Object> seenRelayedOn = new java.util.ArrayList<>();
+    List<Object> seenRelayedOn = new ArrayList<>();
     listeners.add(e -> seenRelayedOn.add(e.getRelayedOn()));
 
     worker.relayBatch();

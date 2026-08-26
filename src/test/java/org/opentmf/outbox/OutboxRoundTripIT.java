@@ -11,7 +11,9 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -61,7 +63,7 @@ class OutboxRoundTripIT {
   }
 
   /** Rows the post-relay seam saw — proves the auto-config collects listener beans. */
-  static final java.util.Set<Long> RELAYED_SEEN = java.util.concurrent.ConcurrentHashMap.newKeySet();
+  static final Set<Long> RELAYED_SEEN = ConcurrentHashMap.newKeySet();
 
   @TestConfiguration
   static class TxTemplateConfig {
@@ -132,7 +134,7 @@ class OutboxRoundTripIT {
             () -> assertThat(maintenance.inspect(appended.getId()).relayedOn()).isNotNull());
 
     // the post-relay seam fired for this row (auto-config collected the listener bean)
-    assertThat(RELAYED_SEEN).contains(appended.getId());
+    assertThat(appended.getId()).isIn(RELAYED_SEEN);
   }
 
   @Test
