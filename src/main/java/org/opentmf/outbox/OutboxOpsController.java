@@ -60,7 +60,13 @@ public class OutboxOpsController {
    * The PARKED rows - the derived state a wire filter cannot express (pending AND
    * {@code attempts >= max-attempts}, a CONFIG comparison). Paged; the break-glass
    * {@code unpark} takes the ids this names.
+   *
+   * <p>{@code @Tmf630Response} here is about RENDERING consistency, not filtering: without it
+   * a {@code Page} serializes as raw {@code PageImpl} JSON ({@code {"content":[...]}}) while
+   * the list sibling renders the toolkit's bare array + count headers - one surface, two wire
+   * shapes (caught by the adapter adoption's OpsIT, 2026-08-26).
    */
+  @Tmf630Response
   @GetMapping(path = "/outbox/parked", produces = MediaType.APPLICATION_JSON_VALUE)
   public Page<OutboxRowView> parked(Pageable pageable) {
     return maintenance.list(null, OutboxStateFilter.PARKED, pageable);

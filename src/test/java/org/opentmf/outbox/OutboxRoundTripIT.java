@@ -147,8 +147,12 @@ class OutboxRoundTripIT {
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.payload").isNotEmpty());
 
-    // the derived-state sub-resource: nothing parks in a healthy round-trip
-    mockMvc.perform(get("/ops/outbox/parked")).andExpect(status().isOk());
+    // the derived-state sub-resource: nothing parks in a healthy round-trip — and the wire
+    // shape is the toolkit's BARE ARRAY, never raw PageImpl JSON (one surface, one shape)
+    mockMvc
+        .perform(get("/ops/outbox/parked"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$").isArray());
 
     // the toolkit's OWN strictness stands untouched: an unknown filter field is a 400
     mockMvc
