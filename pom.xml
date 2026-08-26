@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
   <!-- Spring Boot via <parent>: the library compiles against the
@@ -9,12 +8,12 @@
     <groupId>org.springframework.boot</groupId>
     <artifactId>spring-boot-starter-parent</artifactId>
     <version>4.1.1</version>
-    <relativePath/>
+    <relativePath />
   </parent>
 
   <groupId>org.opentmf.util</groupId>
   <artifactId>opentmf-outbox-service</artifactId>
-  <version>1.0.0-SNAPSHOT</version>
+  <version>1.0.0</version>
   <packaging>jar</packaging>
 
   <name>opentmf-outbox-service</name>
@@ -56,7 +55,7 @@
     <url>https://github.com/opentmf/opentmf-outbox-service</url>
     <connection>scm:git:git@github.com:opentmf/opentmf-outbox-service.git</connection>
     <developerConnection>scm:git:git@github.com:opentmf/opentmf-outbox-service.git</developerConnection>
-    <tag>HEAD</tag>
+    <tag>opentmf-outbox-service-1.0.0</tag>
   </scm>
 
   <properties>
@@ -169,8 +168,7 @@
 
     <!-- The library-provided seal rule (OutboxArchRules) — optional: only test
          classpaths ever see it. anything older
-         (<=1.4.x ASM) cannot parse Java 25 bytecode (class file major 69) and the
-         rule silently checks NOTHING — caught by OutboxArchRulesTests. -->
+         (<=1.4.x ASM) cannot parse Java 25 bytecode (class file major 69) and the rule silently checks NOTHING — caught by OutboxArchRulesTests. -->
     <dependency>
       <groupId>com.tngtech.archunit</groupId>
       <artifactId>archunit</artifactId>
@@ -436,8 +434,7 @@
               </outputFormats>
               <timestampedReports>false</timestampedReports>
               <!-- withHistory is WHY the 1.19.6 hold exists. KNOWN COST
-                   (the un-retired <=1.19 gotcha): the history file is keyed on
-                   mutated-class hashes ONLY — strengthening a TEST does not
+                   (the un-retired <=1.19 gotcha): the history file is keyed on mutated-class hashes ONLY — strengthening a TEST does not
                    invalidate an entry, so DELETE the history file before a survivor
                    review or after material test changes. -->
               <withHistory>true</withHistory>
