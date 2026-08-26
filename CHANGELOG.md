@@ -2,8 +2,7 @@
 
 ## 1.0.0 (unreleased)
 
-Initial extraction of the §23 transactional outbox from the dnms-email-adapter
-reference implementation.
+Initial release of the transactional outbox as a Spring Boot starter.
 
 - Same-transaction append (`OutboxWriter`, propagation MANDATORY), payload
   frozen at write time; after-commit relay poke + fixed-delay sweep into one
@@ -17,5 +16,8 @@ reference implementation.
 - `/ops` surface: prune, unpark break-glass, TMF630 triage list, `/parked`
   derived-state sub-resource, forensic inspect. Consumers own the security rows.
 - Library-owned Liquibase changelog (one clean create); library-stable
-  `opentmf.outbox.*` metrics; `OutboxArchRules.consumersUseOnlyTheSeams()`
-  seal rule (ArchUnit ≥ 1.5.0).
+  `opentmf.outbox.*` metrics.
+- Public contract in `org.opentmf.outbox`; implementation in
+  `org.opentmf.outbox.internal` (no compatibility promise);
+  `OutboxArchRules.consumersUseOnlyTheSeams()` enforces both the package
+  boundary and the no-consumer-repository rule (ArchUnit ≥ 1.5.0).

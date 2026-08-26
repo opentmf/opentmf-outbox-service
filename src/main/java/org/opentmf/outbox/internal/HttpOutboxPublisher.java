@@ -1,7 +1,10 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
+import org.opentmf.outbox.OutboxClientProfileResolver;
+import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxPublisher;
 import org.springframework.http.MediaType;
 import org.springframework.web.client.RestClient;
 import tools.jackson.core.type.TypeReference;
@@ -9,7 +12,7 @@ import tools.jackson.databind.ObjectMapper;
 
 /**
  * The HTTP publisher: {@code http(s)://} destinations are POSTed the row's payload as JSON,
- * with the S14 relay headers as HTTP headers. Client selection (2026-08-26 hub ruling): an
+ * with the relay headers as HTTP headers. Client selection: an
  * explicit per-row {@code clientProfile} - or, absent one, the consumer's
  * {@link OutboxClientProfileResolver} may match the destination by base-url longest prefix;
  * no resolver or no match = the plain default client (a subscriber needing auth is onboarded

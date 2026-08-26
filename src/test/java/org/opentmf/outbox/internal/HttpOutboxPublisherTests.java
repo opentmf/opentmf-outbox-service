@@ -1,4 +1,4 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
@@ -9,6 +9,8 @@ import static org.springframework.test.web.client.response.MockRestResponseCreat
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
 
 import org.junit.jupiter.api.Test;
+import org.opentmf.outbox.OutboxClientProfileResolver;
+import org.opentmf.outbox.OutboxEvent;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.test.web.client.MockRestServiceServer;
@@ -16,7 +18,7 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientResponseException;
 import tools.jackson.databind.ObjectMapper;
 
-/** POSTs the payload with S14 headers; profile selection; non-2xx unwinds to the relay. */
+/** POSTs the payload with the relay headers; profile selection; non-2xx unwinds to the relay. */
 class HttpOutboxPublisherTests {
 
   private static OutboxEvent event(String destination, String profile) {
@@ -113,7 +115,8 @@ class HttpOutboxPublisherTests {
     HttpOutboxPublisher publisher =
         new HttpOutboxPublisher(builder.build(), null, new ObjectMapper(), "svc");
 
+    OutboxEvent event = event("https://hub/cb", null);
     assertThatExceptionOfType(RestClientResponseException.class)
-        .isThrownBy(() -> publisher.publish(event("https://hub/cb", null)));
+        .isThrownBy(() -> publisher.publish(event));
   }
 }

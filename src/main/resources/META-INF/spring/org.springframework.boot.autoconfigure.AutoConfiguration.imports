@@ -1,1 +1,1 @@
-org.opentmf.outbox.OutboxAutoConfiguration
+org.opentmf.outbox.internal.OutboxAutoConfiguration

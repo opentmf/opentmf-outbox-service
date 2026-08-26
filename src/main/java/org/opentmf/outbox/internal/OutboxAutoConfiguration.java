@@ -1,12 +1,18 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import java.util.List;
+import org.opentmf.outbox.OutboxClientProfileResolver;
+import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxMaintenanceService;
+import org.opentmf.outbox.OutboxProperties;
+import org.opentmf.outbox.OutboxPublisher;
+import org.opentmf.outbox.OutboxWriter;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.AutoConfigurationPackage;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
-import org.springframework.boot.autoconfigure.AutoConfigurationPackage;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.ApplicationEventPublisher;
@@ -18,7 +24,7 @@ import org.springframework.web.client.RestClient;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * Auto-configuration of the S23 outbox starter: entity + repository registration, the writer,
+ * Auto-configuration of the outbox starter: entity + repository registration, the writer,
  * the relay chain, the publisher SPI defaults (Kafka when a template exists; HTTP when
  * spring-web does) and the /ops trio (on by default; {@code opentmf.outbox.ops-endpoints=false}
  * disables). The consumer supplies: a DataSource/JPA, the Liquibase include of
@@ -32,8 +38,8 @@ import tools.jackson.databind.ObjectMapper;
     })
 // @AutoConfigurationPackage, NOT @EntityScan/@EnableJpaRepositories: an explicit scan
 // declaration anywhere REPLACES Boot's default auto-configuration-package scanning, so the
-// library's would have erased the CONSUMER's own entities and repositories (adapter adoption
-// 2026-08-26: every IT died with "No qualifying bean of type EmailTransportRepository").
+// library's would have erased the CONSUMER's own entities and repositories (symptom: every
+// consumer repository bean vanishes - "No qualifying bean of type ...Repository").
 // This annotation instead ADDS org.opentmf.outbox to the default scan roots, so Hibernate and
 // Spring Data pick up OutboxEvent + OutboxEventRepository BESIDE the consumer's own. Caveat a
 // consumer that declares its OWN @EntityScan/@EnableJpaRepositories overrides the defaults and

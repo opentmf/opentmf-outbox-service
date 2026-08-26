@@ -3,10 +3,9 @@ package org.opentmf.outbox;
 import java.util.Locale;
 
 /**
- * The ops list state vocabulary - a CLOSED set whose closure IS the contract (the 2026-08-25
- * wire-vocabulary rule: S23 defines exactly these three DERIVED states; a fourth would break
- * the no-status-column design, so an unknown value fails loudly at the binding, never
- * tolerated). Filtering semantics:
+ * The ops list state vocabulary - a CLOSED set whose closure IS the contract (the outbox
+ * defines exactly these three DERIVED states; a fourth would break the no-status-column design,
+ * so an unknown value fails loudly at the binding, never tolerated). Filtering semantics:
  *
  * <ul>
  *   <li>{@code pending} - {@code relayed_on is null} (parked INCLUDED: parked is a sub-state)
@@ -23,7 +22,7 @@ public enum OutboxStateFilter {
   public static OutboxStateFilter fromWire(String wire) {
     try {
       return valueOf(wire.toUpperCase(Locale.ROOT));
-    } catch (IllegalArgumentException e) {
+    } catch (IllegalArgumentException _) {
       throw new IllegalArgumentException(
           "Unknown outbox state '%s' - the closed set is pending|parked|relayed".formatted(wire));
     }

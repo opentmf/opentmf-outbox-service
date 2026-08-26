@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException
 import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -15,6 +16,8 @@ import java.util.List;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.opentmf.outbox.internal.OutboxAppended;
+import org.opentmf.outbox.internal.OutboxEventRepository;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
@@ -106,7 +109,7 @@ class OutboxMaintenanceServiceTests {
     service.list(null, OutboxStateFilter.RELAYED, PageRequest.of(0, 20));
     service.list(QOutboxEvent.outboxEvent.eventType.eq("e.v1"), null, PageRequest.of(0, 20));
 
-    verify(repository, org.mockito.Mockito.times(3))
+    verify(repository, times(3))
         .findAll(predicate.capture(), any(Pageable.class));
     assertThat(predicate.getAllValues().get(0).toString())
         .contains("eventType = e.v1")

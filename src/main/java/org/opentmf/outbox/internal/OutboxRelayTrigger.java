@@ -1,4 +1,4 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -8,7 +8,7 @@ import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 
 /**
- * The after-commit nudge (the S14 OrchestrateTrigger pattern): once the business transaction
+ * The after-commit nudge: once the business transaction
  * that appended an outbox row COMMITS, poke the relay. {@code fallbackExecution = true} covers
  * non-transactional callers; {@code NOT_SUPPORTED} keeps the listener out of any ambient
  * transaction. Poking never fails the caller - the sweep is the safety net.

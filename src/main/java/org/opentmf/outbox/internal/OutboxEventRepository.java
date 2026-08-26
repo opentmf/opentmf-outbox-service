@@ -1,10 +1,14 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import jakarta.persistence.LockModeType;
 import jakarta.persistence.QueryHint;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
+import org.opentmf.outbox.OutboxArchRules;
+import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxMaintenanceService;
+import org.opentmf.outbox.OutboxWriter;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
@@ -17,13 +21,13 @@ import org.springframework.data.repository.query.Param;
  * Repository for {@link OutboxEvent}. Accessed only by the library itself (writer, relay,
  * metrics, maintenance) — consumers go through {@link OutboxWriter} and
  * {@link OutboxMaintenanceService}; the seal is enforceable via {@link OutboxArchRules}.
- * {@link QuerydslPredicateExecutor} backs the TMF630 ops list (2026-08-26 toolkit amendment).
+ * {@link QuerydslPredicateExecutor} backs the TMF630 ops list.
  */
-interface OutboxEventRepository
+public interface OutboxEventRepository
     extends JpaRepository<OutboxEvent, Long>, QuerydslPredicateExecutor<OutboxEvent> {
 
   /**
-   * The §23 claim query: {@code select … for update skip locked} over pending, due, non-parked
+   * The claim query: {@code select … for update skip locked} over pending, due, non-parked
    * rows in {@code id} order. The pessimistic lock plus SKIP LOCKED (Hibernate lock timeout
    * {@code -2}) is the cross-pod guard; within a pod the relay is single-threaded.
    */
@@ -37,7 +41,7 @@ interface OutboxEventRepository
   List<OutboxEvent> claimBatch(
       @Param("now") OffsetDateTime now, @Param("maxAttempts") int maxAttempts, Limit limit);
 
-  /** Pending rows (§23 derived state) — backs the {@code pending} gauge. */
+  /** Pending rows (derived state) — backs the {@code pending} gauge. */
   long countByRelayedOnIsNull();
 
   /** Parked rows (pending AND attempts exhausted) — backs the {@code parked} gauge. */
@@ -49,7 +53,7 @@ interface OutboxEventRepository
 
   /**
    * Retention pruning: deletes rows relayed before the cutoff. Parked rows have
-   * {@code relayed_on is null}, so they structurally never match — §23: parked rows are NEVER
+   * {@code relayed_on is null}, so they structurally never match — parked rows are NEVER
    * pruned automatically.
    */
   long deleteByRelayedOnBefore(OffsetDateTime cutoff);

@@ -1,4 +1,4 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -11,6 +11,8 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.OffsetDateTime;
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxProperties;
 import org.springframework.data.domain.Limit;
 
 /** Success stamps relayed_on; failure books attempts+backoff; park at max-attempts. */

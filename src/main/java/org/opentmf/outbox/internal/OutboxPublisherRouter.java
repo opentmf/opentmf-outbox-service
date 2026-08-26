@@ -1,7 +1,9 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import java.util.List;
 import lombok.RequiredArgsConstructor;
+import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxPublisher;
 
 /**
  * Routes each claimed row to the first {@link OutboxPublisher} that supports it (bean order -

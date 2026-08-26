@@ -1,15 +1,18 @@
 package org.opentmf.outbox;
 
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.Map;
 import lombok.RequiredArgsConstructor;
+import org.opentmf.outbox.internal.OutboxAppended;
+import org.opentmf.outbox.internal.OutboxEventRepository;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * The write side of the §23 outbox: appends one outbox row in the CALLER's transaction
+ * The write side of the outbox: appends one outbox row in the CALLER's transaction
  * (propagation {@code MANDATORY} — never dual-write, never a transaction of its own). The
  * payload is serialized at write time: the event is a fact frozen at commit, not re-read later.
  *
@@ -24,7 +27,7 @@ public class OutboxWriter {
   private final ObjectMapper objectMapper;
 
   /**
-   * Appends an outbox row without extra headers. The relay stamps the §14 relay headers
+   * Appends an outbox row without extra headers. The relay stamps the relay headers
    * ({@code x-idempotency-key}, {@code x-event-type}, {@code x-producer}) at publish time.
    *
    * @param aggregateType aggregate kind, e.g. {@code party-interaction}
@@ -43,7 +46,7 @@ public class OutboxWriter {
   }
 
   /**
-   * Appends an outbox row with additional §14 headers frozen at write time (e.g.
+   * Appends an outbox row with additional headers frozen at write time (e.g.
    * {@code x-schema-version}). Relay-stamped headers win over same-named stored ones.
    */
   @Transactional(propagation = Propagation.MANDATORY)
@@ -54,8 +57,8 @@ public class OutboxWriter {
   }
 
   /**
-   * Appends an HTTP-destined row selecting a NAMED client profile for delivery (the 2026-08-26
-   * hub ruling's per-row selector). {@code clientProfile} null = the HTTP publisher's own
+   * Appends an HTTP-destined row selecting a NAMED client profile for delivery (the
+   * per-row selector). {@code clientProfile} null = the HTTP publisher's own
    * resolution; ignored entirely for Kafka destinations.
    */
   @Transactional(propagation = Propagation.MANDATORY)
@@ -78,8 +81,8 @@ public class OutboxWriter {
     event.setClientProfile(clientProfile);
     event.setPayload(objectMapper.writeValueAsString(payload));
     event.setHeaders(headers.isEmpty() ? null : objectMapper.writeValueAsString(headers));
-    event.setCreatedOn(OffsetDateTime.now());
-    event.setNextAttemptOn(OffsetDateTime.now());
+    event.setCreatedOn(OffsetDateTime.now(ZoneOffset.UTC));
+    event.setNextAttemptOn(OffsetDateTime.now(ZoneOffset.UTC));
     OutboxEvent saved = repository.save(event);
     eventPublisher.publishEvent(new OutboxAppended(saved.getId()));
     return saved;

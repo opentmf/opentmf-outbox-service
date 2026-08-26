@@ -1,4 +1,4 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;

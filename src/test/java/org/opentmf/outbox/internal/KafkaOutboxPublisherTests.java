@@ -1,4 +1,4 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
@@ -12,12 +12,14 @@ import java.util.concurrent.CompletableFuture;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxProperties;
 import org.springframework.kafka.KafkaException;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
 import tools.jackson.databind.ObjectMapper;
 
-/** S14 headers stamped, key = aggregateId, ack awaited, failures unwind to the relay. */
+/** Relay headers stamped, key = aggregateId, ack awaited, failures unwind to the relay. */
 class KafkaOutboxPublisherTests {
 
   @SuppressWarnings("unchecked")
@@ -53,14 +55,14 @@ class KafkaOutboxPublisherTests {
 
     publisher.publish(event("topic", "{\"x-event-type\":\"stored\",\"x-custom\":\"kept\"}"));
 
-    ArgumentCaptor<ProducerRecord<Object, Object>> record =
+    ArgumentCaptor<ProducerRecord<Object, Object>> sent =
         ArgumentCaptor.forClass(ProducerRecord.class);
-    verify(template).send(record.capture());
-    assertThat(record.getValue().key()).isEqualTo("agg-1");
-    assertThat(header(record.getValue(), "x-idempotency-key")).isEqualTo("svc:outbox:7");
-    assertThat(header(record.getValue(), "x-event-type")).isEqualTo("e.v1"); // relay wins
-    assertThat(header(record.getValue(), "x-custom")).isEqualTo("kept"); // stored survives
-    assertThat(header(record.getValue(), "x-producer")).isEqualTo("svc");
+    verify(template).send(sent.capture());
+    assertThat(sent.getValue().key()).isEqualTo("agg-1");
+    assertThat(header(sent.getValue(), "x-idempotency-key")).isEqualTo("svc:outbox:7");
+    assertThat(header(sent.getValue(), "x-event-type")).isEqualTo("e.v1"); // relay wins
+    assertThat(header(sent.getValue(), "x-custom")).isEqualTo("kept"); // stored survives
+    assertThat(header(sent.getValue(), "x-producer")).isEqualTo("svc");
   }
 
   @Test
@@ -80,8 +82,9 @@ class KafkaOutboxPublisherTests {
     when(template.send(any(ProducerRecord.class)))
         .thenReturn(CompletableFuture.failedFuture(new RuntimeException("broker gone")));
 
+    OutboxEvent event = event("topic", null);
     assertThatExceptionOfType(KafkaException.class)
-        .isThrownBy(() -> publisher.publish(event("topic", null)))
+        .isThrownBy(() -> publisher.publish(event))
         .withMessageContaining("row 7");
   }
 
@@ -95,8 +98,9 @@ class KafkaOutboxPublisherTests {
     when(template.isTransactional()).thenReturn(false);
     when(template.send(any(ProducerRecord.class))).thenReturn(new CompletableFuture<>());
 
+    OutboxEvent event = event("topic", null);
     assertThatExceptionOfType(KafkaException.class)
-        .isThrownBy(() -> slow.publish(event("topic", null)))
+        .isThrownBy(() -> slow.publish(event))
         .withMessageContaining("Failed to publish");
   }
 
@@ -106,10 +110,11 @@ class KafkaOutboxPublisherTests {
     when(template.isTransactional()).thenReturn(false);
     when(template.send(any(ProducerRecord.class))).thenReturn(new CompletableFuture<>());
 
+    OutboxEvent event = event("topic", null);
     Thread.currentThread().interrupt();
     try {
       assertThatExceptionOfType(KafkaException.class)
-          .isThrownBy(() -> publisher.publish(event("topic", null)))
+          .isThrownBy(() -> publisher.publish(event))
           .withMessageContaining("Interrupted");
       assertThat(Thread.currentThread().isInterrupted()).isTrue(); // flag restored
     } finally {
@@ -117,7 +122,7 @@ class KafkaOutboxPublisherTests {
     }
   }
 
-  private static String header(ProducerRecord<?, ?> record, String name) {
-    return new String(record.headers().lastHeader(name).value(), StandardCharsets.UTF_8);
+  private static String header(ProducerRecord<?, ?> sent, String name) {
+    return new String(sent.headers().lastHeader(name).value(), StandardCharsets.UTF_8);
   }
 }

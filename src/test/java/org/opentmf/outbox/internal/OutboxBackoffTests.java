@@ -1,12 +1,13 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
+import org.opentmf.outbox.OutboxProperties;
 
-/** The S23 backoff arithmetic: exponential from base, capped, attempts >= 1. */
+/** The backoff arithmetic: exponential from base, capped, attempts >= 1. */
 class OutboxBackoffTests {
 
   private final OutboxBackoff backoff = new OutboxBackoff(new OutboxProperties());

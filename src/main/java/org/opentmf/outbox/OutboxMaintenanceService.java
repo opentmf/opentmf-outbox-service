@@ -3,16 +3,19 @@ package org.opentmf.outbox;
 import com.querydsl.core.BooleanBuilder;
 import com.querydsl.core.types.Predicate;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.opentmf.outbox.internal.OutboxAppended;
+import org.opentmf.outbox.internal.OutboxEventRepository;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * The S23 housekeeping + read surface behind the /ops TRIO (prune / unpark / list - the
- * 2026-08-26 ruling): the S25.5 mechanism (CronJob + kicker) triggers {@link #pruneRelayed()};
+ * The housekeeping + read surface behind the /ops trio (prune / unpark / list): a scheduled
+ * job (e.g. a CronJob hitting the prune endpoint) triggers {@link #pruneRelayed()};
  * {@link #unpark(long)} is the explicit break-glass; {@link #list} and {@link #inspect} are the
  * no-direct-DB read half.
  */
@@ -32,7 +35,7 @@ public class OutboxMaintenanceService {
    */
   @Transactional
   public long pruneRelayed() {
-    OffsetDateTime cutoff = OffsetDateTime.now().minus(properties.getRetention());
+    OffsetDateTime cutoff = OffsetDateTime.now(ZoneOffset.UTC).minus(properties.getRetention());
     long pruned = repository.deleteByRelayedOnBefore(cutoff);
     if (pruned > 0) {
       log.info("Pruned {} relayed outbox rows older than {}", pruned, cutoff);
@@ -64,13 +67,13 @@ public class OutboxMaintenanceService {
               .formatted(outboxId, event.getAttempts(), properties.getMaxAttempts()));
     }
     event.setAttempts(0);
-    event.setNextAttemptOn(OffsetDateTime.now());
+    event.setNextAttemptOn(OffsetDateTime.now(ZoneOffset.UTC));
     eventPublisher.publishEvent(new OutboxAppended(outboxId));
     log.info("Outbox row {} unparked - delivery will be retried", outboxId);
   }
 
   /**
-   * The TMF630 triage list (2026-08-26 toolkit amendment): the caller's Querydsl predicate is
+   * The TMF630 triage list: the caller's Querydsl predicate is
    * AND-composed with the CLOSED derived-state filter ({@link OutboxStateFilter} - a config
    * comparison Querydsl cannot express from the wire, hence the dedicated parameter). Payloads
    * are omitted in lists; {@link #inspect(long)} carries them.

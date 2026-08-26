@@ -1,4 +1,4 @@
-package org.opentmf.outbox;
+package org.opentmf.outbox.internal;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
@@ -7,6 +7,9 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxProperties;
+import org.opentmf.outbox.OutboxPublisher;
 import org.springframework.kafka.KafkaException;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
@@ -15,7 +18,7 @@ import tools.jackson.databind.ObjectMapper;
 
 /**
  * The default publisher: any non-HTTP destination is a Kafka topic. Message key =
- * {@code aggregateId} (preserves per-aggregate order); relay-stamped S14 headers:
+ * {@code aggregateId} (preserves per-aggregate order); relay-stamped headers:
  * {@code x-idempotency-key} = {@code <service>:outbox:<id>}, {@code x-event-type},
  * {@code x-producer}. Stored headers apply first; relay-stamped ones win. {@code traceparent}
  * is stamped by Micrometer's Kafka observation, never home-grown.
