@@ -17,11 +17,41 @@
   <packaging>jar</packaging>
 
   <name>opentmf-outbox-service</name>
+  <url>https://github.com/opentmf/opentmf-outbox-service</url>
   <description>Transactional outbox as a Spring Boot starter (CR §23, extracted from
     dnms-email-adapter's sealed module per the 2026-08-26 ruling): library-owned
     Liquibase DDL, an at-least-once single-relay with SKIP LOCKED claims, a pluggable
     publisher SPI (Kafka default, HTTP with per-row client-profile selection), and the
     /ops maintenance TRIO — prune, unpark, and a TMF630-shaped pending list.</description>
+
+  <organization>
+    <name>PiA Group</name>
+    <url>https://www.pia-group.net/</url>
+  </organization>
+
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+      <comments>A permissive open-source license</comments>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <id>gokhanus</id>
+      <name>Gokhan Demir</name>
+      <email>gokhan@opentmf.org</email>
+    </developer>
+  </developers>
+
+  <scm>
+    <url>https://github.com/opentmf/opentmf-outbox-service</url>
+    <connection>scm:git:git@github.com:opentmf/opentmf-outbox-service.git</connection>
+    <developerConnection>scm:git:git@github.com:opentmf/opentmf-outbox-service.git</developerConnection>
+    <tag>HEAD</tag>
+  </scm>
 
   <properties>
     <java.version>25</java.version>
@@ -51,6 +81,13 @@
          whenever the pin is. -->
     <pitest.version>1.19.6</pitest.version>
     <pitest-junit5.version>1.2.3</pitest-junit5.version>
+
+    <!-- Release machinery (donor: opentmf-db-lock-service). The Boot parent manages
+         source/javadoc/deploy; it pins maven-release-plugin at 3.0.1, overridden here to
+         the estate's 3.3.1. gpg + central-publishing are not Boot-managed. -->
+    <maven-release-plugin.version>3.3.1</maven-release-plugin.version>
+    <maven-gpg-plugin.version>3.2.8</maven-gpg-plugin.version>
+    <central-publishing-maven-plugin.version>0.11.0</central-publishing-maven-plugin.version>
   </properties>
 
   <dependencyManagement>
@@ -293,6 +330,18 @@
           </execution>
         </executions>
       </plugin>
+      <!-- Release cut: mvn release:prepare release:perform. The release profile below
+           (sources, javadoc, signing, Central publishing) is activated via
+           releaseProfiles - never useReleaseProfile. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-release-plugin</artifactId>
+        <version>${maven-release-plugin.version}</version>
+        <configuration>
+          <releaseProfiles>release</releaseProfiles>
+          <goals>deploy</goals>
+        </configuration>
+      </plugin>
       <!-- *IT classes (Testcontainers round-trips) run under failsafe at verify. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -343,6 +392,67 @@
                    review or after material test changes. -->
               <withHistory>true</withHistory>
               <!-- NO mutationThreshold — survivor review is the unit of work (§17). -->
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <!-- Release-only plugins live HERE, not in the default build: normal builds do
+         not generate source/javadoc jars, sign, or publish. -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals>
+                  <goal>jar-no-fork</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+                <configuration>
+                  <failOnWarnings>false</failOnWarnings>
+                  <failOnError>false</failOnError>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>${maven-gpg-plugin.version}</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>${central-publishing-maven-plugin.version}</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>publish-to-central</publishingServerId>
+              <autoPublish>true</autoPublish>
             </configuration>
           </plugin>
         </plugins>

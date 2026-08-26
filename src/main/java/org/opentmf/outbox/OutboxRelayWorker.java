@@ -35,6 +35,14 @@ class OutboxRelayWorker {
   /**
    * Claims and relays one batch.
    *
+   * <p>The whole batch runs in ONE transaction, which is safe against the per-row invariant
+   * (a later row's failure must never roll back an earlier row's already-stood publish)
+   * because {@link #relayOne} catches every {@link RuntimeException} and BOOKS it - no
+   * per-row failure ever propagates to the transaction. The residual trade is a SYSTEMIC
+   * failure at commit (the database gone at that instant): every row in the batch is then
+   * redelivered on the next pass - correct under at-least-once plus the idempotency key,
+   * just a blast radius of up to {@code batch-size} rows instead of one, on a rare event.
+   *
    * @return the number of rows claimed - the relay drains while this equals the batch size
    */
   @Transactional
