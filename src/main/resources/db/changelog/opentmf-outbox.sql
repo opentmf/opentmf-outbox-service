@@ -9,6 +9,11 @@
 -- 10); relayed = relayed_on is not null. No triggers, no stored procedures, no CDC.
 -- CONSUMERS include this file from their master changelog and NEVER edit it — schema evolution
 -- arrives by library version bump (the db-lock-service precedent).
+-- ONE clean create and nothing else (pre-release folding rule; Cezmi 2026-08-26: no
+-- onboarding shims either — no dnms consumer is in production, a consumer with a pre-library
+-- outbox table owns its own transition).
+-- (Comment lines here must never BEGIN with the word "changeset": the strict formatted-SQL
+-- parser reads "-- changeset ..." as a malformed header and refuses the whole file.)
 create table outbox (
   id              bigint generated always as identity primary key,
   aggregate_type  varchar(64) not null,

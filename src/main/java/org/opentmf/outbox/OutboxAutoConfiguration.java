@@ -6,14 +6,13 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
+import org.springframework.boot.autoconfigure.AutoConfigurationPackage;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.boot.persistence.autoconfigure.EntityScan;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
-import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.web.client.RestClient;
 import tools.jackson.databind.ObjectMapper;
@@ -31,8 +30,15 @@ import tools.jackson.databind.ObjectMapper;
       "org.springframework.boot.kafka.autoconfigure.KafkaAutoConfiguration",
       "org.springframework.boot.jackson.autoconfigure.JacksonAutoConfiguration"
     })
-@EntityScan(basePackageClasses = OutboxEvent.class)
-@EnableJpaRepositories(basePackageClasses = OutboxEvent.class)
+// @AutoConfigurationPackage, NOT @EntityScan/@EnableJpaRepositories: an explicit scan
+// declaration anywhere REPLACES Boot's default auto-configuration-package scanning, so the
+// library's would have erased the CONSUMER's own entities and repositories (adapter adoption
+// 2026-08-26: every IT died with "No qualifying bean of type EmailTransportRepository").
+// This annotation instead ADDS org.opentmf.outbox to the default scan roots, so Hibernate and
+// Spring Data pick up OutboxEvent + OutboxEventRepository BESIDE the consumer's own. Caveat a
+// consumer that declares its OWN @EntityScan/@EnableJpaRepositories overrides the defaults and
+// must then include this package explicitly.
+@AutoConfigurationPackage(basePackageClasses = OutboxEvent.class)
 @EnableConfigurationProperties(OutboxProperties.class)
 public class OutboxAutoConfiguration {
 

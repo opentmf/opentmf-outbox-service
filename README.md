@@ -104,9 +104,11 @@ itself is package-private). Requires ArchUnit ≥ 1.5.0 on Java 25 bytecode.
 
 ## Migrating from a hand-written outbox
 
-1. Delete your own `outbox` table changeset **before your first release** (or
-   write a rename/migrate changeset after it); include the library changelog
-   instead. Column set matches the §23 shape plus `client_profile`.
+1. Include the library changelog and remove your own `outbox` changeset file —
+   fold, never migrate (no dnms consumer is in production). A service whose
+   existing environments already ran a pre-library outbox changeset owns its
+   own transition (rebuild the schema, or a local one-off); the library ships
+   one clean create and carries no onboarding shims.
 2. Replace your writer/relay/park classes with `OutboxWriter` + configuration.
    Keep your `x-idempotency-key` format — the library's is the ruled
    `<service>:outbox:<id>`.
