@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.0 (unreleased)
+## 1.2.0 - 2026-08-27
 
 The last gap-closing release: the union of the consumer audits (dnms-flow,
 dnms-681, the email and inbox adapters) and the library's own, plus the
