@@ -77,7 +77,10 @@ comment on column outbox.cancelled_on is 'Cancellation time of an UNRELEASED eff
 -- shape - client_profile / release_at / cancelled_on included for tables that never had them.
 -- Consumer-specific deltas stay the consumer's (e.g. dropping a NOT NULL / DEFAULT on
 -- release_at, or columns the library does not know). The pending index is recreated to the
--- 1.2.0 claim predicate.
+-- 1.2.0 claim predicate. (001's own comment block still says "no onboarding shims": it is
+-- HISTORICAL and stays verbatim because a released changeset's body - comments included - is
+-- part of its recorded checksum; this changeset is the onboarding.) The 001/002 preconditions
+-- probe information_schema for current_schema(): the outbox lives in the consumer's own schema.
 alter table outbox add column if not exists client_profile varchar(64);
 alter table outbox add column if not exists release_at timestamp with time zone;
 alter table outbox add column if not exists cancelled_on timestamp with time zone;

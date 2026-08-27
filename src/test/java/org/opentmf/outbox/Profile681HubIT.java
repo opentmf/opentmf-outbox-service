@@ -2,6 +2,7 @@ package org.opentmf.outbox;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
 import io.micrometer.core.instrument.MeterRegistry;
@@ -11,7 +12,11 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -74,6 +79,11 @@ class Profile681HubIT {
 
   static final AtomicInteger FAILING_HITS = new AtomicInteger();
 
+  /** /hub/slow: the publisher parks INSIDE publish() until the test opens this gate. */
+  static final CountDownLatch SLOW_GATE = new CountDownLatch(1);
+
+  static final CountDownLatch SLOW_IN_FLIGHT = new CountDownLatch(1);
+
   /** Rows the consumer's destination-filtered listener stamped. */
   static final Set<Long> LISTENER_SEEN = ConcurrentHashMap.newKeySet();
 
@@ -95,6 +105,7 @@ class Profile681HubIT {
                 HUB_SEEN.add(request.headers().asHttpHeaders().toSingleValueMap());
                 return ServerResponse.ok().build();
               })
+          .POST("/hub/slow", request -> ServerResponse.ok().build())
           .POST(
               "/hub/down",
               request -> {
@@ -121,6 +132,14 @@ class Profile681HubIT {
 
         @Override
         public void publish(OutboxEvent event) {
+          if (event.getDestination().endsWith("/hub/slow")) {
+            SLOW_IN_FLIGHT.countDown(); // the claim now holds the row's lock
+            try {
+              SLOW_GATE.await(30, TimeUnit.SECONDS);
+            } catch (InterruptedException ex) {
+              Thread.currentThread().interrupt();
+            }
+          }
           Map<String, String> stored =
               event.getHeaders() == null
                   ? Map.of()
@@ -242,7 +261,37 @@ class Profile681HubIT {
     assertThat(maintenance.inspect(delivered.getId()).reference())
         .isEqualTo("subscription-secret-2");
 
-    // 4) cancel vs claim: the claim won - a relayed row refuses to be cancelled
+    // 4) cancel vs claim, THE RACE: the relay claims the slow row and is inside publish();
+    //    cancel arrives now - it BLOCKS behind the claim's row lock (no timeout), and once the
+    //    relay commits it sees the row as the relay left it and refuses. Claim wins, loudly.
+    OutboxEvent slow =
+        tx.execute(
+            s ->
+                writer.append(
+                    OutboxAppend.of(
+                        "subscription", "sub-4", "hub.event.v1", hub("slow"), Map.of())));
+    awaitLatch(SLOW_IN_FLIGHT);
+    CompletableFuture<Throwable> cancelOutcome =
+        CompletableFuture.supplyAsync(
+            () -> {
+              try {
+                maintenance.cancel(slow.getId());
+                return null;
+              } catch (RuntimeException ex) {
+                return ex;
+              }
+            });
+    assertThatThrownBy(() -> cancelOutcome.get(2, TimeUnit.SECONDS))
+        .isInstanceOf(TimeoutException.class); // still blocked behind the claim
+    SLOW_GATE.countDown(); // the relay finishes and commits relayed_on
+    assertThat(cancelOutcome)
+        .succeedsWithin(Duration.ofSeconds(20))
+        .isInstanceOf(IllegalStateException.class)
+        .extracting(Throwable::getMessage)
+        .asString()
+        .contains("already relayed");
+    assertThat(maintenance.inspect(slow.getId()).cancelledOn()).isNull();
+    // and a plainly relayed row refuses the same way
     assertThatIllegalStateException()
         .isThrownBy(() -> maintenance.cancel(delivered.getId()))
         .withMessageContaining("already relayed");
@@ -254,6 +303,15 @@ class Profile681HubIT {
         .isEqualTo(HttpStatusCode.valueOf(409));
     assertThat(status(ops, "/ops/outbox/" + delivered.getId() + "/unpark"))
         .isEqualTo(HttpStatusCode.valueOf(409));
+  }
+
+  private static void awaitLatch(CountDownLatch latch) {
+    try {
+      assertThat(latch.await(20, TimeUnit.SECONDS)).isTrue();
+    } catch (InterruptedException ex) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException(ex);
+    }
   }
 
   private static HttpStatusCode status(RestClient client, String path) {

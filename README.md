@@ -48,9 +48,9 @@ erDiagram
     }
 ```
 
-State is **derived** — there is no status column to corrupt. Five legs:
-pending (of which **held** is the sub-state with a future `release_at`),
-parked, relayed, cancelled:
+State is **derived** — there is no status column to corrupt. Four legs —
+pending, parked, relayed, cancelled — plus **held**, the pending sub-state
+with a future `release_at`:
 
 ```mermaid
 flowchart LR
@@ -128,7 +128,13 @@ sequenceDiagram
   pending set, `last_error` kept, the `dropped` counter books it, a WARN — no
   relayed listener fires and `relayed` is not incremented: nothing was
   delivered). A publisher throws `TerminalOutboxException` to reach exhaustion
-  immediately.
+  immediately — from `publish` only: thrown by a *listener* it is an ordinary
+  retry like any listener failure. Two consequences worth knowing: a DROP
+  publisher paired with a persistently failing listener ends in DROP although
+  the effect itself was delivered on every attempt (the listener, not the
+  delivery, kept failing — the destination saw N idempotent copies); and the
+  001/002 onboarding preconditions probe `information_schema` for
+  `current_schema()`, i.e. the outbox lives in the consumer's own schema.
 - **Claim eligibility lives in ONE place** — the claim query:
   `relayed_on is null and cancelled_on is null and parked_on is null and
   (release_at is null or release_at <= now) and next_attempt_on <= now`, in
@@ -476,7 +482,17 @@ The library is self-contained for consumer testing — no test-jar needed:
   rule rejects; a seeded row fires no after-commit nudge, the sweep picks it up).
   A seeded **parked** row must set `parkedOn` (since 1.2.0 attempts alone do
   not park: a row with `attempts = max-attempts` and no stamp is pending and
-  claimable).
+  claimable):
+
+  ```java
+  OutboxEvent parked = new OutboxEvent();
+  parked.setAggregateType("t"); parked.setAggregateId("a"); parked.setEventType("e.v1");
+  parked.setDestination("topic"); parked.setPayload("{}");
+  parked.setCreatedOn(now); parked.setNextAttemptOn(now);
+  parked.setAttempts(10); parked.setLastError("boom");
+  parked.setParkedOn(now);            // the stamp is what makes it parked
+  entityManager.persist(parked);
+  ```
 - **Conformance**: the library carries one IT per real consumer profile
   (`Profile681HubIT`, `ProfileFlowHttpSideEffectIT`,
   `ProfileAdapterKafkaOrderIT`) plus the crash-window, SKIP LOCKED contention
