@@ -3,6 +3,7 @@ package org.opentmf.outbox.internal;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.header;
+import static org.springframework.test.web.client.match.MockRestRequestMatchers.headerDoesNotExist;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.method;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
@@ -29,6 +30,7 @@ class HttpOutboxPublisherTests {
     event.setDestination(destination);
     event.setClientProfile(profile);
     event.setPayload("{\"n\":1}");
+    event.setReference("subscription-42"); // private - must never reach the wire
     return event;
   }
 
@@ -76,16 +78,26 @@ class HttpOutboxPublisherTests {
   }
 
   @Test
-  void publish_sendsStoredHeaders_relayStampedOnesWin() {
+  void publish_sendsStoredHeaders_aCollidingOneIsReplacedByTheRelayHeader() {
     RestClient.Builder builder = RestClient.builder();
     MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
     server
         .expect(requestTo("https://hub/cb"))
         .andExpect(header("x-schema-version", "2"))
+        // exactly ONE value - a stored x-event-type is replaced, not appended (the bug 1.2.0
+        // fixes: HTTP used to send both, Kafka replaced)
+        .andExpect(
+            request ->
+                assertThat(request.getHeaders().get("x-event-type"))
+                    .containsExactly("hub.event.v1"))
+        .andExpect(headerDoesNotExist("reference"))
+        .andExpect(
+            request ->
+                assertThat(request.getHeaders().toString()).doesNotContain("subscription-42"))
         .andRespond(withSuccess());
 
     OutboxEvent event = event("https://hub/cb", null);
-    event.setHeaders("{\"x-schema-version\":\"2\"}");
+    event.setHeaders("{\"x-schema-version\":\"2\",\"x-event-type\":\"stored.stale\"}");
     new HttpOutboxPublisher(builder.build(), null, new ObjectMapper(), "svc").publish(event);
 
     server.verify();

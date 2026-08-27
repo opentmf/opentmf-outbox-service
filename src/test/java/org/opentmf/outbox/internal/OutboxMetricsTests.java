@@ -9,7 +9,6 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.OffsetDateTime;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
-import org.opentmf.outbox.OutboxProperties;
 
 /** The gauge family: pending/parked wired to the repository, lag from the oldest pending. */
 class OutboxMetricsTests {
@@ -17,12 +16,12 @@ class OutboxMetricsTests {
   private final OutboxEventRepository repository = mock(OutboxEventRepository.class);
   private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
   private final OutboxMetrics metrics =
-      new OutboxMetrics(registry, repository, new OutboxProperties());
+      new OutboxMetrics(registry, repository);
 
   @Test
   void gauges_readTheRepository() {
     when(repository.countByRelayedOnIsNullAndCancelledOnIsNull()).thenReturn(4L);
-    when(repository.countByRelayedOnIsNullAndCancelledOnIsNullAndAttemptsGreaterThanEqual(10))
+    when(repository.countByRelayedOnIsNullAndCancelledOnIsNullAndParkedOnIsNotNull())
         .thenReturn(1L);
 
     assertThat(registry.get(OutboxMetrics.PENDING).gauge().value()).isEqualTo(4d);
@@ -39,6 +38,20 @@ class OutboxMetricsTests {
     when(repository.findOldestPendingSince(any(OffsetDateTime.class)))
         .thenReturn(Optional.empty());
     assertThat(metrics.relayLagSeconds()).isZero();
+  }
+
+  @Test
+  void recordDropped_countsPerDestination_neverAsRelayed() {
+    metrics.recordDropped("hub");
+
+    assertThat(
+            registry
+                .get(OutboxMetrics.DROPPED)
+                .tag(OutboxMetrics.TAG_DESTINATION, "hub")
+                .counter()
+                .count())
+        .isEqualTo(1d);
+    assertThat(registry.find(OutboxMetrics.RELAYED).counters()).isEmpty();
   }
 
   @Test

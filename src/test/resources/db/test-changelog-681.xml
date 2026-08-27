@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+      http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+  <!-- The library include (onboards the pre-existing table)... -->
+  <include file="db/changelog/opentmf-outbox.sql"/>
+  <!-- ...then the CONSUMER-SPECIFIC delta, which stays the consumer's: the NOT NULL / DEFAULT
+       on release_at (the library writes an explicit NULL for every ordinary append, so a
+       column default cannot rescue the insert) and the columns the library does not know. -->
+  <changeSet id="681-cutover" author="dnms-681">
+    <sql>
+      alter table outbox alter column release_at drop not null;
+      alter table outbox alter column release_at drop default;
+      alter table outbox drop column kind;
+      alter table outbox drop column subscription_id;
+    </sql>
+  </changeSet>
+</databaseChangeLog>

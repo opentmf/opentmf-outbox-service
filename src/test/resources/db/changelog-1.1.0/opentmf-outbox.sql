@@ -1,8 +1,8 @@
 --liquibase formatted sql
 
 --changeset opentmf-outbox:001-outbox
---preconditions onFail:MARK_RAN onError:HALT onFailMessage:outbox table already exists (a pre-library outbox) - changeset 001 marked ran, 003 onboards the table. onErrorMessage:PostgreSQL is the shipped DDL dialect of opentmf-outbox-service (the dialect probe errored - this is not a PostgreSQL database). For other databases see the README (a per-dialect changelog is the extension path).
---precondition-sql-check expectedResult:0 SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'outbox' AND current_setting('server_version_num') IS NOT NULL
+--preconditions onFail:HALT onError:HALT onFailMessage:PostgreSQL is the shipped DDL dialect of opentmf-outbox-service; this changelog must not run against another engine. For other databases see the README (a per-dialect changelog is the extension path). onErrorMessage:PostgreSQL is the shipped DDL dialect of opentmf-outbox-service (the dialect probe errored - this is not a PostgreSQL database). For other databases see the README (a per-dialect changelog is the extension path).
+--precondition-sql-check expectedResult:1 SELECT CASE WHEN current_setting('server_version_num') IS NOT NULL THEN 1 ELSE 0 END
 -- Transactional outbox — the LIBRARY-OWNED table (opentmf-outbox-service). One per owning
 -- service's schema: the
 -- business transaction writes its state change AND one row here in the same local transaction;
@@ -51,8 +51,6 @@ comment on index ix_outbox_pending is 'Partial index over pending rows only — 
 --rollback drop table outbox;
 
 --changeset opentmf-outbox:002-outbox-hold-and-cancel
---preconditions onFail:MARK_RAN onError:HALT onFailMessage:release_at / cancelled_on already exist (a pre-library outbox) - changeset 002 marked ran, 003 adds whichever is missing.
---precondition-sql-check expectedResult:0 SELECT count(*) FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'outbox' AND column_name IN ('release_at', 'cancelled_on')
 -- 1.1.0, ADDITIVE (001 is never edited): the scheduled-send HOLD and the cancellation of an
 -- unreleased effect. Both nullable; a 1.0.0 consumer upgrades with zero changes. The state
 -- model gains its fourth leg: cancelled = cancelled_on is not null (only unrelayed rows can be
@@ -67,35 +65,3 @@ comment on column outbox.release_at is 'Optional scheduled-send hold, frozen at 
 comment on column outbox.cancelled_on is 'Cancellation time of an UNRELEASED effect (ops action); null = not cancelled. A cancelled row is never relayed, is retained for audit and pruned with the relayed retention.';
 --rollback alter table outbox drop column cancelled_on;
 --rollback alter table outbox drop column release_at;
-
---changeset opentmf-outbox:003-outbox-policy-reference-onboarding
--- 1.2.0, ADDITIVE and IDEMPOTENT (every ADD COLUMN is IF NOT EXISTS): (a) parked_on - the
--- explicit park stamp, now that the attempt budget is per publisher and "parked" can no longer
--- be derived from attempts >= one max; (b) reference - the private per-row correlation, never
--- a wire header; (c) ONBOARDING of a pre-library outbox table: 001/002 were MARKED RAN because
--- the table (or its columns) pre-existed, and this changeset brings such a table to the 1.2.0
--- shape - client_profile / release_at / cancelled_on included for tables that never had them.
--- Consumer-specific deltas stay the consumer's (e.g. dropping a NOT NULL / DEFAULT on
--- release_at, or columns the library does not know). The pending index is recreated to the
--- 1.2.0 claim predicate.
-alter table outbox add column if not exists client_profile varchar(64);
-alter table outbox add column if not exists release_at timestamp with time zone;
-alter table outbox add column if not exists cancelled_on timestamp with time zone;
-alter table outbox add column if not exists parked_on timestamp with time zone;
-alter table outbox add column if not exists reference varchar(128);
-
-drop index if exists ix_outbox_pending;
-create index ix_outbox_pending on outbox (next_attempt_on) where relayed_on is null and cancelled_on is null and parked_on is null;
-
-comment on table outbox is 'Transactional outbox (library-owned, opentmf-outbox-service): effects frozen at commit, relayed at-least-once in id order. Pending = relayed_on is null and cancelled_on is null; parked = pending and parked_on is not null (a publisher''s delivery budget exhausted with outcome PARK); relayed = relayed_on is not null (also stamped by a DROP exhaustion - last_error tells); cancelled = cancelled_on is not null. A pending row with a future release_at is HELD (not claimable until then). Relayed and cancelled rows pruned after the configured retention (default 7 days), parked rows never pruned automatically.';
-comment on column outbox.client_profile is 'Optional named client profile for HTTP delivery; null = resolver decision (longest-prefix base-url match), else plain POST. Ignored by the Kafka publisher.';
-comment on column outbox.release_at is 'Optional scheduled-send hold, frozen at write time: the row is not claimable before this instant. Null = no hold. Never moved by the retry backoff (that is next_attempt_on).';
-comment on column outbox.cancelled_on is 'Cancellation time of an UNRELEASED effect (ops action); null = not cancelled. A cancelled row is never relayed, is retained for audit and pruned with the relayed retention.';
-comment on column outbox.parked_on is 'Stamped when the publisher''s delivery budget is exhausted with outcome PARK: unclaimable, never auto-pruned, the parked gauge alerts; unpark clears it (ops action). Null while retrying.';
-comment on column outbox.reference is 'Optional PRIVATE correlation (e.g. a subscription id): filterable on the ops list, never forwarded to the wire - wire headers live in headers.';
-comment on column outbox.attempts is 'Failed delivery attempts so far; at the publisher''s budget (library max-attempts by default) the row is exhausted: parked (parked_on) or dropped (relayed_on + last_error).';
-comment on index ix_outbox_pending is 'Partial index over claimable-candidate rows only (not relayed, not cancelled, not parked) - the relay claim query stays cheap regardless of the terminal backlog.';
---rollback drop index if exists ix_outbox_pending;
---rollback create index ix_outbox_pending on outbox (next_attempt_on) where relayed_on is null;
---rollback alter table outbox drop column if exists reference;
---rollback alter table outbox drop column if exists parked_on;

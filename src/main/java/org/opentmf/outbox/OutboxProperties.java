@@ -26,20 +26,26 @@ public class OutboxProperties {
   /** Maximum rows claimed per relay batch. */
   @Positive private int batchSize = 100;
 
-  /** Failed-delivery attempts after which a row PARKS (ops unpark only). Default 10. */
+  /**
+   * Failed-delivery attempts after which a row is EXHAUSTED (parked by default) - the LIBRARY
+   * budget, used when the row's publisher declares none. Default 10.
+   */
   @Positive private int maxAttempts = 10;
 
   /** Exponential-backoff base delay after the first failed attempt. Default 5s. */
   @NotNull private Duration backoffBase = Duration.ofSeconds(5);
 
-  /** Exponential-backoff multiplier per further failed attempt. Default 2. */
+  /** Exponential-backoff multiplier per further failed attempt (a double). Default 2.0. */
   @DecimalMin("1.0")
   private double backoffFactor = 2.0;
 
   /** Exponential-backoff ceiling. Default 10min. */
   @NotNull private Duration backoffCap = Duration.ofMinutes(10);
 
-  /** Relayed rows older than this are pruned; parked rows NEVER auto-prune. Default 7 days. */
+  /**
+   * Relayed and cancelled rows older than this are pruned; parked rows NEVER auto-prune.
+   * Default 7 days.
+   */
   @NotNull private Duration retention = Duration.ofDays(7);
 
   /** Upper bound the relay waits for a publish acknowledgement. */

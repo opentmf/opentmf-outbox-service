@@ -64,16 +64,13 @@ public class OutboxAutoConfiguration {
 
   @Bean
   OutboxMetrics outboxMetrics(
-      ObjectProvider<MeterRegistry> registry,
-      OutboxEventRepository repository,
-      OutboxProperties properties) {
+      ObjectProvider<MeterRegistry> registry, OutboxEventRepository repository) {
     // No registry bean (a consumer without actuator) = a simple local registry: the relay
     // keeps working, the gauges just have no exporter. Consumers with actuator get the real
     // one automatically.
     return new OutboxMetrics(
         registry.getIfAvailable(io.micrometer.core.instrument.simple.SimpleMeterRegistry::new),
-        repository,
-        properties);
+        repository);
   }
 
   @Bean

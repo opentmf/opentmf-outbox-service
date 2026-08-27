@@ -9,9 +9,11 @@ so "state changed AND the platform heard it" never has a crash window, in either
 order. The payload is serialized at write time: the event is a fact frozen at
 commit, never re-read later.
 
-The library auto-configures itself when a JPA `DataSource` is present. The
-consumer supplies the datasource, the Liquibase include, security rows for the
-`/ops` endpoints, and optionally its own publisher/client-resolver beans.
+The library auto-configures itself unconditionally (there is no `DataSource`
+guard — a JPA datasource is a hard requirement, and a consumer without one fails
+at boot by name). The consumer supplies the datasource, the Liquibase include,
+security rows for the `/ops` endpoints, and optionally its own publisher /
+client-resolver / relayed-listener beans.
 
 ## Created Database Table
 
@@ -32,28 +34,34 @@ erDiagram
         varchar(100) event_type        "payload event type; copied into x-event-type"
         varchar(200) destination       "Kafka topic name, or http(s):// URL"
         varchar(64) client_profile     "optional named HTTP client profile (nullable)"
+        varchar(128) reference         "optional PRIVATE correlation, never on the wire (nullable, 1.2.0)"
         text        payload            "serialized JSON, frozen at write time"
-        text        headers            "optional serialized header map (nullable)"
+        text        headers            "optional serialized WIRE header map (nullable)"
         timestamptz created_on         "feeds the relay-lag gauge"
-        smallint    attempts           "failed deliveries; at max-attempts the row parks"
-        timestamptz next_attempt_on    "earliest next delivery (exponential backoff)"
+        smallint    attempts           "failed deliveries; at the publisher's budget the row parks or drops"
+        timestamptz next_attempt_on    "earliest next delivery (the publisher's backoff)"
         timestamptz release_at         "scheduled-send hold, frozen at write (nullable, 1.1.0)"
-        timestamptz relayed_on         "delivery completion; null while pending/parked"
+        timestamptz parked_on          "exhaustion stamp, outcome PARK (nullable, 1.2.0)"
+        timestamptz relayed_on         "delivery completion (or DROP exhaustion); null while pending/parked"
         timestamptz cancelled_on       "cancellation of an unreleased effect (nullable, 1.1.0)"
         text        last_error         "last failure, truncated — ops forensics (nullable)"
     }
 ```
 
-State is **derived** — there is no status column to corrupt:
+State is **derived** — there is no status column to corrupt. Five legs:
+pending (of which **held** is the sub-state with a future `release_at`),
+parked, relayed, cancelled:
 
 ```mermaid
 flowchart LR
-    P["PENDING\nrelayed_on is null\nAND cancelled_on is null"] -->|"relay succeeds"| R["RELAYED\nrelayed_on set"]
-    P -->|"attempts reaches max-attempts"| K["PARKED\npending AND attempts >= max"]
+    P["PENDING\nrelayed_on is null\nAND cancelled_on is null\n(held while release_at > now)"] -->|"relay succeeds"| R["RELAYED\nrelayed_on set"]
+    P -->|"budget exhausted,\npublisher says PARK"| K["PARKED\npending AND parked_on set"]
+    P -->|"budget exhausted,\npublisher says DROP"| D["DROPPED\nrelayed_on set, last_error kept\n(a relayed row for the state model)"]
     K -->|"POST /ops/outbox/{id}/unpark\n(operator break-glass)"| P
     P -->|"POST /ops/outbox/{id}/cancel"| C["CANCELLED\ncancelled_on set"]
     K -->|"POST /ops/outbox/{id}/cancel"| C
     R -->|"retention passes\n(prune)"| G(("deleted"))
+    D --> G
     C -->|"retention passes\n(prune)"| G
     K -.->|"never auto-pruned"| K
 ```
@@ -67,7 +75,8 @@ never relayed, is retained for audit, and is pruned on the same retention as
 relayed rows.
 
 A partial index (`ix_outbox_pending` on `next_attempt_on where relayed_on is
-null`) keeps the relay's claim query cheap regardless of the relayed backlog.
+null and cancelled_on is null and parked_on is null`) keeps the relay's claim
+query cheap regardless of the terminal backlog.
 
 ## How It Works
 
@@ -94,37 +103,71 @@ sequenceDiagram
     R->>DB: relayed_on = now() (same claim transaction)
 ```
 
-- **One relay thread per pod**; `FOR UPDATE SKIP LOCKED` is the cross-pod
-  guard. Each pass drains: it keeps claiming batches while full batches come
-  back.
+- **One relay thread per pod, id-ascending.** Ordering is a contract **at one
+  replica**: rows appended in one business transaction — or for one aggregate
+  in successive ones — are delivered in `id` order (the "PI before bounce"
+  guarantee). **Across replicas** `FOR UPDATE SKIP LOCKED` is the guard, and it
+  interleaves: two pods take disjoint rows concurrently, so strict per-key
+  order across pods is not promised. A consumer needing it runs one replica or
+  accepts the interleave. Each pass drains: it keeps claiming batches while
+  full batches come back.
 - **At-least-once, consumer-dedupable.** A crash between delivery and commit
   means redelivery; `x-idempotency-key = <spring.application.name>:outbox:<id>`
-  makes consumer dedup trivial.
-- **Backoff, then park.** A failed row books `attempts++`, `last_error`, and an
-  exponential next attempt. At `max-attempts` the row parks: excluded from
-  claims, the `parked` gauge alerts, unparking is an explicit ops action.
-  Parked rows are never auto-pruned.
+  makes consumer dedup trivial. **The key format is a cross-service contract**
+  (downstream dedup tables key on it) — it never changes shape; the constants
+  and the formatter are public in `OutboxHeaders`. Set
+  `spring.application.name`: without it the prefix (and `x-producer`) is the
+  literal `unknown`.
+- **Backoff, then park — or drop — by the publisher's policy.** A failed row
+  books `attempts++`, `last_error`, and the next attempt (the library's
+  exponential backoff, or the publisher's own). At the budget (the library's
+  `max-attempts`, or the publisher's own) the row is **exhausted**: the
+  publisher's `onExhausted` says PARK (default: `parked_on` stamped, excluded
+  from claims, the `parked` gauge alerts, unparking is an explicit ops action,
+  never auto-pruned) or DROP (`relayed_on` stamped so the row leaves the
+  pending set, `last_error` kept, the `dropped` counter books it, a WARN — no
+  relayed listener fires and `relayed` is not incremented: nothing was
+  delivered). A publisher throws `TerminalOutboxException` to reach exhaustion
+  immediately.
 - **Claim eligibility lives in ONE place** — the claim query:
-  `relayed_on is null and cancelled_on is null and (release_at is null or
-  release_at <= now) and next_attempt_on <= now and attempts < max-attempts`,
-  in `id` order. A held row waits for its hold; a cancelled row never comes
-  back. The ops actions (`cancel`, `unpark`) read their row under a waiting
-  `FOR UPDATE`, so one that races a claim in flight serializes behind it and
-  sees the row as the relay left it — a cancel that arrives while the relay
-  holds the row fails with "already relayed" rather than silently marking a
-  delivered effect cancelled.
+  `relayed_on is null and cancelled_on is null and parked_on is null and
+  (release_at is null or release_at <= now) and next_attempt_on <= now`, in
+  `id` order (no attempt-count leg: the budget is per publisher). A held row
+  waits for its hold; a cancelled or parked row never comes back on its own.
+  The ops actions (`cancel`, `unpark`) read their row under a waiting
+  `FOR UPDATE` **with no timeout**: one that races a claim in flight blocks for
+  that one publish, then sees the row as the relay left it — a cancel that
+  arrives while the relay holds the row fails with "already relayed" rather
+  than silently marking a delivered effect cancelled.
 - **Publisher routing.** Everything that is not an `http(s)://` URL is a Kafka
   topic (the Kafka publisher registers at lowest precedence as the default).
   HTTP destinations are POSTed the payload with the relay headers. Consumers
-  may contribute their own `OutboxPublisher` beans — first `supports()` wins.
+  may contribute their own `OutboxPublisher` beans — first `supports()` wins,
+  so `@Order` a consumer publisher ahead of the defaults (e.g. an `adapter:`
+  scheme). A publisher runs INSIDE the claim transaction and **may write to the
+  same database there** (flow's "mark recorded"): its writes commit together
+  with `relayed_on`.
+- **Wire headers vs private reference.** Both built-in publishers forward
+  every stored header, then stamp `x-idempotency-key`, `x-event-type` and
+  `x-producer`, **replacing** a stored header of the same name (both legs,
+  since 1.2.0 — HTTP used to append). The row's `reference` is private
+  correlation (a subscription id, say): filterable on the ops list, visible on
+  the row view, never a header.
+- **Kafka specifics.** The record value is the stored JSON **string** — the
+  consumer's value serializer must be string-compatible (a `JsonSerializer`
+  double-encodes it). `traceparent` on the wire is Micrometer's Kafka
+  observation, which the consumer enables with
+  `spring.kafka.template.observation-enabled=true`; the library stamps nothing
+  home-grown.
 
 ## Requirements
 
 - Java 17+
 - Spring Boot 4.1+
 - A JPA datasource (PostgreSQL is the shipped DDL dialect) and Liquibase
-- Kafka only if Kafka destinations are used (`spring-kafka` is optional);
-  nothing extra for HTTP destinations
+- Kafka destinations: `spring-kafka` + `spring-boot-kafka` (both optional here)
+- HTTP destinations: `spring-web` on the classpath (the HTTP publisher rides
+  `RestClient`; without spring-web an `http(s)://` row is unroutable and parks)
 
 ## Supported Configuration Properties
 
@@ -136,26 +179,27 @@ opentmf:
   outbox:
     sweep-interval: 5s       # fixed-delay relay sweep (timers are for the tail)
     batch-size: 100          # rows claimed per relay pass
-    max-attempts: 10         # park threshold
+    max-attempts: 10         # the LIBRARY delivery budget (a publisher may declare its own)
     backoff-base: 5s         # first retry delay
-    backoff-factor: 2        # exponential multiplier
+    backoff-factor: 2.0      # exponential multiplier (a double)
     backoff-cap: 10m         # delay ceiling
-    retention: 7d            # relayed rows older than this are pruned
+    retention: 7d            # relayed AND cancelled rows older than this are pruned
     send-timeout: 10s        # broker-acknowledgement wait per publish
-    ops-endpoints: true      # serve the /ops surface (see below)
+    ops-endpoints: true      # serve the /ops surface (see below) - a conditional switch,
+                             # not a field of OutboxProperties
 ```
 
 | Property         | Type       | Default | Notes                                                                 |
 |------------------|------------|---------|-----------------------------------------------------------------------|
 | `sweep-interval` | `Duration` | `5s`    | The safety-net timer; the after-commit poke is the normal path.       |
 | `batch-size`     | `int`      | `100`   | A full batch triggers an immediate follow-up claim (drain).           |
-| `max-attempts`   | `int`      | `10`    | Also the derived-state boundary for `parked`.                         |
+| `max-attempts`   | `int`      | `10`    | The library budget; a publisher's `maxAttempts(event)` > 0 overrides it per row. |
 | `backoff-base`   | `Duration` | `5s`    | Delay after the first failure.                                        |
-| `backoff-factor` | `int`      | `2`     | `delay = base * factor^(attempts-1)`, capped.                         |
+| `backoff-factor` | `double`   | `2.0`   | `delay = base * factor^(attempts-1)`, capped; a publisher's `backoff(event, attempt)` overrides. |
 | `backoff-cap`    | `Duration` | `10m`   | Ceiling for the exponential delay.                                    |
 | `retention`      | `Duration` | `7d`    | Used by the prune (`OutboxMaintenanceService.prune()`): relayed AND cancelled rows. |
 | `send-timeout`   | `Duration` | `10s`   | Non-transactional Kafka sends await the ack this long.                |
-| `ops-endpoints`  | `boolean`  | `true`  | `false` removes the library's `/ops` controller entirely.             |
+| `ops-endpoints`  | `boolean`  | `true`  | `false` removes the library's `/ops` controller entirely. A `@ConditionalOnProperty` key read at boot, not a bound field. |
 
 ## Metrics
 
@@ -166,10 +210,11 @@ per-service metric prefix. Without a `MeterRegistry` bean the relay still works
 
 | Metric                     | Type    | Meaning                                            |
 |----------------------------|---------|----------------------------------------------------|
-| `opentmf.outbox.pending`   | gauge   | Rows not yet relayed nor cancelled (held included)  |
-| `opentmf.outbox.parked`    | gauge   | Rows parked at max-attempts — **alert when > 0**   |
+| `opentmf.outbox.pending`   | gauge   | Rows not yet relayed nor cancelled (held and parked included) |
+| `opentmf.outbox.parked`    | gauge   | Rows with `parked_on` stamped — **alert when > 0** |
 | `opentmf.outbox.relay-lag` | gauge   | Seconds the oldest *released* pending row has been deliverable (a held row is not lagging) |
 | `opentmf.outbox.relayed`   | counter | Successful relays, tagged by `destination`         |
+| `opentmf.outbox.dropped`   | counter | Rows given up by a publisher's DROP policy, tagged by `destination` (never counted as relayed) |
 | `opentmf.outbox.attempts`  | summary | Delivery attempts a relayed row took               |
 
 ## Usage
@@ -208,16 +253,43 @@ From your master changelog — by reference, never copied:
 ```
 
 The changelog is ONE clean create (changeset `001-outbox`) plus additive
-evolution (`002-outbox-hold-and-cancel`, 1.1.0: the two nullable columns). A
-service whose environments already carry a pre-library `outbox` table owns its
-own transition (rebuild the schema, or a local one-off) — the library ships no
-onboarding shims.
+evolution: `002-outbox-hold-and-cancel` (1.1.0: `release_at`, `cancelled_on`)
+and `003-outbox-policy-reference-onboarding` (1.2.0: `parked_on`, `reference`,
+the onboarding adds below, the index recreated to the 1.2.0 predicate).
 
-**Upgrading 1.0.0 → 1.1.0** needs no consumer change: the included changelog
-applies changeset 002 on the next start (two nullable columns, no rewrite), the
-existing `append` overloads keep their meaning (no hold), and existing rows are
-unaffected — `release_at` and `cancelled_on` are null, so they stay eligible
-exactly as before.
+**Upgrading** needs no consumer change at any step: the included changelog
+applies the missing changesets on the next start (nullable columns only, no
+rewrite; the recorded checksums of 001/002 are unchanged — an IT proves the
+released 1.1.0 changelog upgrades cleanly), the existing `append` overloads keep
+their meaning, and existing rows are unaffected — new columns are null, so rows
+stay eligible exactly as before. A row that was parked under 1.1.0 (attempts at
+the old max, no `parked_on`) becomes claimable again once on 1.2.0 and, failing
+again, parks with the stamp — unpark semantics are otherwise identical.
+
+#### Adopting with an existing `outbox` table
+
+A service that already carries a hand-written `outbox` table (its own
+changesets created it) includes the library changelog **as is** — no
+hand-seeding of `DATABASECHANGELOG`, no schema rebuild:
+
+- `001-outbox` is guarded `onFail:MARK_RAN` on *the table does not exist* —
+  over a pre-existing table it is marked ran and creates nothing;
+- `002-…` is guarded the same way on *neither `release_at` nor `cancelled_on`
+  exists*;
+- `003-…` adds every library column that is missing (`add column if not
+  exists`: `client_profile`, `release_at`, `cancelled_on`, `parked_on`,
+  `reference`) and recreates `ix_outbox_pending` — so both a 1.0.0-shaped table
+  and one that already grew its own `release_at` / `cancelled_on` arrive at the
+  1.2.0 shape. This holds on a **fresh** database too, where the consumer's
+  own pre-library changesets run first.
+
+What stays the consumer's (a changeset of its own, after the include):
+constraints and defaults the library does not have — in particular a
+`release_at NOT NULL DEFAULT now()`: the writer sets `release_at` explicitly
+(null for an ordinary append), so a column default never applies and the insert
+fails until **both** the NOT NULL and the default are dropped — and columns the
+library does not know, which it never drops. `OutboxOnboardingIT` runs all of
+these shapes; `Profile681HubIT` boots over a 681-shaped table end to end.
 
 ### Append events
 
@@ -242,6 +314,11 @@ outboxWriter.append("hub-subscription", subscriptionId,
 outboxWriter.append(
     OutboxAppend.of("comm-schedule", scheduleId, "comm.send.v1", "comm.send.v1", sendFact)
         .withReleaseAt(releaseAt));
+
+// A private correlation (never a wire header) - filter the ops list by it later
+outboxWriter.append(
+    OutboxAppend.of("hub-subscription", eventId, "hub.event.v1", callbackUrl, eventFact)
+        .withReference(subscriptionId));
 ```
 
 The hold is frozen at write time and has no reschedule API — to move a
@@ -251,9 +328,36 @@ effect has not left: a relayed row refuses with an `IllegalStateException`
 ("already relayed"), as does an already-cancelled one.
 
 Pass the payload as a fact object — it is serialized at write time. Extra
-headers frozen at write time ride the `Map<String,String>` overload; the relay
-stamps `x-idempotency-key`, `x-event-type` and `x-producer` on top (relay wins
-on name collisions).
+**wire** headers frozen at write time ride the `Map<String,String>` overload or
+`withHeaders`; the relay stamps `x-idempotency-key`, `x-event-type` and
+`x-producer` on top, replacing same-named stored ones on both legs. Anything
+that must NOT reach the wire goes in `withReference`.
+
+### Publisher failure policy (`OutboxPublisher`)
+
+A consumer publisher decides its own retry budget, backoff and exhaustion
+outcome — three default methods, so an existing publisher is unaffected:
+
+```java
+@Bean
+@Order(Ordered.HIGHEST_PRECEDENCE)   // ahead of the library's HTTP/Kafka defaults
+OutboxPublisher hubSender(RestClient hub) {
+  return new OutboxPublisher() {
+    public boolean supports(OutboxEvent e) { return e.getDestination().contains("/hub/"); }
+    public void publish(OutboxEvent e) { /* POST, attaching OutboxHeaders.idempotencyKey(...) */ }
+    public int maxAttempts(OutboxEvent e) { return 3; }                     // 0 = library max-attempts
+    public Duration backoff(OutboxEvent e, int attempt) { return Duration.ofMinutes(1); } // null = library backoff
+    public ExhaustionOutcome onExhausted(OutboxEvent e) { return ExhaustionOutcome.DROP; }  // default PARK
+  };
+}
+```
+
+The worker resolves the publisher **first**, then books every failure with that
+publisher's policy. `TerminalOutboxException` from `publish` skips straight to
+the exhaustion outcome (the destination said retrying is pointless); any other
+`RuntimeException` is a retry. A DROP is booked as `relayed_on` + `last_error`
++ the `dropped` counter — no relayed listener fires and `relayed` is not
+incremented.
 
 ### Named HTTP clients (`OutboxClientProfileResolver`)
 
@@ -286,12 +390,14 @@ OutboxRelayedListener recordStateStamp(RecordRepository records) {
 ```
 
 The listener runs inside the claim transaction, after the effect is delivered,
-with `relayedOn` already set on the managed entity. A thrown exception undoes
-the stamp and books an ordinary delivery failure (backoff, park at max) — the
-publish then repeats, so the destination dedups via the idempotency key as for
-any at-least-once redelivery — and a listener that keeps failing parks the row
-only after `max-attempts` republishes, so make it idempotent and reliable. Keep
-implementations same-database and fast: they run on the single relay thread.
+with `relayedOn` already set on the managed entity; several listeners run in
+bean order. A thrown exception undoes the stamp and books an ordinary delivery
+failure under the row's publisher policy — the publish then repeats, so the
+destination dedups via the idempotency key as for any at-least-once redelivery
+— and a listener that keeps failing exhausts the row only after that many
+republishes, so make it idempotent and reliable. Listeners never fire for a
+DROPPED row (nothing was delivered). Keep implementations same-database and
+fast: they run on the single relay thread.
 
 ### Ops endpoints
 
@@ -304,16 +410,27 @@ surface):
 | Method | Path                          | What                                                                  |
 |--------|-------------------------------|-----------------------------------------------------------------------|
 | POST   | `/ops/outbox/maintenance/prune` | Deletes relayed + cancelled rows past retention; wire to a CronJob kicker |
-| POST   | `/ops/outbox/{id}/unpark`     | Break-glass after the root cause is fixed: attempts reset, due now    |
+| POST   | `/ops/outbox/{id}/unpark`     | Break-glass after the root cause is fixed: `parked_on` cleared, attempts reset, due now |
 | POST   | `/ops/outbox/{id}/cancel`     | Withdraws an unreleased effect: never relayed, retained for audit     |
 | GET    | `/ops/outbox`                 | TMF630 triage list (attribute filtering + paging), payloads omitted   |
-| GET    | `/ops/outbox/parked`          | The derived state a wire filter cannot express (config comparison)    |
-| GET    | `/ops/outbox/{id}`            | One row in full — payload + `last_error`, the pre-unpark forensic read|
+| GET    | `/ops/outbox/state/{state}`   | The list narrowed to one derived-state leg (`pending`, `parked`, `relayed`, `cancelled`; unknown → 400), same filtering + paging on top |
+| GET    | `/ops/outbox/parked`          | Runbook alias of `/ops/outbox/state/parked`                           |
+| GET    | `/ops/outbox/{id}`            | One row in full — payload + `last_error`, the pre-unpark forensic read (behind the consumer's admin role, by ruling) |
+
+One wire contract for the estate: an unknown row id answers **404**, an action
+on a row not in the state it needs (cancel/unpark a relayed row, unpark a row
+that is not parked) answers **409** — mapped inside the library controller, no
+advice bean, so the consumer's own exception handling is untouched.
 
 Both list endpoints render through the TMF630 toolkit (bare array + count
 headers); an unknown filter field is a strict 400. The state legs on the list
-are the toolkit's null-filtering over `relayedOn` / `cancelledOn`; each row
-carries `releaseAt` and `cancelledOn`, and `parked` stays the one derived flag.
+are the toolkit's null-filtering over `relayedOn` / `cancelledOn` / `parkedOn`
+(`reference` is filterable too); each row carries `releaseAt`, `parkedOn`,
+`cancelledOn` and `reference`, and `parked` stays the one derived flag. The
+derived-state legs ride the PATH (`/state/{state}`), not a `?state=` query
+parameter: the toolkit's predicate resolver reads the whole parameter map and
+rejects any non-reserved name before a handler runs (a `?state=` form needs a
+toolkit pass-through allowance — backlog).
 
 The `tmf630-toolkit-all` dependency is **optional, honestly**: without it on
 the classpath the `/ops` controller is not registered at all (a guarded,
@@ -323,10 +440,12 @@ endpoints.
 
 ### Seal rule (ArchUnit)
 
-The public contract is the `org.opentmf.outbox` package: `OutboxWriter`,
-`OutboxMaintenanceService`, `OutboxEvent` / `OutboxRowView`, `OutboxStateFilter`,
-`OutboxProperties` and the SPI pair (`OutboxPublisher`,
-`OutboxClientProfileResolver`). Everything under `org.opentmf.outbox.internal`
+The public contract is the `org.opentmf.outbox` package: `OutboxWriter` +
+`OutboxAppend`, `OutboxMaintenanceService`, `OutboxEvent` / `OutboxRowView`,
+`OutboxStateFilter`, `OutboxProperties`, `OutboxHeaders`, the SPI types
+(`OutboxPublisher` + `TerminalOutboxException`, `OutboxClientProfileResolver`),
+the post-relay seam `OutboxRelayedListener` and `OutboxArchRules` itself.
+Everything under `org.opentmf.outbox.internal`
 (relay, repository, publishers, auto-configuration, ops controller) is
 implementation with no compatibility promise. One line in the consumer's
 ArchUnit suite keeps business code on the contract side:
@@ -352,14 +471,22 @@ The library is self-contained for consumer testing — no test-jar needed:
   responsibility.
 - **Integration**: the real auto-configuration, changelog and relay run in your
   own Testcontainers IT. Seed rows (e.g. a parked one) by persisting the public
-  `OutboxEvent` entity through the `EntityManager`.
+  `OutboxEvent` entity through the `EntityManager` — the ONLY seal-safe seeding
+  (a consumer-owned repository over `OutboxEvent` is exactly what the seal
+  rule rejects; a seeded row fires no after-commit nudge, the sweep picks it up).
+- **Conformance**: the library carries one IT per real consumer profile
+  (`Profile681HubIT`, `ProfileFlowHttpSideEffectIT`,
+  `ProfileAdapterKafkaOrderIT`) plus the crash-window, SKIP LOCKED contention
+  and onboarding ITs — the contracts above are pinned there, so a consumer gap
+  is a red library build, not a discovery after the cut.
 
 ### Migrating from a hand-written outbox
 
-1. Include the library changelog and delete your own `outbox` changeset file —
-   fold, never migrate. Environments that already ran a pre-library changeset
-   are yours to transition (schema rebuild or a local one-off).
-   **Sharp edge — the id sequence IS the idempotency key.** A schema rebuild
+1. Include the library changelog **after** your own `outbox` changesets (see
+   "Adopting with an existing `outbox` table" above): the library onboards the
+   table in place; only your own constraints/defaults and extra columns need a
+   cut-over changeset of yours. Prefer that over a schema rebuild —
+   **sharp edge — the id sequence IS the idempotency key.** A schema rebuild
    restarts the identity at 1, so new rows REUSE old
    `<service>:outbox:<id>` keys — and every idempotency-disciplined consumer will
    silently drop your new events as replays (no error, no lag, no reaction). After any table
@@ -386,14 +513,15 @@ Quality gates on this repo:
   `withHistory` behind the commercial arcmutate plugin). No mutation threshold:
   survivor review is the unit of work.
 
-### PIT survivor review (123 mutations, 97 killed)
+### PIT survivor review
 
+Run PIT locally for the current figures (the report is not committed).
 Accepted survivors, each reviewed:
 
 | Where | Mutant | Verdict |
 |---|---|---|
 | `OutboxMaintenanceService.prune` | `relayed + cancelled > 0` boundary/negation | Log-only guard; row deletion is unaffected |
-| `OutboxRelayWorker.registerFailure` | `attempts >= max` boundary/negation | Log-level-only; parked state is *derived* from attempts, not this branch |
+| `OutboxRelayWorker.exhaust` | log-level legs | Log-only; the PARK/DROP outcome itself is asserted by the worker tests |
 | `OutboxRelayWorker.truncate` | `<=` vs `<` boundary | Equivalent mutant at exactly 4000 chars |
 | `OutboxRelay.stop` | awaitTermination conditional | Shutdown-timing leg; a kill needs a 5s hanging-task test for no insight |
 | `OutboxRelay` thread factory | removed `setDaemon` | Asserted by `OutboxRelayTests` in every normal run; PIT's per-line selection misses the factory-lambda mapping |

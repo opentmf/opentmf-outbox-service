@@ -33,6 +33,9 @@ class OutboxMaintenanceServiceTests {
 
   private static OutboxEvent row(long id, int attempts, OffsetDateTime relayedOn) {
     OutboxEvent event = new OutboxEvent();
+    if (attempts >= 10 && relayedOn == null) {
+      event.setParkedOn(OffsetDateTime.now()); // the test rows at the old max are PARKED
+    }
     event.setId(id);
     event.setAggregateType("t");
     event.setAggregateId("a-" + id);
@@ -56,6 +59,7 @@ class OutboxMaintenanceServiceTests {
     service.unpark(7L);
 
     assertThat(parked.getAttempts()).isZero();
+    assertThat(parked.getParkedOn()).isNull(); // the stamp is what the claim predicate reads
     // unpark reschedules the retry slot only - the hold is a separate fact
     assertThat(parked.getReleaseAt()).isBeforeOrEqualTo(OffsetDateTime.now().minusDays(1));
     // due NOW - without this an unparked row keeps its far-future slot and never redelivers
@@ -133,11 +137,10 @@ class OutboxMaintenanceServiceTests {
 
     ArgumentCaptor<Predicate> predicate = ArgumentCaptor.forClass(Predicate.class);
     verify(repository).findAll(predicate.capture(), any(Pageable.class));
-    // parked = pending AND attempts >= max-attempts (default 10) - all legs present
+    // parked = parked_on stamped AND not cancelled - both legs present
     assertThat(predicate.getValue().toString())
-        .contains("relayedOn is null")
-        .contains("cancelledOn is null")
-        .contains("attempts >= 10");
+        .contains("parkedOn is not null")
+        .contains("cancelledOn is null");
     assertThat(page.getContent().get(0).parked()).isTrue();
     assertThat(page.getContent()).allSatisfy(v -> assertThat(v.payload()).isNull());
   }
@@ -202,8 +205,10 @@ class OutboxMaintenanceServiceTests {
     assertThat(view.payload()).isEqualTo("{}");
     assertThat(view.lastError()).isEqualTo("boom");
     assertThat(view.parked()).isTrue();
+    assertThat(view.parkedOn()).isNotNull();
     assertThat(view.releaseAt()).isNull();
     assertThat(view.cancelledOn()).isNull();
+    assertThat(view.reference()).isNull();
   }
 
   @Test

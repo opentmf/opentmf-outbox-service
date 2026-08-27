@@ -5,7 +5,6 @@ import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
-import org.opentmf.outbox.OutboxProperties;
 
 /**
  * The outbox meter family under the LIBRARY-STABLE names ({@code opentmf.outbox.*}
@@ -19,6 +18,8 @@ import org.opentmf.outbox.OutboxProperties;
  *   <li>{@code opentmf.outbox.relay-lag} - gauge, how long the oldest RELEASED pending row has
  *       been deliverable (seconds) - a held row is not lagging until its hold passes
  *   <li>{@code opentmf.outbox.relayed} - counter by {@code destination} (closed tag set)
+ *   <li>{@code opentmf.outbox.dropped} - counter by {@code destination}: rows given up by a
+ *       publisher's DROP policy (never delivered, forensics kept)
  *   <li>{@code opentmf.outbox.attempts} - summary, delivery attempts a relayed row took
  * </ul>
  */
@@ -28,14 +29,14 @@ class OutboxMetrics {
   static final String PARKED = "opentmf.outbox.parked";
   static final String RELAY_LAG = "opentmf.outbox.relay-lag";
   static final String RELAYED = "opentmf.outbox.relayed";
+  static final String DROPPED = "opentmf.outbox.dropped";
   static final String ATTEMPTS = "opentmf.outbox.attempts";
   static final String TAG_DESTINATION = "destination";
 
   private final MeterRegistry registry;
   private final OutboxEventRepository repository;
 
-  OutboxMetrics(
-      MeterRegistry registry, OutboxEventRepository repository, OutboxProperties properties) {
+  OutboxMetrics(MeterRegistry registry, OutboxEventRepository repository) {
     this.registry = registry;
     this.repository = repository;
     Gauge.builder(
@@ -45,15 +46,18 @@ class OutboxMetrics {
     Gauge.builder(
             PARKED,
             repository,
-            r ->
-                r.countByRelayedOnIsNullAndCancelledOnIsNullAndAttemptsGreaterThanEqual(
-                    properties.getMaxAttempts()))
-        .description("Outbox rows parked at max-attempts - alert when > 0")
+            OutboxEventRepository::countByRelayedOnIsNullAndCancelledOnIsNullAndParkedOnIsNotNull)
+        .description("Outbox rows parked (delivery budget exhausted) - alert when > 0")
         .register(registry);
     Gauge.builder(RELAY_LAG, this, OutboxMetrics::relayLagSeconds)
         .baseUnit("seconds")
         .description("How long the oldest released pending outbox row has been deliverable")
         .register(registry);
+  }
+
+  /** Books one DROP exhaustion: the per-destination dropped counter (never the relayed one). */
+  public void recordDropped(String destination) {
+    registry.counter(DROPPED, TAG_DESTINATION, destination).increment();
   }
 
   /** Books one successful relay: increments the per-destination counter, records attempts. */

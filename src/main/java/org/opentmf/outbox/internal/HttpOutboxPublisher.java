@@ -4,6 +4,7 @@ import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.opentmf.outbox.OutboxClientProfileResolver;
 import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxHeaders;
 import org.opentmf.outbox.OutboxPublisher;
 import org.springframework.http.MediaType;
 import org.springframework.web.client.RestClient;
@@ -17,6 +18,10 @@ import tools.jackson.databind.ObjectMapper;
  * {@link OutboxClientProfileResolver} may match the destination by base-url longest prefix;
  * no resolver or no match = the plain default client (a subscriber needing auth is onboarded
  * under a named profile, existing plain subscribers stay untouched).
+ *
+ * <p>Stored headers are forwarded first; the relay headers are then SET (replacing a stored
+ * header of the same name - the Kafka leg does the same). The row's {@code reference} is
+ * never sent.
  *
  * <p>Non-2xx answers throw (RestClient's default error handling), unwinding into the relay's
  * ordinary backoff-then-park bookkeeping.
@@ -49,18 +54,23 @@ class HttpOutboxPublisher implements OutboxPublisher {
   @Override
   public void publish(OutboxEvent event) {
     RestClient client = selectClient(event);
-    RestClient.RequestBodySpec request =
-        client
-            .post()
-            .uri(event.getDestination())
-            .contentType(MediaType.APPLICATION_JSON)
-            .header(
-                KafkaOutboxPublisher.HEADER_IDEMPOTENCY_KEY,
-                "%s:outbox:%d".formatted(serviceName, event.getId()))
-            .header(KafkaOutboxPublisher.HEADER_EVENT_TYPE, event.getEventType())
-            .header(KafkaOutboxPublisher.HEADER_PRODUCER, serviceName);
-    storedHeaders(event).forEach(request::header);
-    request.body(event.getPayload()).retrieve().toBodilessEntity();
+    Map<String, String> stored = storedHeaders(event);
+    client
+        .post()
+        .uri(event.getDestination())
+        .contentType(MediaType.APPLICATION_JSON)
+        .headers(
+            headers -> {
+              stored.forEach(headers::set);
+              headers.set(
+                  OutboxHeaders.IDEMPOTENCY_KEY,
+                  OutboxHeaders.idempotencyKey(serviceName, event.getId()));
+              headers.set(OutboxHeaders.EVENT_TYPE, event.getEventType());
+              headers.set(OutboxHeaders.PRODUCER, serviceName);
+            })
+        .body(event.getPayload())
+        .retrieve()
+        .toBodilessEntity();
   }
 
   private RestClient selectClient(OutboxEvent event) {

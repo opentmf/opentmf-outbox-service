@@ -84,9 +84,12 @@ class OutboxWriterTests {
         writer.append(
             OutboxAppend.of("agg", "a-1", "e.v1", "topic", Map.of("k", "v"))
                 .withHeaders(Map.of("x-schema-version", "1"))
-                .withReleaseAt(hold));
+                .withReleaseAt(hold)
+                .withReference("subscription-42"));
 
     assertThat(saved.getReleaseAt()).isEqualTo(hold);
+    assertThat(saved.getReference()).isEqualTo("subscription-42");
+    assertThat(saved.getHeaders()).doesNotContain("subscription-42"); // private, not a header
     assertThat(saved.getHeaders()).contains("x-schema-version");
     assertThat(saved.getClientProfile()).isNull();
     assertThat(saved.getCancelledOn()).isNull();

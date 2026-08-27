@@ -9,7 +9,7 @@ import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxPublisher;
 
-/** First supporting publisher wins; an unroutable destination fails LOUD into backoff/park. */
+/** First supporting publisher resolves; an unroutable destination fails LOUD into backoff/park. */
 class OutboxPublisherRouterTests {
 
   private static OutboxEvent eventTo(String destination) {
@@ -31,17 +31,17 @@ class OutboxPublisherRouterTests {
       @Override public void publish(OutboxEvent e) { delivered.set("kafka"); }
     };
 
-    new OutboxPublisherRouter(List.of(http, kafka)).publish(eventTo("https://hub/cb"));
+    OutboxPublisherRouter router = new OutboxPublisherRouter(List.of(http, kafka));
+    assertThat(router.resolve(eventTo("https://hub/cb"))).isSameAs(http);
+    assertThat(router.resolve(eventTo("comm.delivery.v1"))).isSameAs(kafka);
+    router.resolve(eventTo("https://hub/cb")).publish(eventTo("https://hub/cb"));
     assertThat(delivered.get()).isEqualTo("http");
-
-    new OutboxPublisherRouter(List.of(http, kafka)).publish(eventTo("comm.delivery.v1"));
-    assertThat(delivered.get()).isEqualTo("kafka");
   }
 
   @Test
   void noSupportingPublisher_failsLoudWithTheDestinationNamed() {
     assertThatIllegalStateException()
-        .isThrownBy(() -> new OutboxPublisherRouter(List.of()).publish(eventTo("comm.x.v1")))
+        .isThrownBy(() -> new OutboxPublisherRouter(List.of()).resolve(eventTo("comm.x.v1")))
         .withMessageContaining("comm.x.v1");
   }
 }

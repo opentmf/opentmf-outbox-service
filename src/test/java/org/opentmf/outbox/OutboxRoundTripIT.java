@@ -17,6 +17,7 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -32,6 +33,7 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.interceptor.TransactionAspectSupport;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -71,6 +73,9 @@ class OutboxRoundTripIT {
   /** Rows the post-relay seam saw — proves the auto-config collects listener beans. */
   static final Set<Long> RELAYED_SEEN = ConcurrentHashMap.newKeySet();
 
+  /** The row whose FIRST claim transaction is rolled back after the publish (crash window). */
+  static final AtomicLong CRASH_AFTER_PUBLISH_OF = new AtomicLong(-1);
+
   @TestConfiguration
   static class TxTemplateConfig {
     @Bean
@@ -81,6 +86,20 @@ class OutboxRoundTripIT {
     @Bean
     OutboxRelayedListener recordingRelayedListener() {
       return event -> RELAYED_SEEN.add(event.getId());
+    }
+
+    /**
+     * Models the crash window: the effect is delivered, then the claim transaction does NOT
+     * commit (rollback-only, once). Nothing is booked - not even attempts++ - so the row comes
+     * back exactly as it was and is published again.
+     */
+    @Bean
+    OutboxRelayedListener crashWindowListener() {
+      return event -> {
+        if (CRASH_AFTER_PUBLISH_OF.compareAndSet(event.getId(), -1)) {
+          TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+        }
+      };
     }
   }
 
@@ -171,7 +190,25 @@ class OutboxRoundTripIT {
     mockMvc
         .perform(get("/ops/outbox/parked"))
         .andExpect(status().isOk())
-        .andExpect(jsonPath("$").isArray());
+        .andExpect(jsonPath("$").isArray())
+        .andExpect(jsonPath("$").isEmpty());
+
+    // the state legs on the PATH, with the toolkit predicate still applying on top - and the
+    // literal "state" segment routes past /ops/outbox/{id} (a two-segment path, no clash)
+    mockMvc
+        .perform(get("/ops/outbox/state/relayed").param("eventType", "it.event.v1"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$[?(@.id == %d)]".formatted(appended.getId())).isNotEmpty());
+    mockMvc
+        .perform(get("/ops/outbox/state/pending").param("eventType", "it.event.v1"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$[?(@.id == %d)]".formatted(appended.getId())).isEmpty());
+    mockMvc.perform(get("/ops/outbox/state/parked")).andExpect(status().isOk());
+    mockMvc.perform(get("/ops/outbox/state/dead-lettered")).andExpect(status().isBadRequest());
+    mockMvc
+        .perform(get("/ops/outbox/{id}", appended.getId()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.id").value(appended.getId()));
 
     // the toolkit's OWN strictness stands untouched: an unknown filter field is a 400
     mockMvc
@@ -182,6 +219,65 @@ class OutboxRoundTripIT {
         .perform(post("/ops/outbox/maintenance/prune"))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.outboxRowsPruned").isNumber());
+  }
+
+  /**
+   * CR §23 crash window (H.4): publish succeeds, the claim transaction rolls back before
+   * commit - the row is redelivered on the next pass with the SAME idempotency key, and the
+   * outcome is at-least-once: two records on the wire, one row relayed, no attempt booked.
+   */
+  @Test
+  void aRollbackAfterPublish_redeliversWithTheSameIdempotencyKey() {
+    String topic = "it-crash-" + UUID.randomUUID();
+    try (KafkaProbe probe = new KafkaProbe(kafka.getBootstrapServers(), topic)) {
+      OutboxEvent row =
+          tx.execute(
+              status -> {
+                OutboxEvent e =
+                    writer.append("it-aggregate", "a-crash", "it.event.v1", topic, Map.of());
+                CRASH_AFTER_PUBLISH_OF.set(e.getId()); // arm before the after-commit nudge
+                return e;
+              });
+
+      var records = probe.drain(2, Duration.ofSeconds(30));
+
+      assertThat(records).hasSize(2); // delivered twice...
+      assertThat(records)
+          .allSatisfy(
+              r ->
+                  assertThat(KafkaProbe.header(r, OutboxHeaders.IDEMPOTENCY_KEY))
+                      .isEqualTo("outbox-it:outbox:" + row.getId())); // ...same key: dedupable
+      await()
+          .atMost(Duration.ofSeconds(10))
+          .untilAsserted(
+              () -> assertThat(maintenance.inspect(row.getId()).relayedOn()).isNotNull());
+      assertThat(maintenance.inspect(row.getId()).attempts()).isZero(); // a rollback, not a failure
+    }
+  }
+
+  /**
+   * The /ops wire contract (1.2.0-E): 404 for no such row, 409 for a row not in the state the
+   * action needs; the toolkit's own 400 for an unknown filter field stands untouched.
+   */
+  @Test
+  void theOpsWire_answers404ForUnknownRows_and409ForTheWrongState() throws Exception {
+    OutboxEvent relayed =
+        tx.execute(
+            status ->
+                writer.append("it-aggregate", "a-2", "it.event.v1", "it-ops-wire", Map.of()));
+    await()
+        .atMost(Duration.ofSeconds(10))
+        .untilAsserted(
+            () -> assertThat(maintenance.inspect(relayed.getId()).relayedOn()).isNotNull());
+
+    mockMvc.perform(get("/ops/outbox/{id}", 987654321L)).andExpect(status().isNotFound());
+    mockMvc.perform(post("/ops/outbox/{id}/unpark", 987654321L)).andExpect(status().isNotFound());
+    mockMvc
+        .perform(post("/ops/outbox/{id}/cancel", relayed.getId()))
+        .andExpect(status().isConflict());
+    mockMvc
+        .perform(post("/ops/outbox/{id}/unpark", relayed.getId()))
+        .andExpect(status().isConflict());
   }
 
   /**

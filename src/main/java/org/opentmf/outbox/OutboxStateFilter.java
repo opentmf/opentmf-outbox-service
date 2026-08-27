@@ -10,7 +10,8 @@ import java.util.Locale;
  * <ul>
  *   <li>{@code pending} - {@code relayed_on is null and cancelled_on is null} (parked INCLUDED:
  *       parked is a sub-state; HELD rows - a future {@code release_at} - included too)
- *   <li>{@code parked} - pending AND {@code attempts >= max-attempts}
+ *   <li>{@code parked} - pending AND {@code parked_on is not null} (a publisher's budget ran
+ *       out with outcome PARK)
  *   <li>{@code relayed} - {@code relayed_on is not null}
  *   <li>{@code cancelled} - {@code cancelled_on is not null}
  * </ul>

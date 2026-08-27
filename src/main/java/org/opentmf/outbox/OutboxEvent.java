@@ -17,7 +17,7 @@ import org.hibernate.type.SqlTypes;
 /**
  * One outbox row — an effect frozen at commit time, delivered at-least-once by the relay.
  * State is DERIVED, no status column: pending = {@code relayedOn == null && cancelledOn == null};
- * parked = pending AND {@code attempts >= max-attempts}; relayed = {@code relayedOn != null};
+ * parked = pending AND {@code parkedOn != null}; relayed = {@code relayedOn != null};
  * cancelled = {@code cancelledOn != null}. A pending row whose {@code releaseAt} lies in the
  * future is HELD - not claimable until then.
  *
@@ -71,9 +71,20 @@ public class OutboxEvent {
   @Column(nullable = false, updatable = false)
   private String payload;
 
-  /** Optional serialized header map, frozen at write time; TEXT. */
+  /**
+   * Optional serialized header map, frozen at write time; TEXT. These are WIRE headers: both
+   * built-in publishers forward all of them (relay-stamped names replace same-named ones).
+   */
   @Column(updatable = false)
   private String headers;
+
+  /**
+   * Optional PRIVATE correlation - e.g. the subscription a hub delivery belongs to. Filterable
+   * on the ops list, visible on the row view, NEVER forwarded to the wire by either built-in
+   * publisher (that is what {@link #headers} is for).
+   */
+  @Column(updatable = false, length = 128)
+  private String reference;
 
   /**
    * Row creation time, set by the WRITER (deliberately not {@code @CreatedDate}: a library
@@ -82,7 +93,7 @@ public class OutboxEvent {
   @Column(nullable = false, updatable = false)
   private OffsetDateTime createdOn;
 
-  /** Failed delivery attempts so far; at {@code max-attempts} the row parks. */
+  /** Failed delivery attempts so far; at the publisher's budget the row parks or drops. */
   @JdbcTypeCode(SqlTypes.SMALLINT)
   @Column(nullable = false, columnDefinition = "smallint")
   private int attempts;
@@ -99,7 +110,16 @@ public class OutboxEvent {
   @Column(updatable = false)
   private OffsetDateTime releaseAt;
 
-  /** Set once the effect is delivered — the row's terminal state; null while pending. */
+  /**
+   * Stamped when the delivery budget is exhausted with outcome PARK: the row is unclaimable
+   * until {@link OutboxMaintenanceService#unpark(long)} clears it. Null while retrying.
+   */
+  private OffsetDateTime parkedOn;
+
+  /**
+   * Set once the effect is delivered — the row's terminal state; null while pending. Also
+   * stamped by a DROP exhaustion (the row leaves the pending set; {@link #lastError} tells).
+   */
   private OffsetDateTime relayedOn;
 
   /**
