@@ -103,6 +103,7 @@ public class OutboxWriter {
     event.setCreatedOn(OffsetDateTime.now(ZoneOffset.UTC));
     event.setNextAttemptOn(OffsetDateTime.now(ZoneOffset.UTC));
     event.setReleaseAt(request.releaseAt());
+    event.setReference(request.reference());
     OutboxEvent saved = repository.save(event);
     eventPublisher.publishEvent(new OutboxAppended(saved.getId()));
     return saved;

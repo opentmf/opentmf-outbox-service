@@ -92,9 +92,9 @@ public class OutboxMaintenanceService {
   }
 
   /**
-   * Unparks one parked row after the root cause is fixed: resets {@code attempts}, makes the
-   * row due now and nudges the relay (after this transaction commits). {@code last_error} is
-   * kept for forensics until the row relays.
+   * Unparks one parked row after the root cause is fixed: clears {@code parked_on}, resets
+   * {@code attempts}, makes the row due now and nudges the relay (after this transaction
+   * commits). {@code last_error} is kept for forensics until the row relays.
    *
    * @throws IllegalArgumentException when no row has the given id
    * @throws IllegalStateException when the row is not parked (already relayed, cancelled, or
@@ -109,11 +109,12 @@ public class OutboxMaintenanceService {
     if (event.getCancelledOn() != null) {
       throw new IllegalStateException("Outbox row %d is cancelled".formatted(outboxId));
     }
-    if (event.getAttempts() < properties.getMaxAttempts()) {
+    if (event.getParkedOn() == null) {
       throw new IllegalStateException(
-          "Outbox row %d is not parked (attempts=%d < max-attempts=%d)"
-              .formatted(outboxId, event.getAttempts(), properties.getMaxAttempts()));
+          "Outbox row %d is not parked (attempts=%d, still retrying)"
+              .formatted(outboxId, event.getAttempts()));
     }
+    event.setParkedOn(null);
     event.setAttempts(0);
     event.setNextAttemptOn(OffsetDateTime.now(ZoneOffset.UTC));
     eventPublisher.publishEvent(new OutboxAppended(outboxId));
@@ -129,9 +130,9 @@ public class OutboxMaintenanceService {
 
   /**
    * The TMF630 triage list: the caller's Querydsl predicate is
-   * AND-composed with the CLOSED derived-state filter ({@link OutboxStateFilter} - a config
-   * comparison Querydsl cannot express from the wire, hence the dedicated parameter). Payloads
-   * are omitted in lists; {@link #inspect(long)} carries them.
+   * AND-composed with the CLOSED derived-state filter ({@link OutboxStateFilter} - the state
+   * legs are null-tests over several columns, hence the dedicated parameter). Payloads are
+   * omitted in lists; {@link #inspect(long)} carries them.
    */
   @Transactional(readOnly = true)
   public Page<OutboxRowView> list(Predicate predicate, OutboxStateFilter state, Pageable pageable) {
@@ -143,18 +144,14 @@ public class OutboxMaintenanceService {
     if (state != null) {
       switch (state) {
         case PENDING -> composed.and(row.relayedOn.isNull()).and(row.cancelledOn.isNull());
-        case PARKED ->
-            composed
-                .and(row.relayedOn.isNull())
-                .and(row.cancelledOn.isNull())
-                .and(row.attempts.goe(properties.getMaxAttempts()));
+        case PARKED -> composed.and(row.parkedOn.isNotNull()).and(row.cancelledOn.isNull());
         case RELAYED -> composed.and(row.relayedOn.isNotNull());
         case CANCELLED -> composed.and(row.cancelledOn.isNotNull());
       }
     }
     return repository
         .findAll(composed, pageable)
-        .map(event -> OutboxRowView.of(event, properties.getMaxAttempts(), false));
+        .map(event -> OutboxRowView.of(event, false));
   }
 
   /**
@@ -167,7 +164,7 @@ public class OutboxMaintenanceService {
   public OutboxRowView inspect(long outboxId) {
     return repository
         .findById(outboxId)
-        .map(event -> OutboxRowView.of(event, properties.getMaxAttempts(), true))
+        .map(event -> OutboxRowView.of(event, true))
         .orElseThrow(
             () -> new IllegalArgumentException("Outbox row %d not found".formatted(outboxId)));
   }

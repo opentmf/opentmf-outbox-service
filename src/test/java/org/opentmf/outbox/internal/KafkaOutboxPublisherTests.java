@@ -36,6 +36,7 @@ class KafkaOutboxPublisherTests {
     event.setDestination(destination);
     event.setPayload("{}");
     event.setHeaders(headers);
+    event.setReference("subscription-42"); // private - must never reach the wire
     return event;
   }
 
@@ -63,6 +64,11 @@ class KafkaOutboxPublisherTests {
     assertThat(header(sent.getValue(), "x-event-type")).isEqualTo("e.v1"); // relay wins
     assertThat(header(sent.getValue(), "x-custom")).isEqualTo("kept"); // stored survives
     assertThat(header(sent.getValue(), "x-producer")).isEqualTo("svc");
+    // REPLACED, not appended: exactly one x-event-type on the wire
+    assertThat(sent.getValue().headers().headers("x-event-type")).hasSize(1);
+    // the private reference is not a wire header, under any name
+    assertThat(sent.getValue().headers().toArray())
+        .noneMatch(h -> new String(h.value(), StandardCharsets.UTF_8).contains("subscription-42"));
   }
 
   @Test

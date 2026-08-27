@@ -8,6 +8,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxHeaders;
 import org.opentmf.outbox.OutboxProperties;
 import org.opentmf.outbox.OutboxPublisher;
 import org.springframework.kafka.KafkaException;
@@ -20,18 +21,17 @@ import tools.jackson.databind.ObjectMapper;
  * The default publisher: any non-HTTP destination is a Kafka topic. Message key =
  * {@code aggregateId} (preserves per-aggregate order); relay-stamped headers:
  * {@code x-idempotency-key} = {@code <service>:outbox:<id>}, {@code x-event-type},
- * {@code x-producer}. Stored headers apply first; relay-stamped ones win. {@code traceparent}
- * is stamped by Micrometer's Kafka observation, never home-grown.
+ * {@code x-producer} ({@link OutboxHeaders}). Stored headers apply first; relay-stamped ones
+ * REPLACE same-named ones. The row's {@code reference} is never sent. {@code traceparent} is
+ * stamped by Micrometer's Kafka observation - which the CONSUMER enables with
+ * {@code spring.kafka.template.observation-enabled=true} - never home-grown. The record value
+ * is the stored JSON STRING: the consumer's value serializer must be string-compatible.
  *
  * <p>When the template is transactional the send runs in a Kafka transaction; otherwise the
  * relay awaits the broker acknowledgement synchronously so a failure is observed inside the
  * claim transaction.
  */
 class KafkaOutboxPublisher implements OutboxPublisher {
-
-  static final String HEADER_IDEMPOTENCY_KEY = "x-idempotency-key";
-  static final String HEADER_EVENT_TYPE = "x-event-type";
-  static final String HEADER_PRODUCER = "x-producer";
 
   private final KafkaTemplate<Object, Object> kafkaTemplate;
   private final OutboxProperties properties;
@@ -72,10 +72,10 @@ class KafkaOutboxPublisher implements OutboxPublisher {
     storedHeaders(event).forEach((name, value) -> setHeader(producerRecord, name, value));
     setHeader(
         producerRecord,
-        HEADER_IDEMPOTENCY_KEY,
-        "%s:outbox:%d".formatted(serviceName, event.getId()));
-    setHeader(producerRecord, HEADER_EVENT_TYPE, event.getEventType());
-    setHeader(producerRecord, HEADER_PRODUCER, serviceName);
+        OutboxHeaders.IDEMPOTENCY_KEY,
+        OutboxHeaders.idempotencyKey(serviceName, event.getId()));
+    setHeader(producerRecord, OutboxHeaders.EVENT_TYPE, event.getEventType());
+    setHeader(producerRecord, OutboxHeaders.PRODUCER, serviceName);
     return producerRecord;
   }
 

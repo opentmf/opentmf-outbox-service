@@ -27,23 +27,23 @@ public interface OutboxEventRepository
     extends JpaRepository<OutboxEvent, Long>, QuerydslPredicateExecutor<OutboxEvent> {
 
   /**
-   * The claim query: {@code select … for update skip locked} over pending, not cancelled,
-   * released (no hold, or the hold has passed), due, non-parked rows in {@code id} order. This
-   * is the ONE place the eligibility predicate lives. The pessimistic lock plus SKIP LOCKED
-   * (Hibernate lock timeout {@code -2}) is the cross-pod guard; within a pod the relay is
-   * single-threaded.
+   * The claim query: {@code select … for update skip locked} over pending, not cancelled, not
+   * parked, released (no hold, or the hold has passed), due rows in {@code id} order. This is
+   * the ONE place the eligibility predicate lives; the attempt budget is NOT part of it (it is
+   * per publisher, per row - the worker stamps {@code parked_on} at exhaustion instead). The
+   * pessimistic lock plus SKIP LOCKED (Hibernate lock timeout {@code -2}) is the cross-pod
+   * guard; within a pod the relay is single-threaded.
    */
   @Lock(LockModeType.PESSIMISTIC_WRITE)
   @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "-2"))
   @Query(
       """
       select e from OutboxEvent e
-      where e.relayedOn is null and e.cancelledOn is null
+      where e.relayedOn is null and e.cancelledOn is null and e.parkedOn is null
         and (e.releaseAt is null or e.releaseAt <= :now)
-        and e.nextAttemptOn <= :now and e.attempts < :maxAttempts
+        and e.nextAttemptOn <= :now
       order by e.id""")
-  List<OutboxEvent> claimBatch(
-      @Param("now") OffsetDateTime now, @Param("maxAttempts") int maxAttempts, Limit limit);
+  List<OutboxEvent> claimBatch(@Param("now") OffsetDateTime now, Limit limit);
 
   /**
    * One row under a WAITING {@code for update} lock (no SKIP LOCKED, no timeout hint) - the
@@ -57,8 +57,8 @@ public interface OutboxEventRepository
   /** Pending rows (derived state: not relayed, not cancelled) — backs the {@code pending} gauge. */
   long countByRelayedOnIsNullAndCancelledOnIsNull();
 
-  /** Parked rows (pending AND attempts exhausted) — backs the {@code parked} gauge. */
-  long countByRelayedOnIsNullAndCancelledOnIsNullAndAttemptsGreaterThanEqual(int attempts);
+  /** Parked rows (pending AND {@code parked_on} stamped) — backs the {@code parked} gauge. */
+  long countByRelayedOnIsNullAndCancelledOnIsNullAndParkedOnIsNotNull();
 
   /**
    * The instant the oldest RELEASED pending row became deliverable — {@code created_on}, or

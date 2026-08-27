@@ -15,10 +15,13 @@ import java.util.Map;
  * @param clientProfile optional named HTTP client profile; null = the publisher's own
  *     resolution; ignored for Kafka destinations
  * @param payload the event FACT OBJECT, serialized at write time
- * @param headers extra headers frozen at write time, never null (empty = none)
+ * @param headers extra WIRE headers frozen at write time, never null (empty = none) - both
+ *     built-in publishers forward all of them
  * @param releaseAt the scheduled-send HOLD - the row is not claimable before this instant;
  *     null = deliverable now. Frozen at write time: the retry backoff never moves it, and there
  *     is no reschedule API - cancel and re-append instead
+ * @param reference optional PRIVATE correlation (e.g. a subscription id): filterable on the ops
+ *     list, on the row view, never on the wire
  */
 public record OutboxAppend(
     String aggregateType,
@@ -28,34 +31,43 @@ public record OutboxAppend(
     String clientProfile,
     Object payload,
     Map<String, String> headers,
-    OffsetDateTime releaseAt) {
+    OffsetDateTime releaseAt,
+    String reference) {
 
-  /** The mandatory facts; no client profile, no extra headers, no hold. */
+  /** The mandatory facts; no client profile, no extra headers, no hold, no reference. */
   public static OutboxAppend of(
       String aggregateType, String aggregateId, String eventType, String destination,
       Object payload) {
     return new OutboxAppend(
-        aggregateType, aggregateId, eventType, destination, null, payload, Map.of(), null);
+        aggregateType, aggregateId, eventType, destination, null, payload, Map.of(), null,
+        null);
   }
 
   /** Selects a NAMED HTTP client profile for delivery. */
   public OutboxAppend withClientProfile(String profile) {
     return new OutboxAppend(
         aggregateType, aggregateId, eventType, destination, profile, payload, headers,
-        releaseAt);
+        releaseAt, reference);
   }
 
-  /** Extra headers frozen at write time (relay-stamped headers win on name collisions). */
+  /** Extra wire headers frozen at write time (relay-stamped headers win on name collisions). */
   public OutboxAppend withHeaders(Map<String, String> extraHeaders) {
     return new OutboxAppend(
         aggregateType, aggregateId, eventType, destination, clientProfile, payload,
-        extraHeaders == null ? Map.of() : Map.copyOf(extraHeaders), releaseAt);
+        extraHeaders == null ? Map.of() : Map.copyOf(extraHeaders), releaseAt, reference);
   }
 
   /** The scheduled-send hold: not deliverable before {@code instant}; null = no hold. */
   public OutboxAppend withReleaseAt(OffsetDateTime instant) {
     return new OutboxAppend(
         aggregateType, aggregateId, eventType, destination, clientProfile, payload, headers,
-        instant);
+        instant, reference);
+  }
+
+  /** A private correlation value (max 128 chars) - never forwarded to the wire. */
+  public OutboxAppend withReference(String privateReference) {
+    return new OutboxAppend(
+        aggregateType, aggregateId, eventType, destination, clientProfile, payload, headers,
+        releaseAt, privateReference);
   }
 }
