@@ -58,6 +58,22 @@ next start.
   three consumer-conformance ITs kept in the library — `Profile681HubIT`,
   `ProfileFlowHttpSideEffectIT`, `ProfileAdapterKafkaOrderIT`.
 
+### Consumer action
+
+- **Global exception handlers must honour Spring `ErrorResponse`.** The
+  library controller now answers 404/409/400 through
+  `ResponseStatusException` (the Spring contract, pinned by
+  `OutboxOpsControllerTests` independent of any mapper). A service whose
+  global exception handler swallows `ErrorResponse` — the dnms template
+  `GlobalExceptionMapper` before its fix — turns them into a generic 500, and
+  for an unknown row id that is a regression from the 400 such a service
+  answered on 1.1.0. Adopt the template fix in the same release as this
+  upgrade.
+- **Test fixtures that seed parked rows must set `parkedOn`.** Attempts alone
+  no longer park a row (B): a row seeded with `attempts = max-attempts` and no
+  `parked_on` is pending and claimable, and `OutboxRowView.parked` is false
+  for it.
+
 ### Fixed
 
 - **HTTP header collision.** The HTTP publisher appended a stored header that

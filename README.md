@@ -474,6 +474,9 @@ The library is self-contained for consumer testing — no test-jar needed:
   `OutboxEvent` entity through the `EntityManager` — the ONLY seal-safe seeding
   (a consumer-owned repository over `OutboxEvent` is exactly what the seal
   rule rejects; a seeded row fires no after-commit nudge, the sweep picks it up).
+  A seeded **parked** row must set `parkedOn` (since 1.2.0 attempts alone do
+  not park: a row with `attempts = max-attempts` and no stamp is pending and
+  claimable).
 - **Conformance**: the library carries one IT per real consumer profile
   (`Profile681HubIT`, `ProfileFlowHttpSideEffectIT`,
   `ProfileAdapterKafkaOrderIT`) plus the crash-window, SKIP LOCKED contention
