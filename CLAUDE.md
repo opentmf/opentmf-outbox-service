@@ -19,13 +19,15 @@ they migrate to this at their next touch.
   ahead/behind claim. Central publishing is Gökhan's (namespace verified under
   his Portal account) — the session prepares, he cuts.
 
-## CURRENT TASK — 1.1.0 (ruled 2026-08-26, IMPLEMENTED, awaiting review)
+## CURRENT TASK — 1.2.0, the LAST gap-closing release (spec: analysis plan §1.2.0; IMPLEMENTED, awaiting review)
 
-Branch `feature/hold-and-cancel` (local, unpushed — pushes only on Gökhan's
-word) carries the whole block in one commit on top of develop; gate green
-(52 unit + 3 IT, JaCoCo met, Sonar 0 open / gate OK). Ready ping sent to the
-analysis session with the plan-conformance table. Next: its review → Gökhan
-merges + cuts 1.1.0 → BOM 2.1.21.
+Branch `feature/last-gap-closing` (local, unpushed — pushes only on Gökhan's
+word), one commit on top of develop (1.1.0 released 2026-08-27). Gate green
+(57 unit + 13 IT incl. the three consumer-conformance ITs, JaCoCo met, Sonar 0
+open / gate OK). Ready ping sent with the item-by-item conformance table.
+E-state shipped as the ruled path form `GET /ops/outbox/state/{state}`.
+Build recipe: `JAVA_HOME=/usr/lib/jvm/openjdk-17 mvn -Psonar clean verify`
+(the enforcer refuses the default JDK 25).
 
 1.0.0 shipped without two plan-mandated fields. 1.1.0 adds both, **additively**:
 
