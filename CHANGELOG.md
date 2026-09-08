@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.2.1
+
+Documentation-and-guard release: no behaviour changes, no schema changes. A
+1.2.0 consumer upgrades unchanged.
+
+### Added
+
+- **The `/ops/outbox` OAS fragment, shipped in the jar.**
+  `META-INF/openapi/opentmf-outbox-ops.oas.yaml` (read through
+  `OutboxOpsOpenApi.fragment()`) documents the seven ops routes ONCE, with the
+  TMF630 paging the toolkit actually answers — 200 / 206 / 416, `X-Total-Count`,
+  `X-Result-Count`, a 1-based `Content-Range`, `Link`, `limit` clamped at
+  `max-limit` rather than rejected, and the toolkit's own error object on 400 and
+  416. Four consumers were describing this surface four different ways, none with
+  the paging; each now pastes the fragment and may pin itself with a drift test
+  (README "OAS fragment").
+- **Two guards.** `OutboxOpsOpenApiTests` fails when the fragment and
+  `OutboxOpsController` disagree on a route; `OutboxRoundTripIT` pins the paging
+  contract against the real tmf630-toolkit (partial page, past-the-end, clamp,
+  empty result), so a toolkit bump that changes it fails here first.
+
 ## 1.2.0 - 2026-08-27
 
 The last gap-closing release: the union of the consumer audits (dnms-flow,

@@ -1,0 +1,304 @@
+# opentmf-outbox-service — the /ops/outbox wire contract, as ONE OpenAPI fragment.
+#
+# WHY THIS FILE EXISTS (2026-09-08): every consumer serves the library's ops controller
+# under its own context root and documents it in its own hand-maintained OAS. Four
+# services were found describing the same surface four different ways — none with the
+# TMF630 paging that the toolkit actually answers (206, the range headers, 416). This
+# fragment is the ONE description; a consumer pastes the `paths` under its own `paths`
+# and the `components` under its own `components`, keeps the names, and may pin itself
+# to it with a drift test (README "OAS fragment"). Everything here is MEASURED against
+# tmf630-toolkit 3.1.1 (the toolkit the library is built with) — the numbers below are
+# the toolkit's rules, not aspirations:
+#
+#   status  200  total == 0, or offset == 0 and every row fit in the page
+#           206  otherwise (offset > 0, or fewer rows than the total in this page)
+#           416  total > 0 and offset >= total; a total of 0 is NEVER a 416
+#           400  limit <= 0 or non-numeric, an unknown FILTER field, an unknown state leg
+#   limit   default = paging.default-limit (library default 50); a value ABOVE
+#           paging.max-limit (library default 500) is CLAMPED to it, not rejected
+#   headers X-Total-Count, X-Result-Count and Content-Range on 200, 206 and 416;
+#           Content-Range is 1-BASED ("items 1-50/281", "items */281" on 416, "items */0"
+#           when empty); Link (first/prev/next/last) on 200 and 206
+#   body    a BARE JSON array of rows on 200/206 (never PageImpl JSON); the toolkit's own
+#           error object on 400/416 — NOT the consumer's RFC 9457 problem (see Tmf630Error)
+#
+# Paths are relative to the consumer's server URL (the library mounts under /ops on the
+# main port); the consumer's deny-by-default security gates them as admin-class.
+openapi: 3.1.0
+info:
+  title: opentmf-outbox-service /ops/outbox fragment
+  version: 1.2.1
+  description: >-
+    Paste-in contract for the outbox ops surface served by opentmf-outbox-service.
+    Not a standalone API document — a fragment the consumer's OAS absorbs.
+
+paths:
+  /ops/outbox:
+    get:
+      operationId: listOutboxRows
+      summary: Outbox triage list (TMF630 attribute filtering + paging, payloads omitted)
+      description: >-
+        TMF630 attribute filtering over the row fields (aggregateType, aggregateId,
+        eventType, destination, clientProfile, reference, createdOn ranges; the state legs
+        via `relayedOn` / `cancelledOn` / `parkedOn` null-filters) with the toolkit's
+        offset/limit paging — an unknown filter field is a strict 400. Payloads ride only
+        the single-row inspect. The derived-state legs also ride the path sibling
+        `/ops/outbox/state/{state}`.
+      parameters:
+        - $ref: '#/components/parameters/outboxOffset'
+        - $ref: '#/components/parameters/outboxLimit'
+      responses:
+        '200': { $ref: '#/components/responses/outboxPage' }
+        '206': { $ref: '#/components/responses/outboxPartialPage' }
+        '400': { $ref: '#/components/responses/outboxBadRequest' }
+        '416': { $ref: '#/components/responses/outboxRangeNotSatisfiable' }
+
+  /ops/outbox/state/{state}:
+    get:
+      operationId: listOutboxRowsByState
+      summary: The list narrowed to ONE derived-state leg
+      description: >-
+        `pending` (not relayed, not cancelled, not parked), `parked`, `relayed`,
+        `cancelled` — the closed set; an unknown value is a 400. The same TMF630 filters and
+        paging apply on top. The state rides the PATH because tmf630-toolkit rejects any
+        non-reserved query parameter before a handler runs.
+      parameters:
+        - name: state
+          in: path
+          required: true
+          schema: { type: string, enum: [pending, parked, relayed, cancelled] }
+        - $ref: '#/components/parameters/outboxOffset'
+        - $ref: '#/components/parameters/outboxLimit'
+      responses:
+        '200': { $ref: '#/components/responses/outboxPage' }
+        '206': { $ref: '#/components/responses/outboxPartialPage' }
+        '400':
+          description: >-
+            An unknown state leg (a Spring `ErrorResponse` rendered by the consumer's error
+            handling), or a toolkit paging / filter error (see `Tmf630Error`).
+        '416': { $ref: '#/components/responses/outboxRangeNotSatisfiable' }
+
+  /ops/outbox/parked:
+    get:
+      operationId: listParkedOutboxRows
+      summary: The parked rows — runbook alias of /ops/outbox/state/parked (one code path)
+      description: >-
+        Parked = exhausted its publisher's attempt budget with the PARK outcome
+        (`parkedOn` stamped). The break-glass unpark takes the ids this names.
+      parameters:
+        - $ref: '#/components/parameters/outboxOffset'
+        - $ref: '#/components/parameters/outboxLimit'
+      responses:
+        '200': { $ref: '#/components/responses/outboxPage' }
+        '206': { $ref: '#/components/responses/outboxPartialPage' }
+        '400': { $ref: '#/components/responses/outboxBadRequest' }
+        '416': { $ref: '#/components/responses/outboxRangeNotSatisfiable' }
+
+  /ops/outbox/{id}:
+    get:
+      operationId: inspectOutboxRow
+      summary: One row in full (payload + lastError — the pre-unpark forensic read)
+      parameters:
+        - $ref: '#/components/parameters/outboxRowId'
+      responses:
+        '200':
+          description: The row, payload included
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OutboxRow' }
+        '404':
+          description: No row with this id
+
+  /ops/outbox/{id}/unpark:
+    post:
+      operationId: unparkOutboxRow
+      summary: Unpark one parked row (operator break-glass, never automatic)
+      description: >-
+        Clears `parkedOn`, resets attempts, makes the row due now and nudges the relay after
+        commit. Use only after the root cause of the parking is fixed.
+      parameters:
+        - $ref: '#/components/parameters/outboxRowId'
+      responses:
+        '200':
+          description: Acknowledgement — `action` is `unparked`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OutboxOpsAck' }
+        '404':
+          description: No row with this id
+        '409':
+          description: The row is not parked (already relayed, cancelled, or still pending)
+
+  /ops/outbox/{id}/cancel:
+    post:
+      operationId: cancelOutboxRow
+      summary: Withdraw one unreleased row — never relayed from now on, retained for audit
+      parameters:
+        - $ref: '#/components/parameters/outboxRowId'
+      responses:
+        '200':
+          description: Acknowledgement — `action` is `cancelled`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OutboxOpsAck' }
+        '404':
+          description: No row with this id
+        '409':
+          description: The row is already relayed or already cancelled
+
+  /ops/outbox/maintenance/prune:
+    post:
+      operationId: pruneOutboxRows
+      summary: One retention-pruning pass over terminal (relayed + cancelled) rows
+      description: >-
+        Deletes relayed and cancelled rows past `opentmf.outbox.retention`; wire to a
+        CronJob kicker. Pending and parked rows are structurally never pruned. A consumer
+        with its own wider prune (other tables) documents that one separately — this is the
+        library's outbox-only pass, and it is live wherever the library's ops controller is.
+      responses:
+        '200':
+          description: The count
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OutboxPruneReport' }
+
+components:
+  parameters:
+    outboxOffset:
+      name: offset
+      in: query
+      description: Zero-based row offset (TMF630 paging). Default 0.
+      schema: { type: integer, minimum: 0, default: 0 }
+    outboxLimit:
+      name: limit
+      in: query
+      description: >-
+        Page size. Default = the consumer's `paging.default-limit` (library default 50);
+        a value above `paging.max-limit` (library default 500) is CLAMPED to it, not
+        rejected; 0 or a negative value is a 400.
+      schema: { type: integer, minimum: 1, default: 50, maximum: 500 }
+    outboxRowId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+
+  headers:
+    X-Total-Count:
+      description: Total matching rows across all pages.
+      schema: { type: integer }
+    X-Result-Count:
+      description: Rows in THIS response (0 on 416).
+      schema: { type: integer }
+    Content-Range:
+      description: >-
+        1-based, RFC 7233 shaped with the unit `items`: `items 1-50/281`; `items */281` on
+        416; `items */0` on an empty result.
+      schema: { type: string }
+    Link:
+      description: >-
+        RFC 8288 paging links — `first`, `prev` (when offset > 0), `next` (when more rows
+        follow) and `last`, each an absolute URL carrying the caller's limit and the
+        computed offset. Absent on 416.
+      schema: { type: string }
+
+  responses:
+    outboxPage:
+      description: >-
+        The FULL result (TMF630): total 0, or offset 0 and every row fit in this page. Bare
+        JSON array, payloads null.
+      headers:
+        X-Total-Count: { $ref: '#/components/headers/X-Total-Count' }
+        X-Result-Count: { $ref: '#/components/headers/X-Result-Count' }
+        Content-Range: { $ref: '#/components/headers/Content-Range' }
+        Link: { $ref: '#/components/headers/Link' }
+      content:
+        application/json:
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/OutboxRow' }
+    outboxPartialPage:
+      description: >-
+        A PARTIAL page of a larger result (TMF630): offset > 0, or fewer rows than the total
+        fit in this page. Same body and headers as 200 — clients page on X-Total-Count and
+        Link.
+      headers:
+        X-Total-Count: { $ref: '#/components/headers/X-Total-Count' }
+        X-Result-Count: { $ref: '#/components/headers/X-Result-Count' }
+        Content-Range: { $ref: '#/components/headers/Content-Range' }
+        Link: { $ref: '#/components/headers/Link' }
+      content:
+        application/json:
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/OutboxRow' }
+    outboxRangeNotSatisfiable:
+      description: >-
+        offset >= total while total > 0. The range headers still ride (`items */<total>`,
+        X-Result-Count 0); the body is the toolkit's error object (`code` "416"). An EMPTY
+        result is never a 416 — it is a 200 with `items */0`.
+      headers:
+        X-Total-Count: { $ref: '#/components/headers/X-Total-Count' }
+        X-Result-Count: { $ref: '#/components/headers/X-Result-Count' }
+        Content-Range: { $ref: '#/components/headers/Content-Range' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Tmf630Error' }
+    outboxBadRequest:
+      description: >-
+        A toolkit rejection: `limit` <= 0 or non-numeric (`reason` "Invalid sort or paging
+        parameter."), or an unknown attribute-filter field. Rendered by the toolkit itself
+        as `Tmf630Error` — it does not pass through the consumer's problem-detail mapper.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Tmf630Error' }
+
+  schemas:
+    OutboxRow:
+      type: object
+      description: >-
+        One outbox row as the ops surface serves it (`OutboxRowView`). `parked` is the one
+        derived flag (`parkedOn` stamped); `payload` rides only the single-row inspect and
+        is null in lists; `reference` is the consumer's private per-row note (never on the
+        relay wire).
+      properties:
+        id: { type: integer, format: int64 }
+        aggregateType: { type: string }
+        aggregateId: { type: string }
+        eventType: { type: string }
+        destination: { type: string }
+        clientProfile: { type: [string, 'null'] }
+        reference: { type: [string, 'null'] }
+        attempts: { type: integer }
+        parked: { type: boolean }
+        createdOn: { type: string, format: date-time }
+        nextAttemptOn: { type: [string, 'null'], format: date-time }
+        releaseAt: { type: [string, 'null'], format: date-time }
+        parkedOn: { type: [string, 'null'], format: date-time }
+        relayedOn: { type: [string, 'null'], format: date-time }
+        cancelledOn: { type: [string, 'null'], format: date-time }
+        lastError: { type: [string, 'null'] }
+        payload: { type: [string, 'null'] }
+
+    OutboxOpsAck:
+      type: object
+      description: What happened, to which row.
+      properties:
+        action: { type: string, enum: [unparked, cancelled] }
+        id: { type: integer, format: int64 }
+
+    OutboxPruneReport:
+      type: object
+      properties:
+        outboxRowsPruned: { type: integer, format: int64 }
+
+    Tmf630Error:
+      type: object
+      description: >-
+        tmf630-toolkit's own error object — the shape it renders for its paging / filter
+        rejections and for 416, independent of the consumer's RFC 9457 mapper.
+      properties:
+        code: { type: string, description: The HTTP status as a string ("400", "416") }
+        status: { type: string, description: The HTTP reason phrase }
+        reason: { type: string, description: Category ("Invalid sort or paging parameter.", "Requested offset is outside the available range.") }
+        message: { type: string, description: The specific cause ("limit must be > 0", "Requested offset 999999 does not …") }
