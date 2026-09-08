@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
 import static org.awaitility.Awaitility.await;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -219,6 +220,68 @@ class OutboxRoundTripIT {
         .perform(post("/ops/outbox/maintenance/prune"))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.outboxRowsPruned").isNumber());
+  }
+
+  /**
+   * The TMF630 paging contract the shipped OAS fragment documents, pinned against the real
+   * toolkit (1.2.1): 206 + the range headers + Link on a partial page, 1-based Content-Range,
+   * 416 (headers kept, toolkit error body) at or past the total, 200 with the empty-result
+   * Content-Range on an empty result, limit 0 a 400, a limit above max-limit clamped rather than rejected.
+   */
+  @Test
+  void theOpsList_pagesTheTmf630Way_asTheOasFragmentSays() throws Exception {
+    String eventType = "it.paging." + UUID.randomUUID();
+    String topic = "it-paging-" + UUID.randomUUID();
+    for (int i = 0; i < 3; i++) {
+      tx.execute(status -> writer.append("it-aggregate", "a-page", eventType, topic, Map.of()));
+    }
+
+    mockMvc
+        .perform(get("/ops/outbox").param("eventType", eventType).param("limit", "2"))
+        .andExpect(status().isPartialContent())
+        .andExpect(header().string("X-Total-Count", "3"))
+        .andExpect(header().string("X-Result-Count", "2"))
+        .andExpect(header().string("Content-Range", "items 1-2/3"))
+        .andExpect(header().string("Link", org.hamcrest.Matchers.containsString("rel=\"next\"")))
+        .andExpect(jsonPath("$.length()").value(2));
+
+    mockMvc
+        .perform(
+            get("/ops/outbox")
+                .param("eventType", eventType)
+                .param("limit", "2")
+                .param("offset", "2"))
+        .andExpect(status().isPartialContent())
+        .andExpect(header().string("Content-Range", "items 3-3/3"))
+        .andExpect(header().string("X-Result-Count", "1"));
+
+    mockMvc
+        .perform(get("/ops/outbox").param("eventType", eventType).param("offset", "99"))
+        .andExpect(status().is(416))
+        .andExpect(header().string("X-Total-Count", "3"))
+        .andExpect(header().string("X-Result-Count", "0"))
+        .andExpect(header().string("Content-Range", "items */3"))
+        .andExpect(jsonPath("$.code").value("416"));
+
+    // a limit above max-limit is clamped, not rejected: every row fits, so this is the FULL page
+    mockMvc
+        .perform(get("/ops/outbox").param("eventType", eventType).param("limit", "99999"))
+        .andExpect(status().isOk())
+        .andExpect(header().string("Content-Range", "items 1-3/3"))
+        .andExpect(jsonPath("$.length()").value(3));
+
+    mockMvc
+        .perform(get("/ops/outbox").param("eventType", eventType).param("limit", "0"))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.message").value("limit must be > 0"));
+
+    // an empty result is never a 416 — even with an offset far past zero
+    mockMvc
+        .perform(get("/ops/outbox").param("eventType", "it.nothing." + UUID.randomUUID()).param("offset", "99"))
+        .andExpect(status().isOk())
+        .andExpect(header().string("X-Total-Count", "0"))
+        .andExpect(header().string("Content-Range", "items */0"))
+        .andExpect(jsonPath("$").isEmpty());
   }
 
   /**
