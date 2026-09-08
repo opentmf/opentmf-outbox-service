@@ -298,7 +298,17 @@ components:
         tmf630-toolkit's own error object — the shape it renders for its paging / filter
         rejections and for 416, independent of the consumer's RFC 9457 mapper.
       properties:
-        code: { type: string, description: The HTTP status as a string ("400", "416") }
-        status: { type: string, description: The HTTP reason phrase }
-        reason: { type: string, description: Category ("Invalid sort or paging parameter.", "Requested offset is outside the available range.") }
-        message: { type: string, description: The specific cause ("limit must be > 0", "Requested offset 999999 does not …") }
+        code:
+          type: string
+          description: The HTTP status as a string ("400", "416").
+        status:
+          type: string
+          description: The HTTP reason phrase.
+        reason:
+          type: string
+          description: >-
+            The category — "Invalid sort or paging parameter." or
+            "Requested offset is outside the available range.".
+        message:
+          type: string
+          description: The specific cause — "limit must be > 0", "Requested offset 999999 does not …".
