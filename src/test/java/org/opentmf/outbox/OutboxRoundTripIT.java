@@ -225,8 +225,8 @@ class OutboxRoundTripIT {
   /**
    * The TMF630 paging contract the shipped OAS fragment documents, pinned against the real
    * toolkit (1.2.1): 206 + the range headers + Link on a partial page, 1-based Content-Range,
-   * 416 (headers kept, toolkit error body) at or past the total, 200 with {@code items */0} on
-   * an empty result, limit 0 a 400, a limit above max-limit clamped rather than rejected.
+   * 416 (headers kept, toolkit error body) at or past the total, 200 with the empty-result
+   * Content-Range on an empty result, limit 0 a 400, a limit above max-limit clamped rather than rejected.
    */
   @Test
   void theOpsList_pagesTheTmf630Way_asTheOasFragmentSays() throws Exception {
