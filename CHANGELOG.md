@@ -30,6 +30,8 @@
   order, where `@ConditionalOnBean(KafkaTemplate)` evaluates before
   `KafkaAutoConfiguration` exists and the publisher silently vanishes. Lite
   member classes are processed only through the outer auto-configuration.
+- Compiled against `tmf630-toolkit-all` 3.3.0 (was 3.1.1) — the line the
+  opentmf-versions BOM pins for consumers; the dependency stays optional.
 - `KafkaLessStartupTests` pins all of it: a child-first test classloader that
   DEFINES the library classes without the hidden package (Boot's
   `FilteredClassLoader` cannot reproduce the reflective failure), a signature
