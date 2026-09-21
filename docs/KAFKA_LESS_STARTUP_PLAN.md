@@ -1,6 +1,6 @@
 # opentmf-outbox-service 1.2.1 — a Kafka-less consumer must start
 
-**Status:** planned 2026-09-11, to be performed by Gökhan after the DNMS wave-1 delivery.
+**Status:** planned 2026-09-11; performed 2026-09-21 (see §4 "As performed").
 **Found by:** Yusuf, on dnms-catalog 1.2.0 (the first consumer without Kafka on the classpath).
 **Severity:** blocker for any Kafka-less consumer; no impact on the six existing consumers
 (dnms-681, dnms-flow, the email/inbox/sms adapters, the template), all of which carry Kafka.
@@ -118,6 +118,39 @@ second fails on `kafkaOutboxPublisher`'s parameter. Both go green with §2. Add 
 case with `FilteredClassLoader(RestClient.class)` for §3. `ProfileAdapterKafkaOrderIT` and
 `KafkaOutboxPublisherTests` stay as they are — they prove the Kafka path when Kafka IS present.
 
+**As performed (2026-09-21) — `FilteredClassLoader` does NOT reproduce the defect.** On
+1.2.0's shape the two startup tests above PASSED; only the signature test went red. Boot's
+`FilteredClassLoader` has no URLs of its own and delegates every class definition to the app
+loader, which CAN see `KafkaTemplate`; it only fools the `@ConditionalOnClass` lookup
+(`Class.forName` through the context loader). The failing step is the reflective
+`getDeclaredMethods()` on `OutboxAutoConfiguration`, and that resolves parameter types through
+the class's DEFINING loader — the app loader — so no `NoClassDefFoundError` occurs.
+`KafkaLessStartupTests` therefore uses a small child-first `ConsumerClassLoader` (over the
+`target/classes` and `target/test-classes` code sources of the library, located via
+`getProtectionDomain().getCodeSource()`, not classpath order) that DEFINES every
+`org.opentmf.outbox.*` class itself and throws `ClassNotFoundException` for the hidden package
+(`org.springframework.kafka`, or `org.springframework.web` for the §3 mirror); the two
+configurations are registered by NAME so Spring resolves them through it. With that loader the
+Kafka-less test failed on 1.2.0's shape with the real stack —
+`IllegalStateException: Failed to introspect Class [org.opentmf.outbox.internal.OutboxAutoConfiguration]`
+`Caused by: NoClassDefFoundError: org/springframework/kafka/core/KafkaTemplate` — and went green
+with §2. There is no `JpaTestSupport` fixture in this repo; the repository is a Mockito mock,
+since the subject is what the auto-configuration links, not JPA. The web-less mirror passed on
+1.2.0's shape too (the "safe by accident" of §1) and still passes after §3.
+
+**As performed — the nested classes carry NO `@Configuration`.** With the §2 shape verbatim
+(`@Configuration(proxyBeanMethods = false)` on the nested classes) the Kafka ITs failed:
+"No OutboxPublisher supports destination". The ITs' `OutboxTestApplication` lives in
+`org.opentmf.outbox`, and its component scan registers a nested `@Configuration` class directly
+(the outer class is scan-excluded as a listed auto-configuration; nested stereotypes are not),
+ahead of the auto-configuration order — `@ConditionalOnBean(KafkaTemplate)` then evaluates before
+`KafkaAutoConfiguration` has loaded its definitions, the bean is skipped, and the later
+member-class copy is ignored in favour of the scanned one. The same would hit any consumer whose
+scan root covers the library package. The nested classes are therefore lite member classes
+(`@ConditionalOnClass(name = …)` + `@Bean` methods, no stereotype): Spring still processes them
+as members of the outer auto-configuration in its ordering, but a scan cannot see them.
+`KafkaLessStartupTests` pins that no nested class is `@Component`-meta-annotated.
+
 ## 5. Release checklist
 
 1. Branch `fix/kafka-less-startup` off `develop` (currently 1.2.1-SNAPSHOT after 7b2fdd2).
@@ -139,7 +172,7 @@ case with `FilteredClassLoader(RestClient.class)` for §3. `ProfileAdapterKafkaO
    (the pom's own `<maven.version.ignore>` takes the same string). No image, so no Trivy.
 6. `mvn release:prepare release:perform` (release profile via `releaseProfiles`, Central
    publishing); wait for Maven Central sync before step 7.
-7. **opentmf-versions BOM 2.1.25**: `opentmf-outbox-service.version` 1.2.0 → 1.2.1
+7. **opentmf-versions BOM 2.1.25** (as performed: 2.1.29, the BOM line current on the release day): `opentmf-outbox-service.version` 1.2.0 → 1.2.1
    (`pom.xml:73`); CR §1 floor note "at-next-touch, not a sweep".
 8. Consumers: dnms-catalog drops `spring-kafka` and the `KafkaAutoConfiguration` exclusion at
    its next touch (its 1.2.0 CHANGELOG names both as the workaround); the six Kafka consumers

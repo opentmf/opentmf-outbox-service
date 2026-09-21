@@ -20,6 +20,7 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
+import org.springframework.core.env.Environment;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.web.client.RestClient;
 import tools.jackson.databind.ObjectMapper;
@@ -111,36 +112,62 @@ public class OutboxAutoConfiguration {
     return new OutboxMaintenanceService(repository, properties, eventPublisher);
   }
 
-  /** Kafka default publisher - LOWEST precedence so consumer publishers match first. */
-  @Bean
-  @Order(Ordered.LOWEST_PRECEDENCE)
-  @ConditionalOnClass(KafkaTemplate.class)
-  @ConditionalOnBean(KafkaTemplate.class)
-  OutboxPublisher kafkaOutboxPublisher(
-      KafkaTemplate<Object, Object> kafkaTemplate,
-      OutboxProperties properties,
-      ObjectMapper objectMapper,
-      org.springframework.core.env.Environment environment) {
-    return new KafkaOutboxPublisher(
-        kafkaTemplate,
-        properties,
-        objectMapper,
-        environment.getProperty("spring.application.name", "unknown"));
+  /**
+   * The publisher defaults live in NESTED, name-guarded configurations so this outer class
+   * names no Kafka or web type in any bean-method signature. A method-level guard is not
+   * enough: Spring evaluates it from ASM metadata and skips the bean, but still introspects the
+   * enclosing class's methods reflectively to resolve the OTHER factory methods - and a type
+   * missing from the consumer's classpath then throws {@code NoClassDefFoundError} and no
+   * context starts (found on a Kafka-less consumer, 1.2.0). A class-level name-based guard is
+   * evaluated BEFORE the nested class is loaded, so the guarded type is linked only when the
+   * condition holds; the outer {@code afterName} ordering is inherited by the nested classes.
+   *
+   * <p>Deliberately NOT {@code @Configuration}: the nested classes are lite member classes
+   * (bean methods only). A {@code @Configuration} nested class is a component-scan candidate,
+   * and a consumer whose scan root covers {@code org.opentmf.outbox} (the library's own test
+   * application is one) would register it AHEAD of the auto-configuration order - its
+   * {@code @ConditionalOnBean(KafkaTemplate)} then evaluates before {@code KafkaAutoConfiguration}
+   * has registered the template and the publisher silently vanishes ("No OutboxPublisher
+   * supports destination"). A member class without the stereotype is invisible to the scan and
+   * is processed only as part of this auto-configuration. {@code KafkaLessStartupTests} pins
+   * all three facts.
+   */
+  @ConditionalOnClass(name = "org.springframework.kafka.core.KafkaTemplate")
+  static class KafkaPublisherConfiguration {
+
+    /** Kafka default publisher - LOWEST precedence so consumer publishers match first. */
+    @Bean
+    @Order(Ordered.LOWEST_PRECEDENCE)
+    @ConditionalOnBean(KafkaTemplate.class)
+    OutboxPublisher kafkaOutboxPublisher(
+        KafkaTemplate<Object, Object> kafkaTemplate,
+        OutboxProperties properties,
+        ObjectMapper objectMapper,
+        Environment environment) {
+      return new KafkaOutboxPublisher(
+          kafkaTemplate,
+          properties,
+          objectMapper,
+          environment.getProperty("spring.application.name", "unknown"));
+    }
   }
 
-  /** HTTP publisher for http(s):// destinations - just above the Kafka fallback. */
-  @Bean
-  @Order(Ordered.LOWEST_PRECEDENCE - 1)
-  @ConditionalOnClass(RestClient.class)
-  OutboxPublisher httpOutboxPublisher(
-      ObjectProvider<OutboxClientProfileResolver> profileResolver,
-      ObjectMapper objectMapper,
-      org.springframework.core.env.Environment environment) {
-    return new HttpOutboxPublisher(
-        RestClient.create(),
-        profileResolver.getIfAvailable(),
-        objectMapper,
-        environment.getProperty("spring.application.name", "unknown"));
+  @ConditionalOnClass(name = "org.springframework.web.client.RestClient")
+  static class HttpPublisherConfiguration {
+
+    /** HTTP publisher for http(s):// destinations - just above the Kafka fallback. */
+    @Bean
+    @Order(Ordered.LOWEST_PRECEDENCE - 1)
+    OutboxPublisher httpOutboxPublisher(
+        ObjectProvider<OutboxClientProfileResolver> profileResolver,
+        ObjectMapper objectMapper,
+        Environment environment) {
+      return new HttpOutboxPublisher(
+          RestClient.create(),
+          profileResolver.getIfAvailable(),
+          objectMapper,
+          environment.getProperty("spring.application.name", "unknown"));
+    }
   }
 
   /**

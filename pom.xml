@@ -67,7 +67,7 @@
     <maven.compiler.parameters>false</maven.compiler.parameters>
 
     <!-- Stable-only filter for versions:display-* goals. -->
-    <maven.version.ignore>.*-M\d+,.*-RC\d+,.*-SNAPSHOT,(?i).*-(alpha|beta)\d*</maven.version.ignore>
+    <maven.version.ignore>(?i).*[.-](alpha|beta|m|rc|cr|dev|ea|preview)[0-9]*([.+-].*)?$|^[0-9a-f]{40}$</maven.version.ignore>
 
     <!-- An opentmf library never imports the opentmf-versions BOM (the BOM
          aggregates the libraries — a library importing it would be a cycle in

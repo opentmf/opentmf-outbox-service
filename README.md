@@ -150,9 +150,11 @@ sequenceDiagram
   HTTP destinations are POSTed the payload with the relay headers. Consumers
   may contribute their own `OutboxPublisher` beans — first `supports()` wins,
   so `@Order` a consumer publisher ahead of the defaults (e.g. an `adapter:`
-  scheme). A publisher runs INSIDE the claim transaction and **may write to the
-  same database there** (flow's "mark recorded"): its writes commit together
-  with `relayed_on`.
+  scheme). A consumer without Kafka on the classpath gets the HTTP publisher
+  only; nothing Kafka-typed is linked (and a web-less consumer, conversely,
+  gets only the Kafka one). A publisher runs INSIDE the claim transaction and
+  **may write to the same database there** (flow's "mark recorded"): its
+  writes commit together with `relayed_on`.
 - **Wire headers vs private reference.** Both built-in publishers forward
   every stored header, then stamp `x-idempotency-key`, `x-event-type` and
   `x-producer`, **replacing** a stored header of the same name (both legs,
@@ -545,9 +547,10 @@ Accepted survivors, each reviewed:
 | `OutboxRelay.stop` | awaitTermination conditional | Shutdown-timing leg; a kill needs a 5s hanging-task test for no insight |
 | `OutboxRelay` thread factory | removed `setDaemon` | Asserted by `OutboxRelayTests` in every normal run; PIT's per-line selection misses the factory-lambda mapping |
 
-`NO_COVERAGE` entries (auto-configuration bean methods, ops controller) are
+`NO_COVERAGE` entries (the Kafka publisher bean method, ops controller) are
 exercised by the Testcontainers ITs, which the posture deliberately keeps out
-of PIT (unit tests only).
+of PIT (unit tests only); the other auto-configuration bean methods are
+covered by `KafkaLessStartupTests` since 1.2.1.
 
 ## Version History
 
