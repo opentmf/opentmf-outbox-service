@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.2.1 - 2026-09-21
+
+### Fixed
+
+- **A consumer without `spring-kafka` could not start.** `OutboxAutoConfiguration`
+  named `KafkaTemplate` in a bean-method signature; the method-level
+  `@ConditionalOnClass` did skip the bean, but Spring still introspects the
+  auto-configuration class reflectively to resolve its other factory methods,
+  and the missing type threw `NoClassDefFoundError: org/springframework/kafka/core/KafkaTemplate`
+  before any context came up. The Kafka publisher now lives in a nested,
+  name-guarded member class (`KafkaPublisherConfiguration`), so a Kafka-less
+  consumer starts with the HTTP publisher only and nothing Kafka-typed is
+  linked. Found on dnms-catalog 1.2.0 (Yusuf, 2026-09-11) — the first consumer
+  without Kafka; the six Kafka consumers were never affected. A consumer that
+  worked around it by adding `spring-kafka` and excluding
+  `KafkaAutoConfiguration` can drop both at its next touch.
+
+### Changed
+
+- **The HTTP publisher's guard is name-based and nested** for the same reason
+  (`HttpPublisherConfiguration`, `@ConditionalOnClass(name =
+  "org.springframework.web.client.RestClient")`): a web-less consumer (a pure
+  Kafka relay) also starts. No behaviour change for any consumer that has
+  spring-web.
+- Neither nested class is `@Configuration`: a stereotype would make it a
+  component-scan candidate, and a consumer whose scan root covers
+  `org.opentmf.outbox` would register it ahead of the auto-configuration
+  order, where `@ConditionalOnBean(KafkaTemplate)` evaluates before
+  `KafkaAutoConfiguration` exists and the publisher silently vanishes. Lite
+  member classes are processed only through the outer auto-configuration.
+- Compiled against `tmf630-toolkit-all` 3.3.0 (was 3.1.1) — the line the
+  opentmf-versions BOM pins for consumers; the dependency stays optional.
+- `KafkaLessStartupTests` pins all of it: a child-first test classloader that
+  DEFINES the library classes without the hidden package (Boot's
+  `FilteredClassLoader` cannot reproduce the reflective failure), a signature
+  scan of the outer class, and the no-stereotype rule on the nested ones.
+
 ## 1.2.0 - 2026-08-27
 
 The last gap-closing release: the union of the consumer audits (dnms-flow,

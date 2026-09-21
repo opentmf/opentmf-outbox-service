@@ -67,12 +67,12 @@
     <maven.compiler.parameters>false</maven.compiler.parameters>
 
     <!-- Stable-only filter for versions:display-* goals. -->
-    <maven.version.ignore>.*-M\d+,.*-RC\d+,.*-SNAPSHOT,(?i).*-(alpha|beta)\d*</maven.version.ignore>
+    <maven.version.ignore>(?i).*[.-](alpha|beta|m|rc|cr|dev|ea|preview)[0-9]*([.+-].*)?$|^[0-9a-f]{40}$</maven.version.ignore>
 
     <!-- An opentmf library never imports the opentmf-versions BOM (the BOM
          aggregates the libraries — a library importing it would be a cycle in
          spirit and a lockstep coupling in practice). Direct property pin. -->
-    <tmf630-toolkit.version>3.1.1</tmf630-toolkit.version>
+    <tmf630-toolkit.version>3.3.0</tmf630-toolkit.version>
 
     <!-- Non-BOM-managed pins live here so versions:display-property-updates sees them. -->
     <archunit.version>1.5.0</archunit.version>
@@ -96,7 +96,7 @@
          source/javadoc/deploy; it pins maven-release-plugin at 3.0.1, overridden here to
          3.3.1. gpg + central-publishing are not Boot-managed. -->
     <maven-release-plugin.version>3.3.1</maven-release-plugin.version>
-    <sonar-maven-plugin.version>5.7.0.6970</sonar-maven-plugin.version>
+    <sonar-maven-plugin.version>5.8.0.7211</sonar-maven-plugin.version>
     <maven-gpg-plugin.version>3.2.8</maven-gpg-plugin.version>
     <central-publishing-maven-plugin.version>0.11.0</central-publishing-maven-plugin.version>
   </properties>
