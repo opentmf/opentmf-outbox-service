@@ -51,40 +51,26 @@ public interface OutboxEventRepository
       @Param("now") OffsetDateTime now, @Param("concurrent") Lane concurrent, Limit limit);
 
   /**
-   * The CONCURRENT lane's claim: the same eligibility over rows stamped CONCURRENT, plus the
-   * ORDERING-KEY rule - a keyed row is claimable only when no row of its key with a LOWER id is
-   * due (claimable now) and no row of its key at all is in flight. So a key never has two rows
-   * in flight within a pod, and its rows go in {@code id} order on the happy path; a row in
-   * backoff (not due, lease cleared) lets later rows of its key pass, as before. Across pods
-   * the one exception: a backed-off row that comes due during another pod's claim of a later row
-   * of its key - order for that key was already given up when the row failed.
+   * The CONCURRENT lane's claim ({@link OutboxClaimSql#CONCURRENT}): the same eligibility over
+   * rows stamped CONCURRENT, plus the ORDERING-KEY rule - a keyed row is claimable only as its
+   * key's first due row and only while no row of its key is in flight. So a key never has two
+   * rows in flight within a pod, and its rows go in {@code id} order on the happy path; a row in
+   * backoff lets later rows of its key pass, as before. Across pods the one exception: a
+   * backed-off row that comes due during another pod's claim of a later row of its key - order
+   * for that key was already given up when the row failed.
+   *
+   * @param after the round-robin cursor: only keys above it ({@code ""} = from the first key)
+   * @param until upper key bound, inclusive ({@code null} = none) - the wrap-around pass
+   * @param limit rows to claim at most (the free lane slots)
+   * @param unkeyedLimit rows WITHOUT a key to consider at most ({@code 0} on the wrap-around)
    */
-  @Lock(LockModeType.PESSIMISTIC_WRITE)
-  @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "-2"))
-  @Query(
-      """
-      select e from OutboxEvent e
-      where e.relayedOn is null and e.cancelledOn is null and e.parkedOn is null
-        and (e.releaseAt is null or e.releaseAt <= :now)
-        and e.nextAttemptOn <= :now
-        and (e.claimedUntil is null or e.claimedUntil <= :now)
-        and e.lane = :concurrent
-        and (e.orderingKey is null or (
-          not exists (
-            select 1 from OutboxEvent o
-            where o.lane = :concurrent and o.orderingKey = e.orderingKey and o.id < e.id
-              and o.relayedOn is null and o.cancelledOn is null and o.parkedOn is null
-              and (o.releaseAt is null or o.releaseAt <= :now)
-              and o.nextAttemptOn <= :now
-              and (o.claimedUntil is null or o.claimedUntil <= :now))
-          and not exists (
-            select 1 from OutboxEvent o
-            where o.lane = :concurrent and o.orderingKey = e.orderingKey
-              and o.relayedOn is null and o.cancelledOn is null
-              and o.claimedUntil > :now)))
-      order by e.id""")
+  @Query(value = OutboxClaimSql.CONCURRENT, nativeQuery = true)
   List<OutboxEvent> claimConcurrent(
-      @Param("now") OffsetDateTime now, @Param("concurrent") Lane concurrent, Limit limit);
+      @Param("now") OffsetDateTime now,
+      @Param("after") String after,
+      @Param("until") String until,
+      @Param("limit") int limit,
+      @Param("unkeyedLimit") int unkeyedLimit);
 
   /**
    * The LEASE GUARD: the row under a waiting {@code for update} lock, but only while it still

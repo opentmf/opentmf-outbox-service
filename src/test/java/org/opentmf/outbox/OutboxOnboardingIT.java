@@ -231,7 +231,8 @@ class OutboxOnboardingIT {
     assertThat(pendingIndexPredicate(url)).contains("parked_on IS NULL");
     assertThat(indexDefinition(url, "ix_outbox_claimed_until")).isNotNull(); // 1.2.0-F + 004
     assertThat(indexDefinition(url, "ix_outbox_ordered_claim")).isNotNull();
-    assertThat(indexDefinition(url, "ix_outbox_concurrent_claim")).isNotNull();
+    assertThat(indexDefinition(url, "ix_outbox_concurrent_keyed")).isNotNull();
+    assertThat(indexDefinition(url, "ix_outbox_concurrent_unkeyed")).isNotNull();
   }
 
   @Test
@@ -324,12 +325,17 @@ class OutboxOnboardingIT {
         .containsEntry("ordering_key", true);
     assertThat(indexDefinition(url, "ix_outbox_claimed_until"))
         .contains("claimed_until IS NOT NULL")
-        .contains("relayed_on IS NULL")
-        .contains("cancelled_on IS NULL");
+        .contains("relayed_on IS NULL");
     assertThat(indexDefinition(url, "ix_outbox_ordered_claim")).contains("lane IS NULL");
-    assertThat(indexDefinition(url, "ix_outbox_concurrent_claim"))
+    assertThat(indexDefinition(url, "ix_outbox_concurrent_keyed"))
         .contains("(ordering_key, id)")
-        .contains("'CONCURRENT'");
+        .contains("'CONCURRENT'")
+        .contains("ordering_key IS NOT NULL");
+    assertThat(indexDefinition(url, "ix_outbox_concurrent_unkeyed"))
+        .contains("(id)")
+        .contains("ordering_key IS NULL");
+    // a live lease holds its key even on a cancelled row: the lease index ignores the cancel
+    assertThat(indexDefinition(url, "ix_outbox_claimed_until")).doesNotContain("cancelled_on");
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
     assertThat(changelogRows(url)).hasSize(4);
   }

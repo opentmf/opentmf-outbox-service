@@ -85,7 +85,8 @@ the batch's row locks were held across every backend call.
   gauge still counts in-flight rows.
 - Changeset `004-outbox-claim-lease`: `claimed_until`, `lane` and
   `ordering_key`, plus the partial indexes `ix_outbox_claimed_until`,
-  `ix_outbox_ordered_claim` and `ix_outbox_concurrent_claim`. It is additive
+  `ix_outbox_ordered_claim`, `ix_outbox_concurrent_keyed` and
+  `ix_outbox_concurrent_unkeyed`. It is additive
   and `if not exists`, so it applies to an onboarded pre-library table too.
   001–003 are untouched (their checksums hold, pinned against the released
   1.2.1 changelog).
@@ -101,9 +102,20 @@ the batch's row locks were held across every backend call.
 
 ### Internal
 
-- Each lane claims over its own query and partial index with
-  `FOR UPDATE SKIP LOCKED`, so no backlog of one lane can hide a row of the
-  other.
+- Each lane claims over its own query and partial indexes with
+  `FOR UPDATE SKIP LOCKED`, each in its own short transaction on the relay
+  thread (the CONCURRENT one only when a lane slot is free). Neither reads
+  relayed rows or the other lane's backlog.
+- The CONCURRENT claim is native SQL (`OutboxClaimSql`).
+  - It reads the in-flight keys through the lease index (a live lease holds
+    its key even on a cancelled row).
+  - It steps key by key through `(ordering_key, id)`, round-robin from a
+    per-pod cursor, with one head probe per key not in flight, and stops at
+    the free slots.
+  - Its cost is bounded by those slots plus the keys stepped over. It does not
+    grow with the table or with one key's backlog: 0.5–1.3 ms with 5,000,000
+    relayed rows, including a 100,000-row one-key backlog and 10,000 keys.
+  - `OutboxClaimPlanIT` pins the plan shape and the buffer count.
 - The relay's nudges coalesce, and a freed CONCURRENT slot nudges the relay.
 - The ITs run twice over the lane: on JDK 17 (platform threads) and, for
   `OutboxHttpLaneVirtualIT`, in a failsafe execution forked on a JDK 21+

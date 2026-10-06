@@ -238,7 +238,7 @@ class OutboxTwoRelaysIT {
 
   private List<OutboxEvent> concurrentOf(String key) {
     return repository
-        .claimConcurrent(OffsetDateTime.now(), Lane.CONCURRENT, Limit.of(500))
+        .claimConcurrent(OffsetDateTime.now(), "", null, 500, 500)
         .stream()
         .filter(row -> key.equals(row.getOrderingKey()))
         .toList();

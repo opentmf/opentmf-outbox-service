@@ -103,4 +103,10 @@ class OutboxLaneStamperTests {
     assertThat(event.getLane()).isNull();
     assertThat(event.getOrderingKey()).isNull();
   }
+
+  @Test
+  void aBlankKey_isNoKey() {
+    assertThat(OutboxLaneStamper.fit(" ")).isNull();
+    assertThat(OutboxLaneStamper.fit("")).isNull();
+  }
 }

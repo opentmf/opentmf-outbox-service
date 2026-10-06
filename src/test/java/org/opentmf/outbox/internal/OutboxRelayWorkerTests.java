@@ -4,7 +4,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
@@ -23,13 +26,17 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxBooking;
@@ -116,20 +123,15 @@ class OutboxRelayWorkerTests {
                   .limit(limit.max())
                   .toList();
             });
-    when(repository.claimConcurrent(any(), any(), any(Limit.class)))
+    when(repository.claimConcurrent(any(), any(), any(), anyInt(), anyInt()))
         .thenAnswer(
-            inv -> {
-              OffsetDateTime now = inv.getArgument(0);
-              Limit limit = inv.getArgument(2);
-              return table.values().stream()
-                  .filter(
-                      e ->
-                          e.getLane() == Lane.CONCURRENT
-                              && claimable(e, now)
-                              && keyFree(e, now))
-                  .limit(limit.max())
-                  .toList();
-            });
+            inv ->
+                claimConcurrent(
+                    inv.getArgument(0),
+                    inv.getArgument(1),
+                    inv.getArgument(2),
+                    inv.getArgument(3),
+                    inv.getArgument(4)));
     when(repository.lockLeased(anyLong(), any()))
         .thenAnswer(
             inv -> {
@@ -164,21 +166,57 @@ class OutboxRelayWorkerTests {
         && (e.getClaimedUntil() == null || !e.getClaimedUntil().isAfter(now));
   }
 
-  /** The ordering-key rule of the CONCURRENT claim: no lower row of the key due, none flying. */
-  private boolean keyFree(OutboxEvent e, OffsetDateTime now) {
-    if (e.getOrderingKey() == null) {
-      return true;
-    }
-    return table.values().stream()
-        .filter(
-            o -> o.getLane() == Lane.CONCURRENT && e.getOrderingKey().equals(o.getOrderingKey()))
-        .noneMatch(
-            o ->
-                (o.getId() < e.getId() && claimable(o, now))
-                    || (o.getRelayedOn() == null
-                        && o.getCancelledOn() == null
-                        && o.getClaimedUntil() != null
-                        && o.getClaimedUntil().isAfter(now)));
+  /**
+   * {@link OutboxClaimSql#CONCURRENT} on the fake table: keys round-robin from {@code after} up to
+   * {@code until}, each key not in flight contributing its first due row, until {@code limit}
+   * heads; rows without a key in id order; the union in id order, {@code limit} rows.
+   */
+  private List<OutboxEvent> claimConcurrent(
+      OffsetDateTime now, String after, String until, int limit, int unkeyedLimit) {
+    List<OutboxEvent> pendingConcurrent =
+        table.values().stream()
+            .filter(
+                e ->
+                    e.getLane() == Lane.CONCURRENT
+                        && e.getRelayedOn() == null
+                        && e.getCancelledOn() == null
+                        && e.getParkedOn() == null)
+            .toList();
+    Set<String> inFlight =
+        table.values().stream()
+            .filter(
+                e ->
+                    e.getLane() == Lane.CONCURRENT
+                        && e.getRelayedOn() == null
+                        && e.getOrderingKey() != null
+                        && e.getClaimedUntil() != null
+                        && e.getClaimedUntil().isAfter(now))
+            .map(OutboxEvent::getOrderingKey)
+            .collect(Collectors.toSet());
+    List<OutboxEvent> heads = new ArrayList<>();
+    pendingConcurrent.stream()
+        .map(OutboxEvent::getOrderingKey)
+        .filter(Objects::nonNull)
+        .filter(k -> k.compareTo(after) > 0 && (until == null || k.compareTo(until) <= 0))
+        .distinct()
+        .sorted()
+        .filter(k -> !inFlight.contains(k))
+        .forEach(
+            k ->
+                pendingConcurrent.stream()
+                    .filter(e -> k.equals(e.getOrderingKey()) && claimable(e, now))
+                    .findFirst()
+                    .filter(head -> heads.size() < limit)
+                    .ifPresent(heads::add));
+    List<OutboxEvent> unkeyed =
+        pendingConcurrent.stream()
+            .filter(e -> e.getOrderingKey() == null && claimable(e, now))
+            .limit(unkeyedLimit)
+            .toList();
+    return Stream.concat(heads.stream(), unkeyed.stream())
+        .sorted(Comparator.comparing(OutboxEvent::getId))
+        .limit(limit)
+        .toList();
   }
 
   private static OutboxEvent copy(OutboxEvent row) {
@@ -243,8 +281,9 @@ class OutboxRelayWorkerTests {
                 .count())
         .isEqualTo(1d);
     assertThat(registry.get(OutboxMetrics.ATTEMPTS).summary().totalAmount()).isEqualTo(1d);
-    // claim + one booking: two SHORT transactions, the send in neither
-    assertThat(committed).isEqualTo(2);
+    // the ORDERED claim, the CONCURRENT claim (a slot was free), one booking: three SHORT
+    // transactions, the send in none
+    assertThat(committed).isEqualTo(3);
   }
 
   @Test
@@ -900,7 +939,7 @@ class OutboxRelayWorkerTests {
 
     assertThat(worker.relayBatch()).isZero();
 
-    verify(repository, never()).claimConcurrent(any(), any(), any(Limit.class));
+    verify(repository, never()).claimConcurrent(any(), any(), any(), anyInt(), anyInt());
     assertThat(row.getClaimedUntil()).isNull();
     lane.releaseUnused(2);
   }
@@ -921,13 +960,63 @@ class OutboxRelayWorkerTests {
   }
 
   @Test
-  void aConcurrentRowRacingAClaimThatDoesNotCommit_returnsItsSlots() {
+  void aRowCancelledWhileInFlight_stillHoldsItsKey() {
+    OutboxEvent flying = concurrent(1L, "receiver-a");
+    leasedElsewhere(flying);
+    flying.setCancelledOn(OffsetDateTime.now()); // cancelled, but its send is still running
+    OutboxEvent next = concurrent(2L, "receiver-a");
+
+    assertThat(relay()).isZero();
+    assertThat(next.getClaimedUntil()).isNull();
+  }
+
+  @Test
+  void aConcurrentClaimThatDoesNotCommit_returnsItsSlots_andTheOrderedRowsGoOn() {
     concurrent(1L, null);
+    OutboxEvent ordered = pending(2L, 0);
+    when(repository.claimConcurrent(any(), any(), any(), anyInt(), anyInt()))
+        .thenThrow(new IllegalStateException("database gone mid-claim"));
+
+    worker.relayBatch(); // logged - the pass goes on
+
+    assertThat(lane.available()).isEqualTo(2);
+    assertThat(ordered.getRelayedOn()).isNotNull();
+  }
+
+  @Test
+  void anOrderedClaimThatDoesNotCommit_failsThePass() {
+    pending(1L, 0);
     failCommits = true;
 
     assertThatThrownBy(worker::relayBatch).hasMessageContaining("database gone");
 
     assertThat(lane.available()).isEqualTo(2);
+  }
+
+  @Test
+  void keysAreServedRoundRobin_fromTheCursor_wrappingRound() {
+    concurrent(1L, "a");
+    concurrent(2L, "a");
+    concurrent(3L, "b");
+    concurrent(4L, "b");
+    concurrent(5L, "c");
+    concurrent(6L, "c");
+    List<String> served = new CopyOnWriteArrayList<>();
+    doAnswer(
+            inv -> {
+              served.add(inv.<OutboxEvent>getArgument(0).getOrderingKey());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    relay(); // two slots: a, b - the cursor moves to b
+    relay(); // c, then wraps round to a
+    relay(); // b, c
+
+    assertThat(served).containsExactly("a", "b", "c", "a", "b", "c");
+    verify(repository).claimConcurrent(any(), eq("b"), isNull(), eq(2), eq(2));
+    verify(repository).claimConcurrent(any(), eq(""), eq("b"), eq(1), eq(0)); // the wrap
   }
 
   @Test

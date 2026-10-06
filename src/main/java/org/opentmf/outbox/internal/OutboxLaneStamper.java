@@ -51,7 +51,10 @@ public final class OutboxLaneStamper {
   }
 
   static String fit(String key) {
-    if (key == null || key.length() <= ORDERING_KEY_MAX_LENGTH) {
+    if (key == null || key.isBlank()) {
+      return null; // no key: the row is independent
+    }
+    if (key.length() <= ORDERING_KEY_MAX_LENGTH) {
       return key;
     }
     try {

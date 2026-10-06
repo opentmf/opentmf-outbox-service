@@ -80,9 +80,11 @@ relayed rows.
 
 A partial index (`ix_outbox_pending` on `next_attempt_on where relayed_on is
 null and cancelled_on is null and parked_on is null`) keeps the relay's claim
-query cheap regardless of the terminal backlog; a second one
-(`ix_outbox_claimed_until`, over leased pending rows, 1.3.0) backs the
-in-flight gauge.
+query cheap regardless of the terminal backlog. Since 1.3.0 each lane claims
+over its own partial indexes: `ix_outbox_ordered_claim` for the ORDERED lane;
+`ix_outbox_claimed_until` (leased unrelayed rows), `ix_outbox_concurrent_keyed`
+and `ix_outbox_concurrent_unkeyed` for the CONCURRENT lane, whose claim reads
+neither relayed rows nor more than one row per key.
 
 `relayed` and `cancelled` overlap in exactly one case: a row cancelled while
 its send was in flight, whose send then succeeded — booked
@@ -203,8 +205,29 @@ sequenceDiagram
   ORDERED claim adds `lane is null or lane <> 'CONCURRENT'`. The CONCURRENT
   claim adds `lane = 'CONCURRENT'` and, for a keyed row, the ordering-key
   rule: no row of its key with a lower id is due, and no row of its key at all
-  is in flight. A row in backoff lets later rows of its key pass. A held row
-  waits for its hold; a cancelled or parked row never comes back on its own.
+  is in flight. A live lease holds its key even if its row was cancelled
+  meanwhile, because the send is still running. A row in backoff lets later
+  rows of its key pass. A held row waits for its hold; a cancelled or parked
+  row never comes back on its own.
+- **What a claim costs.** Both claims run on the relay thread, each in its own
+  short transaction: ORDERED first, then CONCURRENT, only when a lane slot is
+  free. The ORDERED sends start after both. Neither claim reads relayed rows
+  or the other lane's backlog.
+  - The ORDERED claim reads its batch from its own index in `id` order.
+  - The CONCURRENT claim reads the keys in flight through the lease index. It
+    steps from key to key through the keyed index, **round-robin from a
+    per-pod cursor**, and probes one head row per key not in flight. It stops
+    as soon as it holds as many rows as there are free slots.
+  - So the CONCURRENT claim's cost is bounded by the free slots plus the keys
+    it steps over: those in flight (bounded by the slots across pods) and
+    those whose rows are all backing off or held. It does not grow with the
+    table, with the lane's backlog, or with one key's backlog.
+  - Measured with 5,000,000 relayed rows (`EXPLAIN (ANALYZE, BUFFERS)`):
+    idle 0.5 ms; 100,000 pending rows of one key, in flight 1.0 ms, not in
+    flight 0.9 ms; 10,000 keys × 10 rows 1.3 ms. `OutboxClaimPlanIT` pins
+    the shape.
+  - Keys are served round-robin, so across keys the claim order follows the
+    cursor, not `id`. The library promises no order between keys.
 - **The claim moves `next_attempt_on` to the lease end**, and every booking
   sets it again: the publisher's backoff on a failure, the booking time
   otherwise. Two consequences. A **pre-1.3.0 relay**, which knows no lease,

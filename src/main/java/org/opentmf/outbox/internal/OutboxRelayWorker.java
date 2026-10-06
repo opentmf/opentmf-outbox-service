@@ -5,7 +5,9 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Supplier;
 import lombok.RequiredArgsConstructor;
@@ -23,8 +25,8 @@ import org.springframework.data.domain.Limit;
 import org.springframework.transaction.support.TransactionOperations;
 
 /**
- * One relay pass, CLAIMED BY LEASE (1.3.0): a short claim transaction takes the due rows of
- * each lane over that lane's own query ({@code FOR UPDATE SKIP LOCKED}), resolves each row's
+ * One relay pass, CLAIMED BY LEASE (1.3.0): one short claim transaction per lane takes that
+ * lane's due rows over its own query ({@code FOR UPDATE SKIP LOCKED}), resolves each row's
  * publisher, stamps {@code claimed_until} on the rows it takes and COMMITS. The sends then run
  * in NO transaction - CONCURRENT rows on the lane's threads, ORDERED rows one after another on
  * the calling relay thread - and each outcome is written by its own short booking transaction,
@@ -76,6 +78,9 @@ class OutboxRelayWorker {
   private final TransactionOperations tx;
   private final OutboxConcurrentLane lane;
 
+  /** The CONCURRENT claim's round-robin key cursor - read and moved on the relay thread only. */
+  private String keyCursor = "";
+
   /** One claimed row: its publisher and the lease value this holder stamped. */
   static final class Leased {
     final OutboxEvent event;
@@ -114,18 +119,27 @@ class OutboxRelayWorker {
 
   // ---------------------------------------------------------------- claim
 
+  /**
+   * The two claims, each its own short transaction on the relay thread: ORDERED first (its
+   * failure fails the pass), then CONCURRENT - only when a lane slot is free. A failed CONCURRENT
+   * claim returns its slots and lets the ORDERED rows go on.
+   */
   private Claim claim() {
+    List<Leased> ordered = tx.execute(status -> claimOrdered(now()));
     List<Leased> concurrent = new ArrayList<>();
-    try {
-      return tx.execute(status -> scan(concurrent));
-    } catch (RuntimeException ex) {
-      lane.releaseUnused(concurrent.size()); // the stamps never committed
-      throw ex;
+    if (lane.available() > 0) {
+      try {
+        tx.executeWithoutResult(status -> claimConcurrent(now(), concurrent));
+      } catch (RuntimeException ex) {
+        lane.releaseUnused(concurrent.size()); // the stamps never committed
+        concurrent.clear();
+        log.error("Outbox CONCURRENT claim failed; the sweep will retry", ex);
+      }
     }
+    return new Claim(ordered, concurrent);
   }
 
-  private Claim scan(List<Leased> concurrent) {
-    OffsetDateTime now = now();
+  private List<Leased> claimOrdered(OffsetDateTime now) {
     List<Leased> ordered = new ArrayList<>();
     for (OutboxEvent row :
         repository.claimOrdered(now, Lane.CONCURRENT, Limit.of(properties.getBatchSize()))) {
@@ -134,16 +148,43 @@ class OutboxRelayWorker {
         ordered.add(stamp(row, publisher, Lane.ORDERED, now));
       }
     }
+    return ordered;
+  }
+
+  /**
+   * Claims as many CONCURRENT rows as there are free slots: keys round-robin from the cursor
+   * (then wrapping round to the cursor), rows without a key in {@code id} order. The cursor
+   * moves to the last key claimed, so every key gets its turn whatever the others' backlogs.
+   */
+  private void claimConcurrent(OffsetDateTime now, List<Leased> concurrent) {
     int free = lane.available();
-    if (free > 0) {
-      for (OutboxEvent row : repository.claimConcurrent(now, Lane.CONCURRENT, Limit.of(free))) {
-        OutboxPublisher publisher = route(row);
-        if (publisher != null && lane.tryAcquire()) {
-          concurrent.add(stamp(row, publisher, Lane.CONCURRENT, now));
-        }
+    List<OutboxEvent> rows =
+        new ArrayList<>(repository.claimConcurrent(now, keyCursor, null, free, free));
+    String lastKey = lastKey(rows);
+    if (rows.size() < free && !keyCursor.isEmpty()) {
+      List<OutboxEvent> wrapped =
+          repository.claimConcurrent(now, "", keyCursor, free - rows.size(), 0);
+      String wrappedLast = lastKey(wrapped);
+      lastKey = wrappedLast != null ? wrappedLast : lastKey;
+      rows.addAll(wrapped);
+    }
+    for (OutboxEvent row : rows) {
+      OutboxPublisher publisher = route(row);
+      if (publisher != null && lane.tryAcquire()) {
+        concurrent.add(stamp(row, publisher, Lane.CONCURRENT, now));
       }
     }
-    return new Claim(ordered, concurrent);
+    if (lastKey != null) {
+      keyCursor = lastKey;
+    }
+  }
+
+  private static String lastKey(List<OutboxEvent> rows) {
+    return rows.stream()
+        .map(OutboxEvent::getOrderingKey)
+        .filter(Objects::nonNull)
+        .max(Comparator.naturalOrder())
+        .orElse(null);
   }
 
   /** The row's publisher - or null after booking the routing failure by the LIBRARY policy. */
