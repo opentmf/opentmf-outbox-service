@@ -51,7 +51,8 @@ class OutboxMetricsTests {
     metrics.refresh(); // fails: the values go NaN, the age does NOT restart
 
     assertThat(gauge(OutboxMetrics.PARKED)).isNaN();
-    assertThat(gauge(OutboxMetrics.METRICS_AGE)).isGreaterThanOrEqualTo(1d);
+    // bounded BOTH ways: ~1.1 s, in SECONDS (the millis-to-seconds division is load-bearing)
+    assertThat(gauge(OutboxMetrics.METRICS_AGE)).isBetween(1d, 5d);
   }
 
   @Test
