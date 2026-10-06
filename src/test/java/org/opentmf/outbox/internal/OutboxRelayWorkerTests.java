@@ -984,6 +984,29 @@ class OutboxRelayWorkerTests {
   }
 
   @Test
+  void aConcurrentClaimWhoseCommitFails_returnsTheSlotsOfTheRowsItStamped_andSendsNone() {
+    OutboxEvent row = concurrent(1L, null);
+    doAnswer(
+            inv -> {
+              failCommits = true; // the stamps are set, then the commit fails
+              return claimConcurrent(
+                  inv.getArgument(0),
+                  inv.getArgument(1),
+                  inv.getArgument(2),
+                  inv.getArgument(3),
+                  inv.getArgument(4));
+            })
+        .when(repository)
+        .claimConcurrent(any(), any(), any(), anyInt(), anyInt());
+
+    assertThat(worker.relayBatch()).isZero(); // nothing claimed, nothing submitted
+
+    assertThat(lane.available()).isEqualTo(2);
+    verify(publisher, never()).deliver(row);
+    assertThat(row.getClaimedUntil()).isNull(); // rolled back
+  }
+
+  @Test
   void anOrderedClaimThatDoesNotCommit_failsThePass() {
     pending(1L, 0);
     failCommits = true;
@@ -1017,6 +1040,10 @@ class OutboxRelayWorkerTests {
     assertThat(served).containsExactly("a", "b", "c", "a", "b", "c");
     verify(repository).claimConcurrent(any(), eq("b"), isNull(), eq(2), eq(2));
     verify(repository).claimConcurrent(any(), eq(""), eq("b"), eq(1), eq(0)); // the wrap
+    // after the wrap the cursor is the WRAPPED pass's last key (a), not the first pass's (c)
+    verify(repository).claimConcurrent(any(), eq("a"), isNull(), eq(2), eq(2));
+    // a pass that filled every slot never wraps
+    verify(repository, never()).claimConcurrent(any(), any(), any(), eq(0), anyInt());
   }
 
   @Test
