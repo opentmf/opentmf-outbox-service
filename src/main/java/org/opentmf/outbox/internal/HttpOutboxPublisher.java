@@ -25,6 +25,11 @@ import tools.jackson.databind.ObjectMapper;
  *
  * <p>Non-2xx answers throw (RestClient's default error handling), unwinding into the relay's
  * ordinary backoff-then-park bookkeeping.
+ *
+ * <p>Lane (1.3.0): CONCURRENT - an HTTP row never waits behind another receiver, and never holds
+ * up an ORDERED row. The ordering key is the DESTINATION, so rows to one receiver are never in
+ * flight together and go in {@code id} order on the happy path, as they did on the single relay
+ * thread.
  */
 @Slf4j
 class HttpOutboxPublisher implements OutboxPublisher {
@@ -49,6 +54,17 @@ class HttpOutboxPublisher implements OutboxPublisher {
   public boolean supports(OutboxEvent event) {
     String destination = event.getDestination();
     return destination.startsWith("http://") || destination.startsWith("https://");
+  }
+
+  @Override
+  public Lane lane(OutboxEvent event) {
+    return Lane.CONCURRENT;
+  }
+
+  /** Per-receiver order: the destination URL is the key. */
+  @Override
+  public String orderingKey(OutboxEvent event) {
+    return event.getDestination();
   }
 
   @Override

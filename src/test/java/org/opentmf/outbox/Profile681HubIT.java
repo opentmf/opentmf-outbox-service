@@ -2,7 +2,6 @@ package org.opentmf.outbox;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
 import io.micrometer.core.instrument.MeterRegistry;
@@ -16,7 +15,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -49,7 +47,9 @@ import tools.jackson.databind.ObjectMapper;
  * (HTTP) rows side by side; the hub publisher is the CONSUMER's, ordered ahead, with its own
  * budget (3), its own backoff and DROP on exhaustion; the subscription id rides
  * {@code reference} and never reaches the wire; a listener filtering by destination sees no
- * dropped row; cancel-vs-claim: the claim wins; the /ops wire answers 404 / 409.
+ * dropped row; cancel against a send in flight (1.3.0, the lease): the cancel returns at once and
+ * the booking records the row SENT-BUT-CANCELLED; the /ops wire answers 404 / 409. The hub sender
+ * is 681's publisher UNCHANGED from 1.2.x - no lane declared, so ORDERED: the no-code-change path.
  */
 @Testcontainers
 @SpringBootTest(
@@ -133,7 +133,7 @@ class Profile681HubIT {
         @Override
         public void publish(OutboxEvent event) {
           if (event.getDestination().endsWith("/hub/slow")) {
-            SLOW_IN_FLIGHT.countDown(); // the claim now holds the row's lock
+            SLOW_IN_FLIGHT.countDown(); // the row is leased; no lock, no transaction is held
             try {
               SLOW_GATE.await(30, TimeUnit.SECONDS);
             } catch (InterruptedException ex) {
@@ -201,7 +201,7 @@ class Profile681HubIT {
   }
 
   @Test
-  void hubProfile_dropsByItsOwnBudget_referenceStaysPrivate_claimBeatsCancel_opsWire() {
+  void hubProfile_dropsByItsOwnBudget_referenceStaysPrivate_cancelInFlightIsBooked_opsWire() {
     String topic = "hub-681-" + UUID.randomUUID();
     OutboxEvent kafkaRow =
         tx.execute(
@@ -261,36 +261,28 @@ class Profile681HubIT {
     assertThat(maintenance.inspect(delivered.getId()).reference())
         .isEqualTo("subscription-secret-2");
 
-    // 4) cancel vs claim, THE RACE: the relay claims the slow row and is inside publish();
-    //    cancel arrives now - it BLOCKS behind the claim's row lock (no timeout), and once the
-    //    relay commits it sees the row as the relay left it and refuses. Claim wins, loudly.
+    // 4) cancel vs a send in flight, THE RACE (1.3.0): the relay leased the slow row and is
+    //    inside publish() - holding no lock and no transaction. The cancel does NOT wait: it
+    //    succeeds at once. The send then succeeds and the booking honours the cancel - the row is
+    //    booked SENT-BUT-CANCELLED, both stamps, the truth on /ops.
     OutboxEvent slow =
         tx.execute(
             s ->
                 writer.append(
                     OutboxAppend.of(
                         "subscription", "sub-4", "hub.event.v1", hub("slow"), Map.of())));
-    awaitLatch(SLOW_IN_FLIGHT);
-    CompletableFuture<Throwable> cancelOutcome =
-        CompletableFuture.supplyAsync(
+    awaitLatch(SLOW_IN_FLIGHT); // in flight: OutboxLeaseIT pins the inFlight view itself
+    CompletableFuture<Void> cancelOutcome =
+        CompletableFuture.runAsync(() -> maintenance.cancel(slow.getId()));
+    assertThat(cancelOutcome).succeedsWithin(Duration.ofSeconds(2)); // nothing to wait behind
+    SLOW_GATE.countDown(); // the send finishes; the booking sees the cancel
+    await() // booked SENT-BUT-CANCELLED: both stamps, no longer in flight
+        .atMost(Duration.ofSeconds(20))
+        .until(
             () -> {
-              try {
-                maintenance.cancel(slow.getId());
-                return null;
-              } catch (RuntimeException ex) {
-                return ex;
-              }
+              OutboxRowView view = maintenance.inspect(slow.getId());
+              return view.relayedOn() != null && view.cancelledOn() != null && !view.inFlight();
             });
-    assertThatThrownBy(() -> cancelOutcome.get(2, TimeUnit.SECONDS))
-        .isInstanceOf(TimeoutException.class); // still blocked behind the claim
-    SLOW_GATE.countDown(); // the relay finishes and commits relayed_on
-    assertThat(cancelOutcome)
-        .succeedsWithin(Duration.ofSeconds(20))
-        .isInstanceOf(IllegalStateException.class)
-        .extracting(Throwable::getMessage)
-        .asString()
-        .contains("already relayed");
-    assertThat(maintenance.inspect(slow.getId()).cancelledOn()).isNull();
     // and a plainly relayed row refuses the same way
     assertThatIllegalStateException()
         .isThrownBy(() -> maintenance.cancel(delivered.getId()))

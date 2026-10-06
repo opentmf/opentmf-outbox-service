@@ -28,8 +28,9 @@ import tools.jackson.databind.ObjectMapper;
  * is the stored JSON STRING: the consumer's value serializer must be string-compatible.
  *
  * <p>When the template is transactional the send runs in a Kafka transaction; otherwise the
- * relay awaits the broker acknowledgement synchronously so a failure is observed inside the
- * claim transaction.
+ * relay awaits the broker acknowledgement synchronously (at most {@code send-timeout}) so a
+ * failure is observed before the booking. Lane: ORDERED (the default) - the single relay thread,
+ * {@code id} order; the ordered lease must exceed {@code send-timeout}.
  */
 class KafkaOutboxPublisher implements OutboxPublisher {
 

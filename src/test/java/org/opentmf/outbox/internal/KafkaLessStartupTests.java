@@ -20,6 +20,7 @@ import org.springframework.context.support.GenericApplicationContext;
 import org.springframework.core.annotation.MergedAnnotations;
 import org.springframework.core.annotation.MergedAnnotations.SearchStrategy;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.PlatformTransactionManager;
 
 /**
  * A consumer WITHOUT {@code spring-kafka} (or without {@code spring-web}) must start.
@@ -50,6 +51,12 @@ class KafkaLessStartupTests {
     @Bean
     OutboxEventRepository outboxEventRepository() {
       return mock(OutboxEventRepository.class);
+    }
+
+    /** JPA brings one; the relay's short claim and booking transactions run through it. */
+    @Bean
+    PlatformTransactionManager transactionManager() {
+      return mock(PlatformTransactionManager.class);
     }
   }
 

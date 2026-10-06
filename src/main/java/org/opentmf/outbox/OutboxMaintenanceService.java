@@ -20,9 +20,14 @@ import org.springframework.transaction.annotation.Transactional;
  * unreleased effect; {@link #list} and {@link #inspect} are the no-direct-DB read half.
  *
  * <p>The row-mutating actions read their row under a WAITING {@code for update} lock, so they
- * serialize against a relay claim in flight: an action that races the relay sees the row as
+ * serialize against the relay's short claim and booking transactions: an action sees the row as
  * the relay LEFT it (and refuses a now-relayed row) - never a stale snapshot, never a silent
- * no-op.
+ * no-op. Since 1.3.0 no lock is held across a send, so an action on an IN-FLIGHT row (a live
+ * lease) does not wait for the send: a cancel succeeds at once, and the send's booking then
+ * honours it - a failed send retires cancelled (no retry), a successful one is booked
+ * SENT-BUT-CANCELLED (both stamps, visible on /ops), and an ORDERED row cancelled before its
+ * turn is released unsent. An unpark never meets a live lease: only a booking parks a row, and
+ * the booking clears the lease.
  */
 @Slf4j
 @RequiredArgsConstructor

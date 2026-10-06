@@ -1,5 +1,93 @@
 # Changelog
 
+## 1.3.0 - 2026-10-06
+
+OUTBOX-HTTP-LANE-1: HTTP rows leave the ordered relay, and every row is claimed
+by **lease**. Until now the relay was one thread that published up to
+`batch-size` rows one after another inside ONE transaction. A slow HTTP
+subscriber delayed every Kafka row behind it, and a database connection plus
+the batch's row locks were held across every backend call.
+
+### Changed (behaviour - read before upgrading)
+
+- **A publisher's own database write moves from `publish` to the booking
+  hook.** `publish` now runs in NO transaction. The 1.1.0 contract (a write
+  inside `publish` commits with `relayed_on`, the claim transaction) is
+  replaced by `OutboxPublisher.onBooked(event, OutboxBooking)`. The hook runs
+  inside the short booking transaction for EVERY outcome: `RELAYED` with the
+  result `deliver` returned, `RETRY`, `EXHAUSTED` (PARK/DROP), `CANCELLED`. Its
+  writes commit with the row's bookkeeping and roll back with it.
+  `OutboxRelayedListener.onRelayed` keeps its guarantee on both lanes: it runs
+  in the transaction that stamps `relayed_on`, after the hook.
+- **HTTP rows are no longer in `id` order against other rows.** The library's
+  `HttpOutboxPublisher` rides the new CONCURRENT lane. An HTTP row keeps no
+  order against Kafka (ORDERED) rows, nor against HTTP rows to other
+  receivers. Rows to the SAME receiver keep their `id` order on the happy path
+  (the destination is the ordering key; a failed row backs off, and later rows
+  may pass it).
+- **Cancel of a row in flight succeeds at once.** It used to block behind the
+  claim and then refuse with "already relayed". The booking honours the
+  cancel: a send that fails retires the row cancelled (no retry, no park), and
+  a send that succeeds is booked **sent-but-cancelled**. Both `relayed_on` and
+  `cancelled_on` are set, the row is listed under both states, and the relayed
+  listeners fire, because the effect did leave.
+- **A crash between send and booking redelivers once the lease lapses**, not
+  on the next pass: up to 15 s on the ORDERED lane, up to the CONCURRENT
+  lease (2 min by default).
+- A booking refused by a hook or listener now books one failed attempt
+  (`attempts++`). The send ran outside the booking, so the rollback cannot
+  pretend the attempt never happened.
+
+### Added
+
+- **Two lanes, chosen by the publisher:** `OutboxPublisher.lane(event)` is
+  `ORDERED` (the default: the single relay thread, `id` order) or `CONCURRENT`
+  (parallel sends, at most `opentmf.outbox.concurrent.max-in-flight`, default
+  8, per pod). The Kafka publisher stays ORDERED and the HTTP publisher is
+  CONCURRENT.
+- **Ordering key** for the CONCURRENT lane: `OutboxPublisher.orderingKey(event)`.
+  Rows sharing a non-null key are never in flight together and are taken in
+  `id` order.
+- **Claim by lease.** New nullable column `claimed_until`. A short claim
+  transaction stamps `now + lease` and commits, the send runs in no
+  transaction and holds no database connection, and a short booking
+  transaction writes the outcome, guarded on the stamped value. A holder whose
+  lease lapsed books nothing. The lease is per publisher
+  (`OutboxPublisher.lease(event)`), with lane defaults `opentmf.outbox.lease`
+  (2 min, CONCURRENT) and `opentmf.outbox.ordered.lease` (15 s, ORDERED;
+  validated to exceed `send-timeout`). Each ORDERED row's lease is renewed by
+  the booking of the row before it, so it covers one send.
+- **Virtual threads where available.** The CONCURRENT lane runs on Spring's
+  `SimpleAsyncTaskExecutor`: virtual threads on a JDK 21+ runtime with
+  `spring.threads.virtual.enabled=true`, platform threads otherwise. The claim
+  takes the slot before it stamps the row, so `max-in-flight` is also the
+  platform-thread bound. The library's bytecode stays on Java 17.
+- `OutboxPublisher.deliver(event)` (returns a result for the booking; the
+  default calls `publish`), `OutboxBooking` (outcome, result, failure,
+  exhaustion).
+- `opentmf.outbox.shutdown-grace` (default 10 s): on stop, sends in flight get
+  this long to finish and book; the rest lapse by lease.
+- Gauge `opentmf.outbox.in-flight` (pending rows under a live lease, across
+  pods); `OutboxRowView` gains `inFlight` and `claimedUntil`. The `pending`
+  gauge still counts in-flight rows.
+- Changeset `004-outbox-claim-lease`: `claimed_until` plus the partial index
+  `ix_outbox_claimed_until`, additive and `if not exists`, so it applies to an
+  onboarded pre-library table too. 001–003 are untouched (their checksums
+  hold, pinned against the released 1.2.1 changelog).
+
+### Internal
+
+- The claim scan reads in-flight rows too (to learn the ordering keys taken)
+  and locks with a waiting `FOR UPDATE` instead of `SKIP LOCKED`. Every lock
+  holder is a short transaction now, and waiting lets a claim see a row
+  another pod is stamping as in flight instead of skipping past it to a later
+  row of the same key. The scan reads at most ten windows of `batch-size`
+  rows.
+- The relay's nudges coalesce, and a freed CONCURRENT slot nudges the relay.
+- The ITs run twice over the lane: on JDK 17 (platform threads) and, for
+  `OutboxHttpLaneVirtualIT`, in a failsafe execution forked on a JDK 21+
+  toolchain (virtual threads).
+
 ## 1.2.1 - 2026-09-21
 
 ### Fixed

@@ -16,12 +16,15 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.thread.Threading;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.core.env.Environment;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.client.RestClient;
 import tools.jackson.databind.ObjectMapper;
 
@@ -79,6 +82,18 @@ public class OutboxAutoConfiguration {
     return new OutboxPublisherRouter(publishers);
   }
 
+  /**
+   * The CONCURRENT lane: virtual threads when the runtime is 21+ AND the application enables
+   * {@code spring.threads.virtual.enabled} (Boot's own test), platform threads otherwise.
+   */
+  @Bean
+  OutboxConcurrentLane outboxConcurrentLane(OutboxProperties properties, Environment environment) {
+    return new OutboxConcurrentLane(
+        properties.getConcurrent().getMaxInFlight(),
+        Threading.VIRTUAL.isActive(environment),
+        properties.getShutdownGrace());
+  }
+
   @Bean
   OutboxRelayWorker outboxRelayWorker(
       OutboxEventRepository repository,
@@ -86,17 +101,26 @@ public class OutboxAutoConfiguration {
       OutboxBackoff backoff,
       OutboxMetrics metrics,
       OutboxProperties properties,
-      ObjectProvider<OutboxRelayedListener> relayedListeners) {
+      ObjectProvider<OutboxRelayedListener> relayedListeners,
+      PlatformTransactionManager transactionManager,
+      OutboxConcurrentLane lane) {
     // the post-relay seam: zero or more consumer beans, invoked in bean order inside the
-    // claim transaction (see OutboxRelayedListener)
+    // booking transaction that stamps relayed_on (see OutboxRelayedListener)
     return new OutboxRelayWorker(
-        repository, router, backoff, metrics, properties,
-        relayedListeners.orderedStream().toList());
+        repository,
+        router,
+        backoff,
+        metrics,
+        properties,
+        relayedListeners.orderedStream().toList(),
+        new TransactionTemplate(transactionManager),
+        lane);
   }
 
   @Bean
-  OutboxRelay outboxRelay(OutboxRelayWorker worker, OutboxProperties properties) {
-    return new OutboxRelay(worker, properties);
+  OutboxRelay outboxRelay(
+      OutboxRelayWorker worker, OutboxProperties properties, OutboxConcurrentLane lane) {
+    return new OutboxRelay(worker, properties, lane);
   }
 
   @Bean

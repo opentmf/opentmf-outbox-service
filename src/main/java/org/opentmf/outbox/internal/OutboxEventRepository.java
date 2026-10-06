@@ -1,7 +1,6 @@
 package org.opentmf.outbox.internal;
 
 import jakarta.persistence.LockModeType;
-import jakarta.persistence.QueryHint;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
@@ -13,7 +12,6 @@ import org.springframework.data.domain.Limit;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.querydsl.QuerydslPredicateExecutor;
 import org.springframework.data.repository.query.Param;
 
@@ -27,28 +25,53 @@ public interface OutboxEventRepository
     extends JpaRepository<OutboxEvent, Long>, QuerydslPredicateExecutor<OutboxEvent> {
 
   /**
-   * The claim query: {@code select … for update skip locked} over pending, not cancelled, not
-   * parked, released (no hold, or the hold has passed), due rows in {@code id} order. This is
-   * the ONE place the eligibility predicate lives; the attempt budget is NOT part of it (it is
-   * per publisher, per row - the worker stamps {@code parked_on} at exhaustion instead). The
-   * pessimistic lock plus SKIP LOCKED (Hibernate lock timeout {@code -2}) is the cross-pod
-   * guard; within a pod the relay is single-threaded.
+   * One window of the claim scan (1.3.0): {@code select … for update} over pending, not
+   * cancelled, not parked, released (no hold, or the hold has passed) rows that are EITHER
+   * claimable (due, and no live lease) OR in flight (a live lease) - in {@code id} order, past
+   * {@code after}. This is the ONE place the eligibility predicate lives. The in-flight rows ride
+   * along so the claim sees which CONCURRENT ordering keys are taken; it never claims them.
+   *
+   * <p>The lock WAITS (no SKIP LOCKED): every holder of these row locks - a claim, a booking,
+   * an ops action - is a short transaction now, and waiting is what lets the claim see a row
+   * another relay is stamping at that instant (PostgreSQL re-checks the predicate after the
+   * wait, so a row just leased elsewhere is seen as in flight, never claimed twice), which keeps
+   * an ordering key from going into flight twice across pods.
    */
   @Lock(LockModeType.PESSIMISTIC_WRITE)
-  @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "-2"))
   @Query(
       """
       select e from OutboxEvent e
       where e.relayedOn is null and e.cancelledOn is null and e.parkedOn is null
         and (e.releaseAt is null or e.releaseAt <= :now)
-        and e.nextAttemptOn <= :now
+        and e.id > :after
+        and (e.claimedUntil > :now
+          or (e.nextAttemptOn <= :now and (e.claimedUntil is null or e.claimedUntil <= :now)))
       order by e.id""")
-  List<OutboxEvent> claimBatch(@Param("now") OffsetDateTime now, Limit limit);
+  List<OutboxEvent> claimWindow(
+      @Param("now") OffsetDateTime now, @Param("after") long after, Limit limit);
+
+  /**
+   * The LEASE GUARD: the row under a waiting {@code for update} lock, but only while it still
+   * carries the lease this holder stamped - empty means the lease lapsed and another holder
+   * re-stamped it (or it was booked), and the caller books nothing.
+   */
+  @Lock(LockModeType.PESSIMISTIC_WRITE)
+  @Query("select e from OutboxEvent e where e.id = :id and e.claimedUntil = :stamp")
+  Optional<OutboxEvent> lockLeased(@Param("id") long id, @Param("stamp") OffsetDateTime stamp);
+
+  /** Pending rows under a live lease - backs the {@code in-flight} gauge. */
+  @Query(
+      """
+      select count(e) from OutboxEvent e
+      where e.relayedOn is null and e.cancelledOn is null and e.claimedUntil > :now""")
+  long countInFlight(@Param("now") OffsetDateTime now);
 
   /**
    * One row under a WAITING {@code for update} lock (no SKIP LOCKED, no timeout hint) - the
    * ops actions (cancel, unpark) read through this so they serialize against a relay claim in
    * flight: the action sees the row AS THE RELAY LEFT IT, never a stale pre-claim snapshot.
+   * Since 1.3.0 the relay holds no lock across a send - the action serialises against the short
+   * claim and booking transactions only; a row in flight is cancellable (see the booking).
    */
   @Lock(LockModeType.PESSIMISTIC_WRITE)
   @Query("select e from OutboxEvent e where e.id = :id")
