@@ -844,7 +844,8 @@ Accepted survivors, each reviewed:
 
 | Where | Mutant | Verdict |
 |---|---|---|
-| `OutboxMaintenanceService.prune` | `relayed + cancelled > 0` boundary/negation/subtraction | Log-only guard; row deletion is unaffected |
+| `OutboxMaintenanceService.pruneExpired` / `unpark` (by filter) | the "anything to log" guard and the "more remain" message ternary (negations, boundaries) | Log-only; the counts and `moreTo…` flags are asserted by the unit tests and the ITs |
+| `OutboxMaintenanceService.pruneExpired` / `unpark` (by filter) | `nanoTime() < deadline` boundary | Equivalent: `<` vs `<=` on a nanosecond clock |
 | `OutboxRelayWorker.truncate` | `<=` vs `<` boundary | Equivalent mutant at exactly 4000 chars |
 | `OutboxRelayWorker.relayBatch` | negated `!lane.submit(...)` | Log-only: the refused send's permit and lease are handled inside `submit` |
 | `OutboxRelayWorker.bookRelayed` / `bookFailure` | removed `logLapsed`; negated cancelled check before the WARN | Log-only; the lapse and sent-but-cancelled outcomes are asserted by the worker tests and `OutboxLeaseIT` |
@@ -853,6 +854,7 @@ Accepted survivors, each reviewed:
 | `OutboxRelay.stop` | awaitTermination conditional | Shutdown-timing leg; a kill needs a grace-long hanging-task test for no insight |
 | `OutboxRelay.poke` | removed `passQueued.set(false)` after a rejection | Reachable only after shutdown, when no further pass can run anyway |
 | `OutboxRelay` thread factory | removed `setDaemon` | Asserted by `OutboxRelayTests` in every normal run; PIT's per-line selection misses the factory-lambda mapping |
+| `OutboxMetrics` thread factory | removed `setDaemon` | Asserted by `OutboxMetricsTests` (the refresher thread is a daemon); same factory-lambda mapping miss |
 
 `NO_COVERAGE` entries (the Kafka publisher bean method, ops controller) are
 exercised by the Testcontainers ITs, which the posture deliberately keeps out
