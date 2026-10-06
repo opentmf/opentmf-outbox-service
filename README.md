@@ -359,6 +359,9 @@ per-service metric prefix. Without a `MeterRegistry` bean the relay still works
 daemon thread (`opentmf-outbox-metrics`) refreshes every `metrics-refresh` (default
 15 s, first refresh at start). Each refresh runs four queries, each served by its own
 partial index over the OPEN rows; none reads the relayed history.
+- **A database that does not answer cannot hang the refresher**: each refresh query has a
+  5 s query timeout, so it becomes a failed refresh. `metrics-age` (seconds since the last
+  successful refresh) keeps growing meanwhile; alert on it beside `parked`.
 - **Before the first refresh, and after a failed one**, the gauges read NaN: no value,
   never a misleading zero.
 - `relay-lag` is computed at read time from the oldest open row's instant, so it keeps
@@ -374,6 +377,7 @@ partial index over the OPEN rows; none reads the relayed history.
 | `opentmf.outbox.pending`   | gauge   | Rows not yet relayed nor cancelled (held, parked and in-flight included) |
 | `opentmf.outbox.in-flight` | gauge   | Pending rows under a live lease, across pods — claimed, send not booked yet (1.3.0) |
 | `opentmf.outbox.parked`    | gauge   | Rows with `parked_on` stamped — **alert when > 0** |
+| `opentmf.outbox.metrics-age` | gauge | Seconds since the gauges were last refreshed successfully — **alert when above a few refresh periods** (e.g. > 60 s with the default 15 s): the values above are stale or NaN |
 | `opentmf.outbox.relay-lag` | gauge   | Seconds the oldest *released* pending row has been deliverable (a held row is not lagging) |
 | `opentmf.outbox.relayed`   | counter | Successful relays, tagged by `destination`         |
 | `opentmf.outbox.dropped`   | counter | Rows given up by a publisher's DROP policy, tagged by `destination` (never counted as relayed) |
@@ -623,6 +627,12 @@ surface):
   through `ix_outbox_relayed_on` / `ix_outbox_cancelled_on` and deleted by id in one
   set-based statement per batch, each its own short transaction. No entity is loaded.
   Parked rows are never pruned.
+- **Independent of the caller.** Each batch runs in its OWN transaction
+  (`REQUIRES_NEW`), even when the caller is inside one: a consumer calling `prune()` from
+  its own `@Transactional` service does not hold every batch in one long transaction,
+  and its rollback does not undo them. While a batch runs, the caller's connection
+  stays checked out beside the batch's, so the pool needs one connection to spare. The
+  same holds for the unpark by filter.
 - **Bounded.** A call stops after `maintenance.time-budget` and answers `moreToPrune: true`.
   The CronJob loops while it is true, and a request thread never works through the
   whole backlog.
@@ -754,12 +764,13 @@ The library is self-contained for consumer testing — no test-jar needed:
    onboarded pre-library one alike). Rows pending at the upgrade have no lane
    and ride ORDERED once, including any pending HTTP backlog, which drains on
    the relay thread as it would have under 1.2.x.
-   **What the first start costs on a large table.** `004` builds its four
-   indexes `CONCURRENTLY`, so the appends of pods still running are never
-   blocked. Each build still reads the whole table once. Measured: about 3.3 s
-   in total on 3,100,000 rows / 2.5 GB, roughly 1.1 s per million rows; a busier
-   database takes about twice that. Liquibase runs before the service is ready,
-   so the consumer's **startup probe must allow for it**.
+   **What the first start costs on a large table.** Changesets `004` and `005`
+   build eight indexes `CONCURRENTLY`, so the appends of pods still running are
+   never blocked. Each build still reads the whole table once. Measured: 0.7–1.8 s
+   per build, about 7.2 s for all eight, on 3,100,000 rows / 2.5 GB, i.e. roughly
+   2.3 s per million rows; a busier database takes about twice that. Liquibase
+   runs before the service is ready, so the consumer's **startup probe must allow
+   for it** (say 5 s per million outbox rows, plus its usual start).
 2. **Rolling deploys are safe for sends.** A 1.3.0 claim moves
    `next_attempt_on` to the lease end, so a 1.2.x pod still running sees a
    leased row as not due and never sends it twice. While old and new pods

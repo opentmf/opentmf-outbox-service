@@ -6,13 +6,19 @@ import static org.awaitility.Awaitility.await;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.persistence.EntityManagerFactory;
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.ApplicationContext;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * F-1 (load test 2026-10-06): the prune at scale. Several hundred thousand expired rows beside
@@ -41,6 +47,8 @@ class OutboxPruneAtScaleIT {
   @Autowired private EntityManagerFactory entityManagerFactory;
   @Autowired private OutboxProperties properties;
   @Autowired private MeterRegistry registry;
+  @Autowired private PlatformTransactionManager txManager;
+  @Autowired private ApplicationContext context;
 
   private Statistics statistics() {
     return entityManagerFactory.unwrap(SessionFactory.class).getStatistics();
@@ -131,5 +139,68 @@ class OutboxPruneAtScaleIT {
               assertThat(registry.get("opentmf.outbox.relay-lag").gauge().value())
                   .isBetween(29.9 * 86_400, 30.1 * 86_400);
             });
+  }
+
+  /**
+   * Each batch is its OWN transaction even when the caller is in one (dnms-flow calls the prune
+   * from its own {@code @Transactional} service): the caller's transaction rolls back, the
+   * batches stay committed.
+   */
+  @Test
+  void theBatchesCommitOnTheirOwn_evenInsideACallersTransactionThatRollsBack() {
+    TransactionTemplate outer = new TransactionTemplate(txManager);
+
+    Long pruned =
+        outer.execute(
+            status -> {
+              long rows = maintenance.prune();
+              status.setRollbackOnly(); // the caller's own work fails
+              return rows;
+            });
+
+    assertThat(pruned).isPositive();
+    assertThat(count("relayed_on < now() - interval '7 days'"))
+        .isEqualTo(EXPIRED_RELAYED - Math.min(pruned, EXPIRED_RELAYED)); // gone for good
+  }
+
+  /**
+   * A database that does not answer: a refresh query runs into its 5 s timeout, so the refresh
+   * FAILS (the gauges read NaN) instead of hanging the refresher with the last values standing;
+   * {@code metrics-age} keeps growing.
+   */
+  @Test
+  void aHungDatabase_failsTheRefresh_withinTheQueryTimeout() throws Exception {
+    GaugeRefresh.now(context); // a successful refresh first
+    CountDownLatch locked = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    CompletableFuture<Void> lockHolder =
+        CompletableFuture.runAsync(
+            () ->
+                new TransactionTemplate(txManager)
+                    .executeWithoutResult(
+                        status -> {
+                          jdbc.execute("lock table outbox in access exclusive mode");
+                          locked.countDown();
+                          try {
+                            assertThat(release.await(30, TimeUnit.SECONDS)).isTrue();
+                          } catch (InterruptedException ex) {
+                            Thread.currentThread().interrupt();
+                          }
+                        }));
+    try {
+      assertThat(locked.await(10, TimeUnit.SECONDS)).isTrue();
+      long started = System.nanoTime();
+
+      GaugeRefresh.now(context); // blocks on the lock - until the query timeout fires
+
+      long millis = (System.nanoTime() - started) / 1_000_000;
+      assertThat(millis).isBetween(4_000L, 9_000L);
+      assertThat(registry.get("opentmf.outbox.pending").gauge().value()).isNaN();
+      assertThat(registry.get("opentmf.outbox.metrics-age").gauge().value())
+          .isGreaterThanOrEqualTo(4d);
+    } finally {
+      release.countDown();
+      lockHolder.get(30, TimeUnit.SECONDS);
+    }
   }
 }

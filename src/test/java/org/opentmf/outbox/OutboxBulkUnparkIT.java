@@ -233,4 +233,21 @@ class OutboxBulkUnparkIT {
     assertThat(count("id = " + id + " and cancelled_on is not null and parked_on is not null"))
         .isEqualTo(1);
   }
+
+  /** Each batch is its own transaction even when the caller is in one that then rolls back. */
+  @Test
+  void theBatchesCommitOnTheirOwn_evenInsideACallersTransactionThatRollsBack() {
+    park("ord:topic-f", "ORDERED", 30, "now() - interval '10 minutes'");
+
+    OutboxUnparkResult result =
+        tx.execute(
+            status -> {
+              OutboxUnparkResult inside = maintenance.unpark("ord:topic-f", null, null, null);
+              status.setRollbackOnly(); // the caller's own work fails
+              return inside;
+            });
+
+    assertThat(result.unparked()).isEqualTo(30);
+    assertThat(count("destination = 'ord:topic-f' and parked_on is not null")).isZero();
+  }
 }

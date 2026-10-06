@@ -18,6 +18,10 @@ the batch's row locks were held across every backend call.
   - The gauges now read a snapshot that a daemon thread refreshes every
     `opentmf.outbox.metrics-refresh` (default 15 s), so a scrape never touches the
     database. Before the first refresh, and after a failed one, they read NaN.
+  - Each refresh query has a 5 s query timeout, so a database that does not answer
+    becomes a failed refresh, not a hung refresher with stale values standing. A new
+    gauge `opentmf.outbox.metrics-age` gives the seconds since the last successful
+    refresh; alert on it beside `parked`.
   - Each refresh query is served by a partial index over the OPEN rows only
     (`ix_outbox_pending`, `ix_outbox_parked`, `ix_outbox_open_since`,
     `ix_outbox_claimed_until`). Pinned in `OutboxClaimPlanIT` over 1,000,000 relayed
@@ -28,7 +32,9 @@ the batch's row locks were held across every backend call.
   nightly job ran dnms-681 and dnms-flow out of CPU and memory, failed liveness twice
   each, and pruned nothing (load test 2026-10-06, F-1).
   - The prune now deletes set-based in batches (`opentmf.outbox.maintenance.batch-size`,
-    default 5,000), oldest first. Each batch is its own short transaction, driven by
+    default 5,000), oldest first. Each batch is its own short transaction
+    (`REQUIRES_NEW`, so a caller already in a transaction neither holds the batches in
+    it nor undoes them with its rollback), driven by
     `ix_outbox_relayed_on` / `ix_outbox_cancelled_on`, with no entity loaded.
   - A call is bounded by `opentmf.outbox.maintenance.time-budget` (default 10 s). The
     endpoint answers `{"outboxRowsPruned": n, "moreToPrune": bool}`: the 1.0.0 key is
@@ -137,8 +143,9 @@ the batch's row locks were held across every backend call.
   1.2.1 changelog). Its four indexes are built `CONCURRENTLY` (the changeset
   runs outside a transaction), each preceded by `drop index concurrently if
   exists`, so a deploy does not block the appends of the pods still running and
-  a failed build's INVALID index is rebuilt, not skipped. About 1.1 s per
-  million rows for the four; the startup probe must allow for it.
+  a failed build's INVALID index is rebuilt, not skipped. With 005's four, the
+  eight builds take about 2.3 s per million rows (7.2 s on 3.1 M rows / 2.5 GB);
+  the consumer's startup probe must allow for the first start.
 
 ### Dependencies
 

@@ -24,6 +24,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.SpringBootTest.WebEnvironment;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -57,8 +58,9 @@ import org.testcontainers.kafka.KafkaContainer;
       "spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer",
       "spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer",
       "opentmf.outbox.sweep-interval=1h",
-      // the gauges follow quickly here: these tests read in-flight as their quiet signal
-      "opentmf.outbox.metrics-refresh=200ms"
+      // no scheduled refresh after the one at start: the tests refresh where they read a gauge,
+      // so the refresher never takes a connection while the pool is sampled for zero
+      "opentmf.outbox.metrics-refresh=1h"
     })
 class OutboxHttpLaneIT {
 
@@ -176,6 +178,7 @@ class OutboxHttpLaneIT {
   @Autowired private TransactionTemplate tx;
   @Autowired private DataSource dataSource;
   @Autowired private MeterRegistry registry;
+  @Autowired private ApplicationContext context;
   @LocalServerPort private int port;
 
   private String url(String path) {
@@ -190,7 +193,9 @@ class OutboxHttpLaneIT {
     return dataSource.unwrap(HikariDataSource.class).getHikariPoolMXBean().getActiveConnections();
   }
 
+  /** Refreshes the snapshot NOW, then reads the gauge. */
   private double inFlightGauge() {
+    GaugeRefresh.now(context);
     return registry.get("opentmf.outbox.in-flight").gauge().value();
   }
 
@@ -223,8 +228,7 @@ class OutboxHttpLaneIT {
     assertThat(inFlight.relayedOn()).isNull(); // still answering...
     assertThat(inFlight.inFlight()).isTrue(); // ...and visibly so
     assertThat(inFlight.claimedUntil()).isNotNull();
-    // the gauge is a refreshed snapshot (200 ms here): it settles on the one row still in flight
-    await().atMost(Duration.ofSeconds(2)).until(() -> inFlightGauge() == 1d);
+    assertThat(inFlightGauge()).isEqualTo(1d);
     assertThat(registry.get("opentmf.outbox.pending").gauge().value()).isGreaterThanOrEqualTo(1d);
 
     // the pool, read through JMX (no connection taken to read it), polled over 3 s of the send

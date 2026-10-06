@@ -27,6 +27,8 @@ import lombok.extern.slf4j.Slf4j;
  *   <li>{@code opentmf.outbox.parked} - gauge, alert when above 0
  *   <li>{@code opentmf.outbox.relay-lag} - gauge, how long the oldest RELEASED pending row has
  *       been deliverable (seconds) - a held row is not lagging until its hold passes
+ *   <li>{@code opentmf.outbox.metrics-age} - gauge, seconds since the last SUCCESSFUL refresh of
+ *       the gauges above (NaN before the first) - alert when it exceeds a few refresh periods
  *   <li>{@code opentmf.outbox.relayed} - counter by {@code destination} (closed tag set)
  *   <li>{@code opentmf.outbox.dropped} - counter by {@code destination}: rows given up by a
  *       publisher's DROP policy (never delivered, forensics kept)
@@ -48,6 +50,7 @@ class OutboxMetrics {
   static final String PARKED = "opentmf.outbox.parked";
   static final String IN_FLIGHT = "opentmf.outbox.in-flight";
   static final String RELAY_LAG = "opentmf.outbox.relay-lag";
+  static final String METRICS_AGE = "opentmf.outbox.metrics-age";
   static final String RELAYED = "opentmf.outbox.relayed";
   static final String DROPPED = "opentmf.outbox.dropped";
   static final String ATTEMPTS = "opentmf.outbox.attempts";
@@ -67,6 +70,7 @@ class OutboxMetrics {
   private final OutboxEventRepository repository;
   private final Duration refreshEvery;
   private final AtomicReference<Snapshot> snapshot = new AtomicReference<>(Snapshot.NONE);
+  private final AtomicReference<Instant> lastRefreshed = new AtomicReference<>();
   private ScheduledExecutorService refresher;
 
   OutboxMetrics(MeterRegistry registry, OutboxEventRepository repository, Duration refreshEvery) {
@@ -85,6 +89,10 @@ class OutboxMetrics {
     Gauge.builder(RELAY_LAG, this, OutboxMetrics::relayLagSeconds)
         .baseUnit("seconds")
         .description("How long the oldest released pending outbox row has been deliverable")
+        .register(registry);
+    Gauge.builder(METRICS_AGE, this, OutboxMetrics::metricsAgeSeconds)
+        .baseUnit("seconds")
+        .description("Seconds since the outbox gauges were last refreshed successfully")
         .register(registry);
   }
 
@@ -111,8 +119,10 @@ class OutboxMetrics {
   }
 
   /**
-   * Re-reads the gauge values - four indexed queries over the OPEN rows only. A failure leaves
-   * NaN (no value) until the next refresh succeeds, and never reaches a scrape.
+   * Re-reads the gauge values - four indexed queries over the OPEN rows only, each with a 5 s
+   * query timeout, so a database that does not answer becomes a FAILED refresh rather than a
+   * stuck one. A failure leaves NaN (no value) until the next refresh succeeds, never reaches a
+   * scrape, and lets {@code metrics-age} keep growing.
    */
   void refresh() {
     try {
@@ -121,6 +131,7 @@ class OutboxMetrics {
       long inFlight = repository.countInFlight(OffsetDateTime.now(ZoneOffset.UTC));
       Instant openSince = repository.findOldestOpenSince().orElse(null);
       snapshot.set(new Snapshot(true, pending, parked, inFlight, openSince));
+      lastRefreshed.set(Instant.now());
     } catch (RuntimeException ex) {
       snapshot.set(Snapshot.NONE);
       log.warn("Outbox gauges not refreshed - they read NaN until the next refresh", ex);
@@ -136,6 +147,12 @@ class OutboxMetrics {
   public void recordRelayed(String destination, int attempts) {
     registry.counter(RELAYED, TAG_DESTINATION, destination).increment();
     registry.summary(ATTEMPTS).record(attempts);
+  }
+
+  /** Seconds since the last successful refresh; NaN before the first. */
+  double metricsAgeSeconds() {
+    Instant last = lastRefreshed.get();
+    return last == null ? Double.NaN : Duration.between(last, Instant.now()).toMillis() / 1000d;
   }
 
   /**

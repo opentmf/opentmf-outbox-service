@@ -12,6 +12,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -36,6 +38,20 @@ class OutboxMetricsTests {
     assertThat(gauge(OutboxMetrics.PARKED)).isNaN();
     assertThat(gauge(OutboxMetrics.IN_FLIGHT)).isNaN();
     assertThat(gauge(OutboxMetrics.RELAY_LAG)).isNaN();
+    assertThat(gauge(OutboxMetrics.METRICS_AGE)).isNaN(); // never refreshed
+  }
+
+  @Test
+  void theSnapshotsAge_restartsOnEverySuccess_andKeepsGrowingThroughFailures() throws Exception {
+    metrics.refresh();
+    assertThat(gauge(OutboxMetrics.METRICS_AGE)).isBetween(0d, 1d);
+
+    when(repository.countParked()).thenThrow(new IllegalStateException("database gone"));
+    assertThat(new CountDownLatch(1).await(1100, TimeUnit.MILLISECONDS)).isFalse(); // time passes
+    metrics.refresh(); // fails: the values go NaN, the age does NOT restart
+
+    assertThat(gauge(OutboxMetrics.PARKED)).isNaN();
+    assertThat(gauge(OutboxMetrics.METRICS_AGE)).isGreaterThanOrEqualTo(1d);
   }
 
   @Test

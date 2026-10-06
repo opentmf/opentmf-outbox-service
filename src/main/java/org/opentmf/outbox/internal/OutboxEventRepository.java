@@ -19,6 +19,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.querydsl.QuerydslPredicateExecutor;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
@@ -29,6 +30,13 @@ import org.springframework.transaction.annotation.Transactional;
  */
 public interface OutboxEventRepository
     extends JpaRepository<OutboxEvent, Long>, QuerydslPredicateExecutor<OutboxEvent> {
+
+  /** The query timeout hint (not a planner hint): a gauge query cannot hang the refresher. */
+  String GAUGE_TIMEOUT_HINT = "jakarta.persistence.query.timeout";
+
+  /** A gauge query that does not answer within 5 s fails the refresh (the gauges read NaN). */
+  String GAUGE_TIMEOUT_MILLIS = "5000";
+
 
   /**
    * The ORDERED lane's claim: {@code select … for update skip locked} over pending, not
@@ -99,10 +107,12 @@ public interface OutboxEventRepository
   Optional<OutboxEvent> lockById(@Param("id") long id);
 
   /** Open rows that are not parked (pending minus parked) - half of the {@code pending} gauge. */
+  @QueryHints(@QueryHint(name = GAUGE_TIMEOUT_HINT, value = GAUGE_TIMEOUT_MILLIS))
   @Query(value = OutboxGaugeSql.OPEN_NOT_PARKED, nativeQuery = true)
   long countOpenNotParked();
 
   /** Parked rows - the {@code parked} gauge, and the other half of {@code pending}. */
+  @QueryHints(@QueryHint(name = GAUGE_TIMEOUT_HINT, value = GAUGE_TIMEOUT_MILLIS))
   @Query(value = OutboxGaugeSql.PARKED, nativeQuery = true)
   long countParked();
 
@@ -110,27 +120,30 @@ public interface OutboxEventRepository
    * The instant the oldest open row became deliverable - {@code created_on}, or its hold if that
    * came later; a held row's instant lies in the future - backs the {@code relay-lag} gauge.
    */
+  @QueryHints(@QueryHint(name = GAUGE_TIMEOUT_HINT, value = GAUGE_TIMEOUT_MILLIS))
   @Query(value = OutboxGaugeSql.OPEN_SINCE, nativeQuery = true)
   Optional<Instant> findOldestOpenSince(); // a native timestamptz scalar comes back as Instant
 
   /** Open rows under a live lease - the {@code in-flight} gauge. */
+  @QueryHints(@QueryHint(name = GAUGE_TIMEOUT_HINT, value = GAUGE_TIMEOUT_MILLIS))
   @Query(value = OutboxGaugeSql.IN_FLIGHT, nativeQuery = true)
   long countInFlight(@Param("now") OffsetDateTime now);
 
   /**
-   * Retention prune, one BATCH of relayed rows older than the cutoff, in its own transaction.
+   * Retention prune, one BATCH of relayed rows older than the cutoff, in its OWN transaction -
+   * {@code REQUIRES_NEW}: a caller already in a transaction does not hold every batch in it.
    * Parked rows have {@code relayed_on is null}, so they structurally never match.
    *
    * @return the rows deleted - fewer than {@code limit} means none are left
    */
   @Modifying
-  @Transactional
+  @Transactional(propagation = Propagation.REQUIRES_NEW)
   @Query(value = OutboxPruneSql.RELAYED, nativeQuery = true)
   int deleteRelayedBatch(@Param("cutoff") OffsetDateTime cutoff, @Param("limit") int limit);
 
   /** Retention prune of the other terminal state: one batch of cancelled rows. */
   @Modifying
-  @Transactional
+  @Transactional(propagation = Propagation.REQUIRES_NEW)
   @Query(value = OutboxPruneSql.CANCELLED, nativeQuery = true)
   int deleteCancelledBatch(@Param("cutoff") OffsetDateTime cutoff, @Param("limit") int limit);
 
@@ -141,7 +154,7 @@ public interface OutboxEventRepository
    * @return the rows unparked - fewer than {@code limit} means none are left
    */
   @Modifying
-  @Transactional
+  @Transactional(propagation = Propagation.REQUIRES_NEW)
   @Query(value = OutboxUnparkSql.BY_DESTINATION, nativeQuery = true)
   int unparkBatch(
       @Param("now") OffsetDateTime now,
@@ -152,7 +165,7 @@ public interface OutboxEventRepository
 
   /** The same, narrowed to one {@code reference}. */
   @Modifying
-  @Transactional
+  @Transactional(propagation = Propagation.REQUIRES_NEW)
   @Query(value = OutboxUnparkSql.BY_REFERENCE, nativeQuery = true)
   int unparkBatchByReference(
       @Param("now") OffsetDateTime now,
