@@ -734,10 +734,14 @@ Accepted survivors, each reviewed:
 
 | Where | Mutant | Verdict |
 |---|---|---|
-| `OutboxMaintenanceService.prune` | `relayed + cancelled > 0` boundary/negation | Log-only guard; row deletion is unaffected |
-| `OutboxRelayWorker.exhaust` | log-level legs | Log-only; the PARK/DROP outcome itself is asserted by the worker tests |
+| `OutboxMaintenanceService.prune` | `relayed + cancelled > 0` boundary/negation/subtraction | Log-only guard; row deletion is unaffected |
 | `OutboxRelayWorker.truncate` | `<=` vs `<` boundary | Equivalent mutant at exactly 4000 chars |
+| `OutboxRelayWorker.relayBatch` | negated `!lane.submit(...)` | Log-only: the refused send's permit and lease are handled inside `submit` |
+| `OutboxRelayWorker.bookRelayed` / `bookFailure` | removed `logLapsed`; negated cancelled check before the WARN | Log-only; the lapse and sent-but-cancelled outcomes are asserted by the worker tests and `OutboxLeaseIT` |
+| `OutboxLaneStamper.stamp` | removed `setOrderingKey(null)` in the failure path | Equivalent: the key is never set before the throw it recovers from |
+| `OutboxConcurrentLane` | removed `setVirtualThreads`; `isVirtual` → false | Equivalent on the JDK 17 unit-test run; `OutboxHttpLaneVirtualIT` (JDK 21+) asserts the virtual threads, and PIT runs unit tests only |
 | `OutboxRelay.stop` | awaitTermination conditional | Shutdown-timing leg; a kill needs a grace-long hanging-task test for no insight |
+| `OutboxRelay.poke` | removed `passQueued.set(false)` after a rejection | Reachable only after shutdown, when no further pass can run anyway |
 | `OutboxRelay` thread factory | removed `setDaemon` | Asserted by `OutboxRelayTests` in every normal run; PIT's per-line selection misses the factory-lambda mapping |
 
 `NO_COVERAGE` entries (the Kafka publisher bean method, ops controller) are

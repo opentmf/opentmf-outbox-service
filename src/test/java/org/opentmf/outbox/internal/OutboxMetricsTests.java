@@ -68,4 +68,11 @@ class OutboxMetricsTests {
         .isEqualTo(2d);
     assertThat(registry.get(OutboxMetrics.ATTEMPTS).summary().totalAmount()).isEqualTo(4d);
   }
+
+  @Test
+  void theInFlightGauge_countsLiveLeasesAsOfNow() {
+    when(repository.countInFlight(any(OffsetDateTime.class))).thenReturn(3L);
+
+    assertThat(registry.get(OutboxMetrics.IN_FLIGHT).gauge().value()).isEqualTo(3d);
+  }
 }

@@ -189,9 +189,9 @@ class OutboxMaintenanceServiceTests {
     verify(repository).deleteByRelayedOnBefore(cutoff.capture());
     verify(repository).deleteByCancelledOnBefore(cutoff.getValue());
 
-    when(repository.deleteByRelayedOnBefore(any(OffsetDateTime.class))).thenReturn(0L);
+    when(repository.deleteByRelayedOnBefore(any(OffsetDateTime.class))).thenReturn(2L);
     when(repository.deleteByCancelledOnBefore(any(OffsetDateTime.class))).thenReturn(0L);
-    assertThat(service.pruneRelayed()).isZero(); // the 1.0.0 name, same pass
+    assertThat(service.pruneRelayed()).isEqualTo(2L); // the 1.0.0 name, same pass
   }
 
   @Test

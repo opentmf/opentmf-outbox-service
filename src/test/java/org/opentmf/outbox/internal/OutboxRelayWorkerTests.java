@@ -11,6 +11,7 @@ import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -274,6 +275,7 @@ class OutboxRelayWorkerTests {
     assertThat(plain.lane(event)).isEqualTo(Lane.ORDERED);
     assertThat(plain.orderingKey(event)).isNull();
     assertThat(plain.lease(event)).isNull();
+    assertThat(plain.onExhausted(event)).isEqualTo(ExhaustionOutcome.PARK);
   }
 
   @Test
@@ -525,12 +527,15 @@ class OutboxRelayWorkerTests {
     assertThat(event.getRelayedOn()).isNull();
     assertThat(event.getClaimedUntil()).isEqualTo(otherHolder);
     assertThat(bookings).isEmpty();
+    assertThat(rolledBack).isZero(); // the lapse is booked as nothing - not as a refusal
+    verify(repository, times(1)).lockLeased(anyLong(), any());
     assertThat(counter(OutboxMetrics.RELAYED)).isZero();
   }
 
   @Test
-  void aLapsedLeaseOnFailure_booksNothingEither() {
+  void aLapsedLeaseOnFailure_booksNothingEither_andTheBatchGoesOn() {
     OutboxEvent event = pending(1L, 0);
+    OutboxEvent next = pending(2L, 0);
     doAnswer(
             inv -> {
               event.setClaimedUntil(OffsetDateTime.now().plusHours(1));
@@ -542,6 +547,8 @@ class OutboxRelayWorkerTests {
     relay();
 
     assertThat(event.getAttempts()).isZero();
+    assertThat(next.getRelayedOn()).isNotNull(); // the lapse did not stop the ORDERED batch
+    assertThat(rolledBack).isZero();
   }
 
   @Test
@@ -615,6 +622,7 @@ class OutboxRelayWorkerTests {
     assertThat(event.getRelayedOn()).isNull();
     assertThat(event.getClaimedUntil()).isNull();
     assertThat(event.getLastError()).contains("receiver 503");
+    assertThat(event.getNextAttemptOn()).isBeforeOrEqualTo(OffsetDateTime.now()); // no lease end
     assertThat(bookings).extracting(OutboxBooking::outcome).containsExactly(Outcome.CANCELLED);
   }
 
@@ -639,6 +647,81 @@ class OutboxRelayWorkerTests {
     assertThat(first.getRelayedOn()).isNotNull();
     assertThat(second.getRelayedOn()).isNotNull();
     assertThat(leaseAtSend.get(2L)).isAfter(leaseAtSend.get(1L)); // renewed, not the claim's
+  }
+
+  @Test
+  void theRenewal_reachesExactlyOneRowAhead_andMovesItsNextAttemptToo() {
+    pending(1L, 0);
+    pending(2L, 0);
+    pending(3L, 0);
+    List<Boolean> nextAttemptIsLeaseEnd = new ArrayList<>();
+    doAnswer(
+            inv -> {
+              OutboxEvent sent = table.get(inv.<OutboxEvent>getArgument(0).getId());
+              nextAttemptIsLeaseEnd.add(sent.getNextAttemptOn().equals(sent.getClaimedUntil()));
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    relay();
+
+    // own guard x3 + one renewal for row 2 and one for row 3 - never two rows ahead
+    verify(repository, times(5)).lockLeased(anyLong(), any());
+    assertThat(nextAttemptIsLeaseEnd).containsExactly(true, true, true);
+  }
+
+  @Test
+  void aRowLostToAnotherHolder_passesTheRenewalOnToTheRowAfterIt() {
+    OutboxEvent first = pending(1L, 0);
+    OutboxEvent taken = pending(2L, 0);
+    pending(3L, 0);
+    Map<Long, OffsetDateTime> leaseAtSend = new LinkedHashMap<>();
+    Map<Long, OffsetDateTime> claimStamp = new LinkedHashMap<>();
+    doAnswer(
+            inv -> {
+              OutboxEvent row = table.get(inv.<OutboxEvent>getArgument(0).getId());
+              if (row.getId() == 1L) {
+                claimStamp.put(3L, table.get(3L).getClaimedUntil());
+                taken.setClaimedUntil(OffsetDateTime.now().plusHours(1)); // re-stamped elsewhere
+              }
+              leaseAtSend.put(row.getId(), row.getClaimedUntil());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    relay();
+
+    assertThat(first.getRelayedOn()).isNotNull();
+    assertThat(leaseAtSend).containsOnlyKeys(1L, 3L);
+    assertThat(leaseAtSend.get(3L)).isAfter(claimStamp.get(3L)); // renewed, not the claim's
+  }
+
+  @Test
+  void aRowCancelledBeforeItsTurn_passesTheRenewalOnToTheRowAfterIt() {
+    pending(1L, 0);
+    OutboxEvent cancelled = pending(2L, 0);
+    pending(3L, 0);
+    Map<Long, OffsetDateTime> claimStamp = new LinkedHashMap<>();
+    Map<Long, OffsetDateTime> leaseAtSend = new LinkedHashMap<>();
+    doAnswer(
+            inv -> {
+              OutboxEvent row = table.get(inv.<OutboxEvent>getArgument(0).getId());
+              if (row.getId() == 1L) {
+                claimStamp.put(3L, table.get(3L).getClaimedUntil());
+                cancelled.setCancelledOn(OffsetDateTime.now());
+              }
+              leaseAtSend.put(row.getId(), row.getClaimedUntil());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    relay();
+
+    assertThat(leaseAtSend).containsOnlyKeys(1L, 3L);
+    assertThat(leaseAtSend.get(3L)).isAfter(claimStamp.get(3L));
   }
 
   @Test

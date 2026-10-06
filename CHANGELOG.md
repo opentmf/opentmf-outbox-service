@@ -90,6 +90,15 @@ the batch's row locks were held across every backend call.
   001–003 are untouched (their checksums hold, pinned against the released
   1.2.1 changelog).
 
+### Dependencies
+
+- tmf630-toolkit 3.3.0 → 3.4.0; archunit 1.5.0 → 1.5.1. Parent
+  `spring-boot-starter-parent` 4.1.1 is the latest release.
+- **Named hold:** pitest-maven stays at 1.19.6 (1.30.0 available). Free
+  incremental history (`withHistory`) moved behind the commercial arcmutate
+  plugin from 1.20, and the bare flag fails the run there. Decided by Gökhan;
+  the standing hold of this repo.
+
 ### Internal
 
 - Each lane claims over its own query and partial index with

@@ -128,6 +128,7 @@ class KafkaLessStartupTests {
             context -> {
               assertThat(context).hasNotFailed();
               assertBeanIs(context, "outboxWriter", OutboxWriter.class);
+              assertBeanIs(context, "outboxLaneStamper", OutboxLaneStamper.class);
               assertBeanIs(context, "outboxOpsController", OutboxOpsController.class);
               assertBeanIs(context, "httpOutboxPublisher", HttpOutboxPublisher.class);
               assertThat(context).doesNotHaveBean("kafkaOutboxPublisher");

@@ -25,14 +25,16 @@ class OutboxRelayTests {
 
   @Test
   void pokeBeforeStart_isIgnored() {
+    OutboxConcurrentLane stoppedLane = lane();
     OutboxRelay relay =
-        new OutboxRelay(mock(OutboxRelayWorker.class), new OutboxProperties(), lane());
+        new OutboxRelay(mock(OutboxRelayWorker.class), new OutboxProperties(), stoppedLane);
     assertThatCode(
             () -> {
               relay.poke(); // no executor yet
               relay.stop(); // stop before start
             })
         .doesNotThrowAnyException();
+    assertThat(stoppedLane.submit(() -> {})).isFalse(); // the lane is closed all the same
   }
 
   @Test

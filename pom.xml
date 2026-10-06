@@ -73,7 +73,7 @@
     <!-- An opentmf library never imports the opentmf-versions BOM (the BOM
          aggregates the libraries — a library importing it would be a cycle in
          spirit and a lockstep coupling in practice). Direct property pin. -->
-    <tmf630-toolkit.version>3.3.0</tmf630-toolkit.version>
+    <tmf630-toolkit.version>3.4.0</tmf630-toolkit.version>
 
     <!-- Non-BOM-managed pins live here so versions:display-property-updates sees them. -->
     <archunit.version>1.5.1</archunit.version>
