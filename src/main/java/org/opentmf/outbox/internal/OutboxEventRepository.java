@@ -1,17 +1,20 @@
 package org.opentmf.outbox.internal;
 
 import jakarta.persistence.LockModeType;
+import jakarta.persistence.QueryHint;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
 import org.opentmf.outbox.OutboxArchRules;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxMaintenanceService;
+import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.opentmf.outbox.OutboxWriter;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.querydsl.QuerydslPredicateExecutor;
 import org.springframework.data.repository.query.Param;
 
@@ -25,30 +28,63 @@ public interface OutboxEventRepository
     extends JpaRepository<OutboxEvent, Long>, QuerydslPredicateExecutor<OutboxEvent> {
 
   /**
-   * One window of the claim scan (1.3.0): {@code select … for update} over pending, not
-   * cancelled, not parked, released (no hold, or the hold has passed) rows that are EITHER
-   * claimable (due, and no live lease) OR in flight (a live lease) - in {@code id} order, past
-   * {@code after}. This is the ONE place the eligibility predicate lives. The in-flight rows ride
-   * along so the claim sees which CONCURRENT ordering keys are taken; it never claims them.
-   *
-   * <p>The lock WAITS (no SKIP LOCKED): every holder of these row locks - a claim, a booking,
-   * an ops action - is a short transaction now, and waiting is what lets the claim see a row
-   * another relay is stamping at that instant (PostgreSQL re-checks the predicate after the
-   * wait, so a row just leased elsewhere is seen as in flight, never claimed twice), which keeps
-   * an ordering key from going into flight twice across pods.
+   * The ORDERED lane's claim: {@code select … for update skip locked} over pending, not
+   * cancelled, not parked, released (no hold, or the hold has passed), due rows with no live
+   * lease whose stamped lane is ORDERED or null (a row written before 1.3.0, or not through the
+   * writer), in {@code id} order. Together with {@link #claimConcurrent} this is the ONE place
+   * the eligibility predicate lives. {@code SKIP LOCKED} (Hibernate lock timeout {@code -2}) is
+   * the cross-pod guard: a row another pod is claiming is skipped, and once that claim commits
+   * the row carries a live lease.
    */
   @Lock(LockModeType.PESSIMISTIC_WRITE)
+  @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "-2"))
   @Query(
       """
       select e from OutboxEvent e
       where e.relayedOn is null and e.cancelledOn is null and e.parkedOn is null
         and (e.releaseAt is null or e.releaseAt <= :now)
-        and e.id > :after
-        and (e.claimedUntil > :now
-          or (e.nextAttemptOn <= :now and (e.claimedUntil is null or e.claimedUntil <= :now)))
+        and e.nextAttemptOn <= :now
+        and (e.claimedUntil is null or e.claimedUntil <= :now)
+        and (e.lane is null or e.lane <> :concurrent)
       order by e.id""")
-  List<OutboxEvent> claimWindow(
-      @Param("now") OffsetDateTime now, @Param("after") long after, Limit limit);
+  List<OutboxEvent> claimOrdered(
+      @Param("now") OffsetDateTime now, @Param("concurrent") Lane concurrent, Limit limit);
+
+  /**
+   * The CONCURRENT lane's claim: the same eligibility over rows stamped CONCURRENT, plus the
+   * ORDERING-KEY rule - a keyed row is claimable only when no row of its key with a LOWER id is
+   * due (claimable now) and no row of its key at all is in flight. So a key never has two rows
+   * in flight within a pod, and its rows go in {@code id} order on the happy path; a row in
+   * backoff (not due, lease cleared) lets later rows of its key pass, as before. Across pods
+   * the one exception: a backed-off row that comes due during another pod's claim of a later row
+   * of its key - order for that key was already given up when the row failed.
+   */
+  @Lock(LockModeType.PESSIMISTIC_WRITE)
+  @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "-2"))
+  @Query(
+      """
+      select e from OutboxEvent e
+      where e.relayedOn is null and e.cancelledOn is null and e.parkedOn is null
+        and (e.releaseAt is null or e.releaseAt <= :now)
+        and e.nextAttemptOn <= :now
+        and (e.claimedUntil is null or e.claimedUntil <= :now)
+        and e.lane = :concurrent
+        and (e.orderingKey is null or (
+          not exists (
+            select 1 from OutboxEvent o
+            where o.lane = :concurrent and o.orderingKey = e.orderingKey and o.id < e.id
+              and o.relayedOn is null and o.cancelledOn is null and o.parkedOn is null
+              and (o.releaseAt is null or o.releaseAt <= :now)
+              and o.nextAttemptOn <= :now
+              and (o.claimedUntil is null or o.claimedUntil <= :now))
+          and not exists (
+            select 1 from OutboxEvent o
+            where o.lane = :concurrent and o.orderingKey = e.orderingKey
+              and o.relayedOn is null and o.cancelledOn is null
+              and o.claimedUntil > :now)))
+      order by e.id""")
+  List<OutboxEvent> claimConcurrent(
+      @Param("now") OffsetDateTime now, @Param("concurrent") Lane concurrent, Limit limit);
 
   /**
    * The LEASE GUARD: the row under a waiting {@code for update} lock, but only while it still
@@ -71,7 +107,8 @@ public interface OutboxEventRepository
    * ops actions (cancel, unpark) read through this so they serialize against a relay claim in
    * flight: the action sees the row AS THE RELAY LEFT IT, never a stale pre-claim snapshot.
    * Since 1.3.0 the relay holds no lock across a send - the action serialises against the short
-   * claim and booking transactions only; a row in flight is cancellable (see the booking).
+   * claim and booking transactions only; a row in flight is cancellable (see the booking). The
+   * claims skip a row an ops action holds.
    */
   @Lock(LockModeType.PESSIMISTIC_WRITE)
   @Query("select e from OutboxEvent e where e.id = :id")

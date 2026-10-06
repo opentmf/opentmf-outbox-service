@@ -46,7 +46,9 @@ class OutboxOnboardingIT {
           "parked_on",
           "reference",
           "relayed_on",
-          "claimed_until");
+          "claimed_until",
+          "lane",
+          "ordering_key");
 
   private static String urlFor(String database) {
     return postgres.getJdbcUrl().replaceAll("/[^/?]+(\\?|$)", "/" + database + "$1");
@@ -228,6 +230,8 @@ class OutboxOnboardingIT {
     assertThat(columnNullability(url)).containsKeys(LIBRARY_COLUMNS.toArray(String[]::new));
     assertThat(pendingIndexPredicate(url)).contains("parked_on IS NULL");
     assertThat(indexDefinition(url, "ix_outbox_claimed_until")).isNotNull(); // 1.2.0-F + 004
+    assertThat(indexDefinition(url, "ix_outbox_ordered_claim")).isNotNull();
+    assertThat(indexDefinition(url, "ix_outbox_concurrent_claim")).isNotNull();
   }
 
   @Test
@@ -314,11 +318,18 @@ class OutboxOnboardingIT {
     List<String> after = rawRows(url);
     assertThat(after).hasSize(4).startsWith(recordedBy121.toArray(String[]::new));
     assertThat(after.get(3)).startsWith("004-outbox-claim-lease|").endsWith("|EXECUTED");
-    assertThat(columnNullability(url)).containsEntry("claimed_until", true);
+    assertThat(columnNullability(url))
+        .containsEntry("claimed_until", true)
+        .containsEntry("lane", true)
+        .containsEntry("ordering_key", true);
     assertThat(indexDefinition(url, "ix_outbox_claimed_until"))
         .contains("claimed_until IS NOT NULL")
         .contains("relayed_on IS NULL")
         .contains("cancelled_on IS NULL");
+    assertThat(indexDefinition(url, "ix_outbox_ordered_claim")).contains("lane IS NULL");
+    assertThat(indexDefinition(url, "ix_outbox_concurrent_claim"))
+        .contains("(ordering_key, id)")
+        .contains("'CONCURRENT'");
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
     assertThat(changelogRows(url)).hasSize(4);
   }

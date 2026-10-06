@@ -5,10 +5,8 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
-import java.util.Set;
 import java.util.function.Supplier;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -25,21 +23,26 @@ import org.springframework.data.domain.Limit;
 import org.springframework.transaction.support.TransactionOperations;
 
 /**
- * One relay pass, CLAIMED BY LEASE (1.3.0): a short claim transaction scans the due rows in
- * {@code id} order, resolves each row's publisher and lane, stamps {@code claimed_until} on the
- * rows it takes and COMMITS. The sends then run in NO transaction - CONCURRENT rows on the
- * lane's threads, ORDERED rows one after another on the calling relay thread - and each outcome
- * is written by its own short booking transaction, guarded on the lease value this holder
- * stamped: a holder whose lease lapsed (and whose row another holder may own now) books
- * nothing. At-least-once holds - a crash between delivery and booking redelivers once the lease
- * lapses, and the {@code x-idempotency-key} makes the consumer's dedup trivial. No database
- * connection is held while a send is in flight.
+ * One relay pass, CLAIMED BY LEASE (1.3.0): a short claim transaction takes the due rows of
+ * each lane over that lane's own query ({@code FOR UPDATE SKIP LOCKED}), resolves each row's
+ * publisher, stamps {@code claimed_until} on the rows it takes and COMMITS. The sends then run
+ * in NO transaction - CONCURRENT rows on the lane's threads, ORDERED rows one after another on
+ * the calling relay thread - and each outcome is written by its own short booking transaction,
+ * guarded on the lease value this holder stamped: a holder whose lease lapsed (and whose row
+ * another holder may own now) books nothing. At-least-once holds - a crash between delivery and
+ * booking redelivers once the lease lapses, and the {@code x-idempotency-key} makes the
+ * consumer's dedup trivial. No database connection is held while a send is in flight.
  *
- * <p>The CLAIM takes: ORDERED rows up to {@code batch-size}; CONCURRENT rows only while a lane
- * slot is free (the slot is taken before the row is stamped, so no lease burns in a queue), and
- * per ordering key only the first row - never one whose key is already in flight. It scans up to
- * {@link #MAX_CLAIM_WINDOWS} windows of {@code batch-size} rows, so an ORDERED row is found even
- * behind a backlog of CONCURRENT rows waiting for slots.
+ * <p>The lane is the one STAMPED on the row at append (null = ORDERED) - it wins even if the
+ * publisher would now name another. The CLAIM takes: ORDERED rows up to {@code batch-size};
+ * CONCURRENT rows only as many as there are free lane slots (the slot is taken before the row is
+ * stamped, so no lease burns in a queue), the query itself keeping a key from going into flight
+ * twice. Neither lane's query reads the other lane's rows, so no backlog of one can hide a row of
+ * the other.
+ *
+ * <p>The claim also moves {@code next_attempt_on} to the lease end: a pre-1.3.0 relay (which
+ * knows no lease) then sees a leased row as not due during a rolling upgrade, and a lapsed lease
+ * leaves the row due at the lapse for both. Every booking sets {@code next_attempt_on} again.
  *
  * <p>ORDERED rows are stamped with the SHORT ordered lease, and each row's lease is RENEWED in
  * the booking transaction of the row before it - so every lease covers one send, never the whole
@@ -61,9 +64,6 @@ class OutboxRelayWorker {
 
   /** Bound for the persisted {@code last_error} text - keeps forensic rows sane. */
   static final int LAST_ERROR_MAX_LENGTH = 4000;
-
-  /** Windows of {@code batch-size} rows one claim scans at most. */
-  static final int MAX_CLAIM_WINDOWS = 10;
 
   private static final Runnable NOTHING = () -> {};
 
@@ -126,52 +126,33 @@ class OutboxRelayWorker {
 
   private Claim scan(List<Leased> concurrent) {
     OffsetDateTime now = now();
-    int batch = properties.getBatchSize();
     List<Leased> ordered = new ArrayList<>();
-    Set<String> takenKeys = new HashSet<>();
-    long after = Long.MIN_VALUE;
-    for (int window = 0; window < MAX_CLAIM_WINDOWS; window++) {
-      List<OutboxEvent> rows = repository.claimWindow(now, after, Limit.of(batch));
-      for (OutboxEvent row : rows) {
-        after = row.getId();
-        consider(row, now, ordered, concurrent, takenKeys);
+    for (OutboxEvent row :
+        repository.claimOrdered(now, Lane.CONCURRENT, Limit.of(properties.getBatchSize()))) {
+      OutboxPublisher publisher = route(row);
+      if (publisher != null) {
+        ordered.add(stamp(row, publisher, Lane.ORDERED, now));
       }
-      if (rows.size() < batch || (ordered.size() >= batch && lane.available() == 0)) {
-        break;
+    }
+    int free = lane.available();
+    if (free > 0) {
+      for (OutboxEvent row : repository.claimConcurrent(now, Lane.CONCURRENT, Limit.of(free))) {
+        OutboxPublisher publisher = route(row);
+        if (publisher != null && lane.tryAcquire()) {
+          concurrent.add(stamp(row, publisher, Lane.CONCURRENT, now));
+        }
       }
     }
     return new Claim(ordered, concurrent);
   }
 
-  private void consider(
-      OutboxEvent row,
-      OffsetDateTime now,
-      List<Leased> ordered,
-      List<Leased> concurrent,
-      Set<String> takenKeys) {
-    boolean inFlight = row.getClaimedUntil() != null && row.getClaimedUntil().isAfter(now);
-    OutboxPublisher publisher = null;
-    Lane rowLane;
-    String key;
+  /** The row's publisher - or null after booking the routing failure by the LIBRARY policy. */
+  private OutboxPublisher route(OutboxEvent row) {
     try {
-      publisher = router.resolve(row);
-      rowLane = publisher.lane(row);
-      key = rowLane == Lane.CONCURRENT ? publisher.orderingKey(row) : null;
+      return router.resolve(row);
     } catch (RuntimeException ex) {
-      if (!inFlight) {
-        registerFailure(row, publisher, ex); // unroutable: the LIBRARY policy books it
-      }
-      return;
-    }
-    if (rowLane == Lane.CONCURRENT) {
-      // a key seen once in this scan is taken - by a row in flight, by the row claimed here, or
-      // by an earlier row left waiting for a slot: later rows of the key wait their turn
-      boolean keyFree = key == null || takenKeys.add(key);
-      if (!inFlight && keyFree && lane.tryAcquire()) {
-        concurrent.add(stamp(row, publisher, Lane.CONCURRENT, now));
-      }
-    } else if (!inFlight && ordered.size() < properties.getBatchSize()) {
-      ordered.add(stamp(row, publisher, Lane.ORDERED, now));
+      registerFailure(row, null, ex);
+      return null;
     }
   }
 
@@ -179,6 +160,7 @@ class OutboxRelayWorker {
       OutboxEvent row, OutboxPublisher publisher, Lane rowLane, OffsetDateTime now) {
     OffsetDateTime stamp = leaseEnd(row, publisher, rowLane, now);
     row.setClaimedUntil(stamp);
+    row.setNextAttemptOn(stamp); // a pre-1.3.0 relay sees the leased row as not due
     return new Leased(row, publisher, stamp);
   }
 
@@ -261,6 +243,7 @@ class OutboxRelayWorker {
     }
     OffsetDateTime renewed = leaseEnd(row, next.publisher, Lane.ORDERED, now());
     row.setClaimedUntil(renewed);
+    row.setNextAttemptOn(renewed);
     afterCommit.add(() -> next.stamp = renewed);
     return true;
   }
@@ -307,6 +290,7 @@ class OutboxRelayWorker {
     OutboxEvent row = held.get();
     row.setClaimedUntil(null);
     row.setRelayedOn(now());
+    row.setNextAttemptOn(row.getRelayedOn()); // no longer the lease end
     if (row.getCancelledOn() != null) {
       log.warn(
           "Outbox row {} to {} was cancelled while its send was in flight and the send"
@@ -335,6 +319,7 @@ class OutboxRelayWorker {
     OutboxBooking booking;
     if (row.getCancelledOn() != null) {
       bookAttempt(row, ex);
+      row.setNextAttemptOn(now()); // no longer the lease end; never claimed again anyway
       booking = OutboxBooking.failed(Outcome.CANCELLED, ex, null);
       log.info(
           "Outbox row {} - send failed after it was cancelled; it retires cancelled: {}",

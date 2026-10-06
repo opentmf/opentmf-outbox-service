@@ -37,6 +37,17 @@ the batch's row locks were held across every backend call.
 - A booking refused by a hook or listener now books one failed attempt
   (`attempts++`). The send ran outside the booking, so the rollback cannot
   pretend the attempt never happened.
+- **The lane and ordering key are stamped at APPEND**, frozen like the
+  headers: the writer asks the row's publisher through the relay's router.
+  The stamped lane wins at claim time, so changing a publisher's lane affects
+  only rows appended afterwards. A row not written through `OutboxWriter`
+  (raw SQL, migrated data, rows from before 1.3.0) has no lane and rides
+  ORDERED.
+- While a 1.3.0 relay holds a row's lease, the row's `next_attempt_on` reads
+  as the lease end (the claim moves it there; every booking sets it again).
+  This is what keeps a 1.2.x pod off leased rows during a rolling upgrade.
+  While old and new pods overlap, sends are not duplicated, but per-key order
+  is not guaranteed.
 
 ### Added
 
@@ -46,8 +57,10 @@ the batch's row locks were held across every backend call.
   8, per pod). The Kafka publisher stays ORDERED and the HTTP publisher is
   CONCURRENT.
 - **Ordering key** for the CONCURRENT lane: `OutboxPublisher.orderingKey(event)`.
-  Rows sharing a non-null key are never in flight together and are taken in
-  `id` order.
+  Rows sharing a non-null key are never in flight together within a pod and
+  are taken in `id` order on the happy path. Across pods the one exception is
+  a backed-off row that comes due during another pod's claim of a later row of
+  its key. A key over 255 characters is stored as `sha256:<hex>`.
 - **Claim by lease.** New nullable column `claimed_until`. A short claim
   transaction stamps `now + lease` and commits, the send runs in no
   transaction and holds no database connection, and a short booking
@@ -70,19 +83,18 @@ the batch's row locks were held across every backend call.
 - Gauge `opentmf.outbox.in-flight` (pending rows under a live lease, across
   pods); `OutboxRowView` gains `inFlight` and `claimedUntil`. The `pending`
   gauge still counts in-flight rows.
-- Changeset `004-outbox-claim-lease`: `claimed_until` plus the partial index
-  `ix_outbox_claimed_until`, additive and `if not exists`, so it applies to an
-  onboarded pre-library table too. 001–003 are untouched (their checksums
-  hold, pinned against the released 1.2.1 changelog).
+- Changeset `004-outbox-claim-lease`: `claimed_until`, `lane` and
+  `ordering_key`, plus the partial indexes `ix_outbox_claimed_until`,
+  `ix_outbox_ordered_claim` and `ix_outbox_concurrent_claim`. It is additive
+  and `if not exists`, so it applies to an onboarded pre-library table too.
+  001–003 are untouched (their checksums hold, pinned against the released
+  1.2.1 changelog).
 
 ### Internal
 
-- The claim scan reads in-flight rows too (to learn the ordering keys taken)
-  and locks with a waiting `FOR UPDATE` instead of `SKIP LOCKED`. Every lock
-  holder is a short transaction now, and waiting lets a claim see a row
-  another pod is stamping as in flight instead of skipping past it to a later
-  row of the same key. The scan reads at most ten windows of `batch-size`
-  rows.
+- Each lane claims over its own query and partial index with
+  `FOR UPDATE SKIP LOCKED`, so no backlog of one lane can hide a row of the
+  other.
 - The relay's nudges coalesce, and a freed CONCURRENT slot nudges the relay.
 - The ITs run twice over the lane: on JDK 17 (platform threads) and, for
   `OutboxHttpLaneVirtualIT`, in a failsafe execution forked on a JDK 21+

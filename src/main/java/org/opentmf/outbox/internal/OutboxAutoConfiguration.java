@@ -57,8 +57,15 @@ public class OutboxAutoConfiguration {
   public OutboxWriter outboxWriter(
       OutboxEventRepository repository,
       ApplicationEventPublisher eventPublisher,
-      ObjectMapper objectMapper) {
-    return new OutboxWriter(repository, eventPublisher, objectMapper);
+      ObjectMapper objectMapper,
+      ObjectProvider<OutboxLaneStamper> laneStamper) {
+    // lazy: a consumer publisher that appends through the writer must not form a cycle
+    return new OutboxWriter(repository, eventPublisher, objectMapper, laneStamper::getObject);
+  }
+
+  @Bean
+  OutboxLaneStamper outboxLaneStamper(OutboxPublisherRouter router) {
+    return new OutboxLaneStamper(router);
   }
 
   @Bean

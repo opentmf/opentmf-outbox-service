@@ -105,16 +105,34 @@ comment on index ix_outbox_pending is 'Partial index over claimable-candidate ro
 
 --changeset opentmf-outbox:004-outbox-claim-lease
 -- 1.3.0, ADDITIVE and IDEMPOTENT (IF NOT EXISTS throughout, so it applies to a table onboarded
--- by 003 as well as to one the library created): claimed_until - the relay's LEASE on a row.
--- The claim stamps now + lease and commits; the send runs in no transaction; the booking writes
--- the outcome guarded on the stamped value and clears it. Null = not claimed; a past value = a
--- lapsed lease (claimable again); a future value = in flight. The claim predicate gains
--- "claimed_until is null or claimed_until <= now"; the pending index keeps its predicate.
+-- by 003 as well as to one the library created). Three columns:
+-- claimed_until - the relay's LEASE on a row. The claim stamps now + lease (and moves
+-- next_attempt_on to the same instant, so a pre-1.3.0 relay sees a leased row as not due) and
+-- commits; the send runs in no transaction; the booking writes the outcome guarded on the
+-- stamped value and clears it. Null = not claimed; past = lapsed (claimable again); future = in
+-- flight.
+-- lane / ordering_key - what the row's publisher said at APPEND, frozen like headers: ORDERED
+-- (or null: a row written before 1.3.0, or not through the library's writer) rides the single
+-- relay thread in id order; CONCURRENT rides the parallel lane, where rows sharing an
+-- ordering_key are never in flight together. Each lane claims over its own partial index, so
+-- neither ever reads through the other's backlog.
 alter table outbox add column if not exists claimed_until timestamp with time zone;
+alter table outbox add column if not exists lane varchar(16);
+alter table outbox add column if not exists ordering_key varchar(255);
 
 create index if not exists ix_outbox_claimed_until on outbox (claimed_until) where claimed_until is not null and relayed_on is null and cancelled_on is null;
+create index if not exists ix_outbox_ordered_claim on outbox (id) where (lane is null or lane <> 'CONCURRENT') and relayed_on is null and cancelled_on is null and parked_on is null;
+create index if not exists ix_outbox_concurrent_claim on outbox (ordering_key, id) where lane = 'CONCURRENT' and relayed_on is null and cancelled_on is null and parked_on is null;
 
-comment on column outbox.claimed_until is 'The relay''s lease (1.3.0): stamped now + lease by the claim, cleared by the booking. Future = in flight (not claimable); past = lapsed, claimable again - the late holder''s booking is guarded on the stamped value and books nothing.';
+comment on column outbox.claimed_until is 'The relay''s lease (1.3.0): stamped now + lease by the claim (next_attempt_on moves with it), cleared by the booking. Future = in flight (not claimable); past = lapsed, claimable again - the late holder''s booking is guarded on the stamped value and books nothing.';
+comment on column outbox.lane is 'The relay lane the row''s publisher named at append (1.3.0), frozen: ORDERED (single relay thread, id order) or CONCURRENT (parallel, keyed). Null = written before 1.3.0 or not through the library writer - rides ORDERED.';
+comment on column outbox.ordering_key is 'CONCURRENT lane (1.3.0): rows sharing this key are never in flight together and are taken in id order on the happy path. Null = independent. Frozen at append; a key over 255 chars is stored as sha256:<hex>.';
 comment on index ix_outbox_claimed_until is 'Partial index over leased pending rows - backs the in-flight gauge and the ops in-flight read.';
+comment on index ix_outbox_ordered_claim is 'The ORDERED lane''s claim: claimable-candidate rows of that lane only, in id order.';
+comment on index ix_outbox_concurrent_claim is 'The CONCURRENT lane''s claim: claimable-candidate rows of that lane by ordering key, then id - backs the per-key blocking probes.';
+--rollback drop index if exists ix_outbox_concurrent_claim;
+--rollback drop index if exists ix_outbox_ordered_claim;
 --rollback drop index if exists ix_outbox_claimed_until;
+--rollback alter table outbox drop column if exists ordering_key;
+--rollback alter table outbox drop column if exists lane;
 --rollback alter table outbox drop column if exists claimed_until;

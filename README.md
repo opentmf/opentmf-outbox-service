@@ -45,6 +45,8 @@ erDiagram
         timestamptz relayed_on         "delivery completion (or DROP exhaustion); null while pending/parked"
         timestamptz cancelled_on       "cancellation of an unreleased effect (nullable, 1.1.0)"
         timestamptz claimed_until      "the relay's lease; future = in flight (nullable, 1.3.0)"
+        varchar(16) lane               "ORDERED | CONCURRENT, stamped at append; null = ORDERED (1.3.0)"
+        varchar(255) ordering_key      "CONCURRENT rows sharing it are never in flight together (1.3.0)"
         text        last_error         "last failure, truncated — ops forensics (nullable)"
     }
 ```
@@ -115,10 +117,18 @@ sequenceDiagram
     Pub->>DB: BOOKING tx — guarded on the stamped lease:<br/>relayed_on + publisher hook + listeners, COMMIT
 ```
 
-- **Two lanes, chosen by the publisher (1.3.0).** `OutboxPublisher.lane(event)`
-  is `ORDERED` (the default) or `CONCURRENT`. The **ORDERED** lane is the
-  single relay thread per pod: rows go one by one in `id` order — the 1.2.x
-  behaviour; the Kafka publisher rides it. The **CONCURRENT** lane sends rows
+- **Two lanes, chosen by the publisher (1.3.0) AT APPEND.** `OutboxPublisher.lane(event)`
+  is `ORDERED` (the default) or `CONCURRENT`. The writer asks the row's
+  publisher (through the relay's own router) and stamps `lane` and
+  `ordering_key` on the row, **frozen like the headers**. The stamped lane
+  wins at claim time even if the publisher would now say otherwise, so
+  changing a publisher's lane affects only rows appended afterwards. A row
+  not written through `OutboxWriter` (a raw SQL insert, migrated data, a row
+  from before 1.3.0) has no lane and rides ORDERED. An append never fails on
+  this account: a row no publisher supports, or whose publisher throws while
+  naming its lane, is stored without one and the relay books it as before.
+  The **ORDERED** lane is the single relay thread per pod: rows go one by one
+  in `id` order — the 1.2.x behaviour; the Kafka publisher rides it. The **CONCURRENT** lane sends rows
   in parallel, one per thread, at most `concurrent.max-in-flight` (default 8)
   at a time; the HTTP publisher rides it, so a slow subscriber never delays a
   Kafka row again. CONCURRENT rows keep **no order** against ORDERED rows, nor
@@ -126,6 +136,10 @@ sequenceDiagram
   are never in flight together and go in `id` order on the happy path (a
   failed row backs off, and later rows of its key may pass it). The HTTP
   publisher's key is the destination, so rows to one receiver keep their order.
+  A key over 255 characters is stored as `sha256:<hex>`. **Each lane claims
+  over its own query and index**, so no backlog of one lane can hide a row of
+  the other: an ORDERED row relays within seconds behind 1,500 pending rows of
+  one slow subscriber (`OutboxBacklogIT`).
 - **Claimed by lease, not by a lock held across the send.** A short claim
   transaction stamps `claimed_until = now + lease` on the rows it takes and
   commits. The send runs in **no transaction and holds no database
@@ -147,12 +161,14 @@ sequenceDiagram
   task, so `max-in-flight` is also the thread bound. The library's bytecode
   stays on Java 17.
 - **Ordering at one replica** therefore means: ORDERED rows in `id` order,
-  CONCURRENT rows in `id` order per ordering key. **Across replicas** the
-  lease is the guard. Two pods never take one row twice: a claim waits for
-  another pod's claim in progress (row locks, no SKIP LOCKED — every lock
-  holder is a short transaction now) and then sees its rows as in flight. Pods
-  still interleave ORDERED rows, so strict per-key order across pods is not
-  promised.
+  CONCURRENT rows in `id` order per ordering key. **Across replicas**
+  `FOR UPDATE SKIP LOCKED` plus the lease is the guard: two pods never take
+  one row twice. A row another pod is claiming is skipped, and once that claim
+  commits the row carries a live lease. Pods still interleave ORDERED rows, so
+  strict order across pods is not promised. Rows of one ordering key are
+  **never in flight together within a pod**. Across pods the one exception is
+  a backed-off row that comes due during another pod's claim of a later row of
+  its key; order for that key was already given up when the row failed.
 - **At-least-once, consumer-dedupable.** A crash between delivery and booking
   means redelivery once the row's lease lapses (seconds on the ORDERED lane,
   up to the lease on the CONCURRENT lane); `x-idempotency-key = <spring.application.name>:outbox:<id>`
@@ -178,18 +194,28 @@ sequenceDiagram
   delivery, kept failing — the destination saw N idempotent copies); and the
   001/002 onboarding preconditions probe `information_schema` for
   `current_schema()`, i.e. the outbox lives in the consumer's own schema.
-- **Claim eligibility lives in ONE place** — the claim query:
+- **Claim eligibility lives in ONE place**, the two lane claims (one
+  repository, side by side):
   `relayed_on is null and cancelled_on is null and parked_on is null and
   (release_at is null or release_at <= now) and next_attempt_on <= now and
-  (claimed_until is null or claimed_until <= now)`, in `id` order (no
-  attempt-count leg: the budget is per publisher). The scan also reads the
-  rows in flight, only to learn which ordering keys are taken. It looks at up
-  to ten windows of `batch-size` rows, so an ORDERED row is found even behind
-  a backlog of CONCURRENT rows waiting for slots. A held row waits for its
-  hold; a cancelled or parked row never comes back on its own.
+  (claimed_until is null or claimed_until <= now)`, in `id` order, `FOR UPDATE
+  SKIP LOCKED` (no attempt-count leg: the budget is per publisher). The
+  ORDERED claim adds `lane is null or lane <> 'CONCURRENT'`. The CONCURRENT
+  claim adds `lane = 'CONCURRENT'` and, for a keyed row, the ordering-key
+  rule: no row of its key with a lower id is due, and no row of its key at all
+  is in flight. A row in backoff lets later rows of its key pass. A held row
+  waits for its hold; a cancelled or parked row never comes back on its own.
+- **The claim moves `next_attempt_on` to the lease end**, and every booking
+  sets it again: the publisher's backoff on a failure, the booking time
+  otherwise. Two consequences. A **pre-1.3.0 relay**, which knows no lease,
+  sees a leased row as not due and leaves it alone during a rolling upgrade.
+  The row view's `nextAttemptOn` of an in-flight row reads as its lease end.
+  The retry schedule is still computed from `attempts`, and `release_at` is
+  never touched.
 - **Ops actions against a row in flight.** `cancel` and `unpark` read their row
   under a waiting `FOR UPDATE`. Since 1.3.0 that serialises only against the
-  short claim and booking transactions, never against a send. A **cancel of a
+  short claim and booking transactions, never against a send (the claims skip
+  a row an ops action holds). A **cancel of a
   row in flight succeeds at once**, and the booking honours it. A send that
   then fails retires the row cancelled (no retry, no park; the booking hook
   sees `CANCELLED`). A send that succeeds is booked **sent-but-cancelled**:
@@ -606,28 +632,37 @@ The library is self-contained for consumer testing — no test-jar needed:
   ```
 - **Conformance**: the library carries one IT per real consumer profile
   (`Profile681HubIT`, `ProfileFlowHttpSideEffectIT`,
-  `ProfileAdapterKafkaOrderIT`) plus the crash-window, SKIP LOCKED contention
-  and onboarding ITs — the contracts above are pinned there, so a consumer gap
+  `ProfileAdapterKafkaOrderIT`) plus the crash-window, SKIP LOCKED contention,
+  lease, lane, backlog and onboarding ITs — the contracts above are pinned there, so a consumer gap
   is a red library build, not a discovery after the cut.
 
 ### Upgrading to 1.3.0
 
-1. Take the version. Changeset `004-outbox-claim-lease` adds the nullable
-   `claimed_until` column and a partial index (`if not exists`, so it applies
-   to a library-created table and to an onboarded pre-library one alike).
-2. **A publisher that writes to the database inside `publish`** moves that
+1. Take the version. Changeset `004-outbox-claim-lease` adds three nullable
+   columns (`claimed_until`, `lane`, `ordering_key`) and three partial indexes
+   (`if not exists`, so it applies to a library-created table and to an
+   onboarded pre-library one alike). Rows pending at the upgrade have no lane
+   and ride ORDERED once, including any pending HTTP backlog, which drains on
+   the relay thread as it would have under 1.2.x.
+2. **Rolling deploys are safe for sends.** A 1.3.0 claim moves
+   `next_attempt_on` to the lease end, so a 1.2.x pod still running sees a
+   leased row as not due and never sends it twice. While old and new pods
+   overlap, **per-key order is not guaranteed**: an old pod knows no ordering
+   key.
+3. **A publisher that writes to the database inside `publish`** moves that
    write into `onBooked(event, booking)`. This is the one stated contract that
    changes: `publish` runs in no transaction now.
-3. **Order changes for HTTP rows.** The library HTTP publisher is CONCURRENT:
+4. **Order changes for HTTP rows.** The library HTTP publisher is CONCURRENT:
    an HTTP row no longer keeps `id` order against Kafka (ORDERED) rows, nor
    against HTTP rows to other receivers. Rows to one receiver still go in
    order on the happy path. A flow that relied on "the Kafka row before the
    HTTP row" through the relay must get that order elsewhere, or ride its own
    ORDERED publisher.
-4. A consumer's own publisher stays ORDERED unless it says otherwise. Moving it
+5. A consumer's own publisher stays ORDERED unless it says otherwise. Moving it
    to CONCURRENT means declaring `lane`, usually an `orderingKey`, and a
-   `lease` longer than its longest call.
-5. Ops: a cancel of a row in flight succeeds at once (it used to wait for the
+   `lease` longer than its longest call. Rows it appended before the change
+   keep the lane they were stamped with.
+6. Ops: a cancel of a row in flight succeeds at once (it used to wait for the
    send and then refuse). Watch the new `opentmf.outbox.in-flight` gauge and
    the `inFlight` / `claimedUntil` fields on the row view. A crash after a send
    redelivers once the lease lapses, not on the next pass.
@@ -662,11 +697,31 @@ Quality gates on this repo:
   execution merged; generated Querydsl classes excluded from the denominator.
 - SonarQube (`mvn -Psonar clean verify` against a local server on
   `localhost:9000`, token via `SONAR_TOKEN`): zero open findings is the bar.
-- The ITs run twice over the lane: on the build JDK (17, platform threads), and
-  `OutboxHttpLaneVirtualIT` in failsafe's `virtual-threads-it` execution,
-  forked on a **JDK 21+ toolchain** (`~/.m2/toolchains.xml` needs a `jdk`
-  entry of version 21 or later). Without one, the build fails there instead of
-  quietly testing one executor.
+- **Prerequisite: a JDK 21+ Maven toolchain.** The ITs run twice over the
+  lane: on the build JDK (17, platform threads), and `OutboxHttpLaneVirtualIT`
+  in failsafe's `virtual-threads-it` execution, forked on a JDK 21+ toolchain
+  for virtual threads. Without a matching entry in `~/.m2/toolchains.xml`, the
+  build **fails** there instead of quietly testing one executor. A minimal
+  file (paths are examples):
+
+  ```xml
+  <toolchains>
+    <toolchain>
+      <type>jdk</type>
+      <provides><version>17</version></provides>
+      <configuration><jdkHome>/usr/lib/jvm/openjdk-17</jdkHome></configuration>
+    </toolchain>
+    <toolchain>
+      <type>jdk</type>
+      <provides><version>25</version></provides>
+      <configuration><jdkHome>/usr/lib/jvm/openjdk-25</jdkHome></configuration>
+    </toolchain>
+  </toolchains>
+  ```
+- **CI runs no build.** The repository has no CI workflows; the SonarCloud
+  check on a pull request is SonarCloud's automatic analysis, which compiles
+  and tests nothing. The gate above (unit tests, both IT executions, JaCoCo,
+  local SonarQube) is run locally before every merge and cut.
 - PIT (`mvn -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage`)
   on the pinned 1.19.6 hold with incremental history (1.20+ moved free
   `withHistory` behind the commercial arcmutate plugin). No mutation threshold:

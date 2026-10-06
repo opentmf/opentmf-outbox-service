@@ -2,6 +2,8 @@ package org.opentmf.outbox;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
@@ -13,6 +15,7 @@ import org.hibernate.annotations.DynamicInsert;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.annotations.DynamicUpdate;
 import org.hibernate.type.SqlTypes;
+import org.opentmf.outbox.OutboxPublisher.Lane;
 
 /**
  * One outbox row — an effect frozen at commit time, delivered at-least-once by the relay.
@@ -139,6 +142,23 @@ public class OutboxEvent {
    * and the late holder's booking - guarded on the value it stamped - books nothing.
    */
   private OffsetDateTime claimedUntil;
+
+  /**
+   * The relay lane the row's publisher named at APPEND (1.3.0), frozen - the stamped lane wins
+   * at claim even if the publisher would now say otherwise. Null = written before 1.3.0 or not
+   * through {@link OutboxWriter}: the row rides ORDERED.
+   */
+  @Enumerated(EnumType.STRING)
+  @Column(updatable = false, length = 16)
+  private Lane lane;
+
+  /**
+   * CONCURRENT lane (1.3.0): rows sharing this key are never in flight together within a pod
+   * and are taken in {@code id} order on the happy path; null = independent. Frozen at append;
+   * a key over 255 characters is stored as {@code sha256:<hex>}.
+   */
+  @Column(updatable = false)
+  private String orderingKey;
 
   /** Last delivery failure, truncated — ops forensics for parked rows. */
   private String lastError;

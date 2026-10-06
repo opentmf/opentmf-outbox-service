@@ -11,7 +11,6 @@ import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -105,14 +104,28 @@ class OutboxRelayWorkerTests {
     when(publisher.supports(any())).thenReturn(true);
     doThrow(new AssertionError("unstubbed publish")).when(publisher).publish(any());
     doReturn(null).when(publisher).deliver(any()); // delivered, no result - per test overridden
-    when(repository.claimWindow(any(), anyLong(), any(Limit.class)))
+    // the two lane claims, emulated on the fake table (the real SQL is the ITs' job)
+    when(repository.claimOrdered(any(), any(), any(Limit.class)))
         .thenAnswer(
             inv -> {
               OffsetDateTime now = inv.getArgument(0);
-              long after = inv.getArgument(1);
               Limit limit = inv.getArgument(2);
               return table.values().stream()
-                  .filter(e -> e.getId() > after && eligible(e, now))
+                  .filter(e -> e.getLane() != Lane.CONCURRENT && claimable(e, now))
+                  .limit(limit.max())
+                  .toList();
+            });
+    when(repository.claimConcurrent(any(), any(), any(Limit.class)))
+        .thenAnswer(
+            inv -> {
+              OffsetDateTime now = inv.getArgument(0);
+              Limit limit = inv.getArgument(2);
+              return table.values().stream()
+                  .filter(
+                      e ->
+                          e.getLane() == Lane.CONCURRENT
+                              && claimable(e, now)
+                              && keyFree(e, now))
                   .limit(limit.max())
                   .toList();
             });
@@ -141,13 +154,30 @@ class OutboxRelayWorkerTests {
     lane.close();
   }
 
-  private static boolean eligible(OutboxEvent e, OffsetDateTime now) {
-    boolean live = e.getClaimedUntil() != null && e.getClaimedUntil().isAfter(now);
+  private static boolean claimable(OutboxEvent e, OffsetDateTime now) {
     return e.getRelayedOn() == null
         && e.getCancelledOn() == null
         && e.getParkedOn() == null
         && (e.getReleaseAt() == null || !e.getReleaseAt().isAfter(now))
-        && (live || !e.getNextAttemptOn().isAfter(now));
+        && !e.getNextAttemptOn().isAfter(now)
+        && (e.getClaimedUntil() == null || !e.getClaimedUntil().isAfter(now));
+  }
+
+  /** The ordering-key rule of the CONCURRENT claim: no lower row of the key due, none flying. */
+  private boolean keyFree(OutboxEvent e, OffsetDateTime now) {
+    if (e.getOrderingKey() == null) {
+      return true;
+    }
+    return table.values().stream()
+        .filter(
+            o -> o.getLane() == Lane.CONCURRENT && e.getOrderingKey().equals(o.getOrderingKey()))
+        .noneMatch(
+            o ->
+                (o.getId() < e.getId() && claimable(o, now))
+                    || (o.getRelayedOn() == null
+                        && o.getCancelledOn() == null
+                        && o.getClaimedUntil() != null
+                        && o.getClaimedUntil().isAfter(now)));
   }
 
   private static OutboxEvent copy(OutboxEvent row) {
@@ -164,6 +194,21 @@ class OutboxRelayWorkerTests {
     event.setNextAttemptOn(OffsetDateTime.now().minusSeconds(1));
     table.put(id, event);
     return event;
+  }
+
+  /** A CONCURRENT row as the writer stamps it at append. */
+  private OutboxEvent concurrent(long id, String key) {
+    OutboxEvent event = pending(id, 0);
+    event.setLane(Lane.CONCURRENT);
+    event.setOrderingKey(key);
+    return event;
+  }
+
+  /** In flight elsewhere: a live lease, next_attempt_on moved with it. */
+  private static void leasedElsewhere(OutboxEvent event) {
+    OffsetDateTime lease = OffsetDateTime.now().plusMinutes(1);
+    event.setClaimedUntil(lease);
+    event.setNextAttemptOn(lease);
   }
 
   private double counter(String name) {
@@ -378,7 +423,7 @@ class OutboxRelayWorkerTests {
   void anUnroutableRowInFlight_isLeftToItsHolder() {
     when(publisher.supports(any())).thenReturn(false);
     OutboxEvent event = pending(1L, 0);
-    event.setClaimedUntil(OffsetDateTime.now().plusMinutes(1));
+    leasedElsewhere(event);
 
     relay();
 
@@ -520,13 +565,12 @@ class OutboxRelayWorkerTests {
         .isBetween(before.plusSeconds(14), before.plusSeconds(16)); // ordered lease 15s
     assertThat(ordered.getRelayedOn()).isNotNull();
 
-    when(publisher.lane(any())).thenReturn(Lane.CONCURRENT);
-    pending(2L, 0);
+    concurrent(2L, null);
     relay();
     assertThat(stamps.get(1)).isAfter(OffsetDateTime.now().plusSeconds(100)); // lease 2min
 
     when(publisher.lease(any())).thenReturn(Duration.ofSeconds(3));
-    pending(3L, 0);
+    concurrent(3L, null);
     relay();
     assertThat(stamps.get(2)).isBefore(OffsetDateTime.now().plusSeconds(4));
   }
@@ -640,7 +684,7 @@ class OutboxRelayWorkerTests {
   @Test
   void anInFlightOrderedRow_isNotClaimedAgain() {
     OutboxEvent leased = pending(1L, 0);
-    leased.setClaimedUntil(OffsetDateTime.now().plusMinutes(1));
+    leasedElsewhere(leased);
 
     assertThat(relay()).isZero();
     verify(publisher, never()).deliver(leased);
@@ -681,8 +725,7 @@ class OutboxRelayWorkerTests {
 
   @Test
   void concurrentRows_runOffTheRelayThread_andReturnTheirSlots() {
-    when(publisher.lane(any())).thenReturn(Lane.CONCURRENT);
-    OutboxEvent row = pending(1L, 0);
+    OutboxEvent row = concurrent(1L, null);
     List<String> threads = new CopyOnWriteArrayList<>();
     doAnswer(
             inv -> {
@@ -700,11 +743,55 @@ class OutboxRelayWorkerTests {
   }
 
   @Test
+  void theStampedLaneWins_overWhatThePublisherSaysNow() {
+    when(publisher.lane(any())).thenReturn(Lane.CONCURRENT); // the publisher changed its mind
+    OutboxEvent stampedOrdered = pending(1L, 0); // appended as ORDERED (or before 1.3.0)
+    OutboxEvent stampedConcurrent = concurrent(2L, null);
+    when(publisher.lane(stampedConcurrent)).thenReturn(Lane.ORDERED);
+    List<String> threads = new CopyOnWriteArrayList<>();
+    doAnswer(
+            inv -> {
+              long id = inv.<OutboxEvent>getArgument(0).getId();
+              threads.add(id + "@" + Thread.currentThread().getName());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    relay();
+
+    await().atMost(Duration.ofSeconds(5)).until(() -> stampedConcurrent.getRelayedOn() != null);
+    assertThat(stampedOrdered.getRelayedOn()).isNotNull();
+    assertThat(threads)
+        .anyMatch(t -> t.startsWith("1@") && !t.contains("opentmf-outbox-send-"))
+        .anyMatch(t -> t.startsWith("2@opentmf-outbox-send-"));
+  }
+
+  @Test
+  void theClaim_movesNextAttemptToTheLeaseEnd_andTheBookingMovesItBack() {
+    OutboxEvent row = pending(1L, 0);
+    List<OffsetDateTime> atSend = new ArrayList<>();
+    doAnswer(
+            inv -> {
+              OutboxEvent sent = table.get(1L);
+              assertThat(sent.getNextAttemptOn()).isEqualTo(sent.getClaimedUntil());
+              atSend.add(sent.getNextAttemptOn());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    relay();
+
+    assertThat(atSend).singleElement().satisfies(t -> assertThat(t).isAfter(OffsetDateTime.now()));
+    assertThat(row.getNextAttemptOn()).isEqualTo(row.getRelayedOn()); // no future value left
+  }
+
+  @Test
   void theClaim_takesOnlyAsManyConcurrentRowsAsThereAreFreeSlots() {
-    when(publisher.lane(any())).thenReturn(Lane.CONCURRENT);
-    pending(1L, 0);
-    pending(2L, 0);
-    OutboxEvent third = pending(3L, 0);
+    concurrent(1L, null);
+    concurrent(2L, null);
+    OutboxEvent third = concurrent(3L, null);
     CountDownLatch gate = new CountDownLatch(1);
     doAnswer(
             inv -> {
@@ -723,13 +810,23 @@ class OutboxRelayWorkerTests {
   }
 
   @Test
+  void noFreeSlot_meansNoConcurrentClaimAtAll() {
+    OutboxEvent row = concurrent(1L, null);
+    assertThat(lane.tryAcquire()).isTrue();
+    assertThat(lane.tryAcquire()).isTrue();
+
+    assertThat(worker.relayBatch()).isZero();
+
+    verify(repository, never()).claimConcurrent(any(), any(), any(Limit.class));
+    assertThat(row.getClaimedUntil()).isNull();
+    lane.releaseUnused(2);
+  }
+
+  @Test
   void rowsSharingAnOrderingKey_areNeverInFlightTogether_andGoInIdOrder() {
-    when(publisher.lane(any())).thenReturn(Lane.CONCURRENT);
-    when(publisher.orderingKey(any()))
-        .thenAnswer(inv -> inv.<OutboxEvent>getArgument(0).getId() <= 2 ? "receiver-a" : null);
-    OutboxEvent firstOfA = pending(1L, 0);
-    OutboxEvent secondOfA = pending(2L, 0);
-    OutboxEvent independent = pending(3L, 0);
+    OutboxEvent firstOfA = concurrent(1L, "receiver-a");
+    OutboxEvent secondOfA = concurrent(2L, "receiver-a");
+    OutboxEvent independent = concurrent(3L, null);
 
     assertThat(relay()).isEqualTo(2); // 1 and 3 - the second of the key waits its turn
     assertThat(firstOfA.getRelayedOn()).isNotNull();
@@ -741,50 +838,29 @@ class OutboxRelayWorkerTests {
   }
 
   @Test
-  void aKeyInFlightElsewhere_blocksTheLaterRowsOfItsKey() {
-    when(publisher.lane(any())).thenReturn(Lane.CONCURRENT);
-    when(publisher.orderingKey(any())).thenReturn("receiver-a");
-    OutboxEvent inFlight = pending(1L, 0);
-    inFlight.setClaimedUntil(OffsetDateTime.now().plusMinutes(1)); // another relay sends it
-    OutboxEvent later = pending(2L, 0);
-
-    assertThat(relay()).isZero();
-    assertThat(later.getClaimedUntil()).isNull();
-  }
-
-  @Test
-  void aKeyWaitingForASlot_isNotOvertakenByItsOwnLaterRow() {
-    when(publisher.lane(any())).thenReturn(Lane.CONCURRENT);
-    when(publisher.orderingKey(any()))
-        .thenAnswer(inv -> inv.<OutboxEvent>getArgument(0).getId() == 1 ? null : "receiver-b");
-    pending(1L, 0);
-    OutboxEvent waitsForASlot = pending(2L, 0);
-    OutboxEvent laterOfItsKey = pending(3L, 0);
-    assertThat(lane.tryAcquire()).isTrue(); // one slot taken by someone else
-
-    assertThat(worker.relayBatch()).isEqualTo(1); // row 1 takes the last slot
-    assertThat(waitsForASlot.getClaimedUntil()).isNull();
-    assertThat(laterOfItsKey.getClaimedUntil()).isNull(); // the key is taken by row 2
-    lane.release();
-    await().atMost(Duration.ofSeconds(5)).until(() -> lane.available() == 2);
-  }
-
-  @Test
-  void aClaimThatDoesNotCommit_returnsItsSlots() {
-    when(publisher.lane(any())).thenReturn(Lane.CONCURRENT);
-    pending(1L, 0);
+  void aConcurrentRowRacingAClaimThatDoesNotCommit_returnsItsSlots() {
+    concurrent(1L, null);
     failCommits = true;
 
-    assertThatThrownBy(worker::relayBatch)
-        .hasMessageContaining("database gone");
+    assertThatThrownBy(worker::relayBatch).hasMessageContaining("database gone");
 
     assertThat(lane.available()).isEqualTo(2);
   }
 
   @Test
+  void anUnroutableConcurrentRow_isBookedInTheClaim_andTakesNoSlot() {
+    when(publisher.supports(any())).thenReturn(false);
+    OutboxEvent row = concurrent(1L, null);
+
+    assertThat(relay()).isZero();
+
+    assertThat(row.getAttempts()).isEqualTo(1);
+    assertThat(lane.available()).isEqualTo(2);
+  }
+
+  @Test
   void aSendTheClosingLaneRefuses_returnsItsSlot_theLeaseLapses() {
-    when(publisher.lane(any())).thenReturn(Lane.CONCURRENT);
-    OutboxEvent row = pending(1L, 0);
+    OutboxEvent row = concurrent(1L, null);
     lane.close();
 
     assertThat(worker.relayBatch()).isEqualTo(1);
@@ -796,8 +872,7 @@ class OutboxRelayWorkerTests {
 
   @Test
   void aBookingFailureOnTheConcurrentLane_isLogged_andTheSlotStillReturns() {
-    when(publisher.lane(any())).thenReturn(Lane.CONCURRENT);
-    OutboxEvent row = pending(1L, 0);
+    OutboxEvent row = concurrent(1L, null);
     doAnswer(
             inv -> {
               failCommits = true;
@@ -813,47 +888,26 @@ class OutboxRelayWorkerTests {
   }
 
   @Test
-  void anOrderedRow_isFoundBehindAFullWindowOfConcurrentRowsWaitingForSlots() {
-    properties.setBatchSize(2);
-    when(publisher.lane(any()))
-        .thenAnswer(
-            inv -> inv.<OutboxEvent>getArgument(0).getId() <= 6 ? Lane.CONCURRENT : Lane.ORDERED);
+  void anOrderedRow_isClaimedWhateverTheConcurrentBacklog() {
     CountDownLatch gate = new CountDownLatch(1);
     doAnswer(
             inv -> {
-              if (inv.<OutboxEvent>getArgument(0).getId() <= 6) {
+              if (inv.<OutboxEvent>getArgument(0).getLane() == Lane.CONCURRENT) {
                 gate.await();
               }
               return null;
             })
         .when(publisher)
         .deliver(any());
-    for (long id = 1; id <= 6; id++) {
-      pending(id, 0);
+    for (long id = 1; id <= 500; id++) {
+      concurrent(id, "one-slow-receiver");
     }
-    OutboxEvent ordered = pending(7L, 0); // fourth window
+    OutboxEvent ordered = pending(501L, 0);
 
     worker.relayBatch();
 
     assertThat(ordered.getRelayedOn()).isNotNull();
     gate.countDown();
     await().atMost(Duration.ofSeconds(5)).until(() -> lane.available() == 2);
-  }
-
-  @Test
-  void theScan_stopsAfterItsWindowBudget() {
-    properties.setBatchSize(1);
-    when(publisher.lane(any())).thenReturn(Lane.CONCURRENT);
-    when(publisher.orderingKey(any())).thenReturn("one-receiver");
-    for (long id = 1; id <= OutboxRelayWorker.MAX_CLAIM_WINDOWS + 2; id++) {
-      pending(id, 0);
-    }
-    OutboxEvent beyond = table.get((long) OutboxRelayWorker.MAX_CLAIM_WINDOWS + 1);
-
-    relay(); // row 1 relays; rows 2..10 are seen and wait for the key; 11 is never scanned
-
-    verify(repository, times(OutboxRelayWorker.MAX_CLAIM_WINDOWS))
-        .claimWindow(any(), anyLong(), any(Limit.class));
-    assertThat(beyond.getClaimedUntil()).isNull();
   }
 }
