@@ -365,6 +365,7 @@ class OutboxOnboardingIT {
         .contains("ordering_key IS NULL");
     // a live lease holds its key even on a cancelled row: the lease index ignores the cancel
     assertThat(indexDefinition(url, "ix_outbox_claimed_until")).doesNotContain("cancelled_on");
+    assertThat(invalidIndexes(url)).isZero(); // the concurrent builds all completed
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
     assertThat(changelogRows(url)).hasSize(5);
   }

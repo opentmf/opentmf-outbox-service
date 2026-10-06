@@ -754,6 +754,12 @@ The library is self-contained for consumer testing — no test-jar needed:
    onboarded pre-library one alike). Rows pending at the upgrade have no lane
    and ride ORDERED once, including any pending HTTP backlog, which drains on
    the relay thread as it would have under 1.2.x.
+   **What the first start costs on a large table.** `004` builds its four
+   indexes `CONCURRENTLY`, so the appends of pods still running are never
+   blocked. Each build still reads the whole table once. Measured: about 3.3 s
+   in total on 3,100,000 rows / 2.5 GB, roughly 1.1 s per million rows; a busier
+   database takes about twice that. Liquibase runs before the service is ready,
+   so the consumer's **startup probe must allow for it**.
 2. **Rolling deploys are safe for sends.** A 1.3.0 claim moves
    `next_attempt_on` to the lease end, so a 1.2.x pod still running sees a
    leased row as not due and never sends it twice. While old and new pods
