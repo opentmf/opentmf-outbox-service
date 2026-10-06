@@ -89,7 +89,11 @@ the batch's row locks were held across every backend call.
   `ix_outbox_concurrent_unkeyed`. It is additive
   and `if not exists`, so it applies to an onboarded pre-library table too.
   001–003 are untouched (their checksums hold, pinned against the released
-  1.2.1 changelog).
+  1.2.1 changelog). Its four indexes are built `CONCURRENTLY` (the changeset
+  runs outside a transaction), each preceded by `drop index concurrently if
+  exists`, so a deploy does not block the appends of the pods still running and
+  a failed build's INVALID index is rebuilt, not skipped. About 1.1 s per
+  million rows for the four; the startup probe must allow for it.
 
 ### Dependencies
 

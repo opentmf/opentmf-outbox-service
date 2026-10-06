@@ -169,6 +169,20 @@ class OutboxOnboardingIT {
     return indexDefinition(url, "ix_outbox_pending");
   }
 
+  /** Indexes PostgreSQL marks INVALID - a failed concurrent build leaves one behind. */
+  private static long invalidIndexes(String url) throws SQLException {
+    try (Connection c =
+            DriverManager.getConnection(url, postgres.getUsername(), postgres.getPassword());
+        Statement st = c.createStatement();
+        ResultSet rs =
+            st.executeQuery(
+                "select count(*) from pg_index i join pg_class c on c.oid = i.indrelid"
+                    + " where c.relname = 'outbox' and not i.indisvalid")) {
+      rs.next();
+      return rs.getLong(1);
+    }
+  }
+
   private static String indexDefinition(String url, String index) throws SQLException {
     try (Connection c =
             DriverManager.getConnection(url, postgres.getUsername(), postgres.getPassword());
@@ -336,6 +350,7 @@ class OutboxOnboardingIT {
         .contains("ordering_key IS NULL");
     // a live lease holds its key even on a cancelled row: the lease index ignores the cancel
     assertThat(indexDefinition(url, "ix_outbox_claimed_until")).doesNotContain("cancelled_on");
+    assertThat(invalidIndexes(url)).isZero(); // the concurrent builds all completed
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
     assertThat(changelogRows(url)).hasSize(4);
   }

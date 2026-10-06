@@ -103,7 +103,7 @@ comment on index ix_outbox_pending is 'Partial index over claimable-candidate ro
 --rollback alter table outbox drop column if exists reference;
 --rollback alter table outbox drop column if exists parked_on;
 
---changeset opentmf-outbox:004-outbox-claim-lease
+--changeset opentmf-outbox:004-outbox-claim-lease runInTransaction:false
 -- 1.3.0, ADDITIVE and IDEMPOTENT (IF NOT EXISTS throughout, so it applies to a table onboarded
 -- by 003 as well as to one the library created). Three columns:
 -- claimed_until - the relay's LEASE on a row. The claim stamps now + lease (and moves
@@ -122,14 +122,23 @@ comment on index ix_outbox_pending is 'Partial index over claimable-candidate ro
 -- in-flight keys through ix_outbox_claimed_until, skips from key to key through
 -- ix_outbox_concurrent_keyed (one probe per key not in flight - never one per pending row),
 -- and walks ix_outbox_concurrent_unkeyed for rows without a key.
+-- The indexes are built CONCURRENTLY (hence runInTransaction:false): a deploy onto a large
+-- table must not block the appends of the pods still running. Each build is preceded by a
+-- DROP ... IF EXISTS - a failed concurrent build leaves an INVALID index and this changeset
+-- unmarked, and the next run must rebuild it, not skip it. The column additions are
+-- metadata-only (nullable, no default).
 alter table outbox add column if not exists claimed_until timestamp with time zone;
 alter table outbox add column if not exists lane varchar(16);
 alter table outbox add column if not exists ordering_key varchar(255) collate "C";
 
-create index if not exists ix_outbox_claimed_until on outbox (claimed_until) where claimed_until is not null and relayed_on is null;
-create index if not exists ix_outbox_ordered_claim on outbox (id) where (lane is null or lane <> 'CONCURRENT') and relayed_on is null and cancelled_on is null and parked_on is null;
-create index if not exists ix_outbox_concurrent_keyed on outbox (ordering_key, id) where lane = 'CONCURRENT' and ordering_key is not null and relayed_on is null and cancelled_on is null and parked_on is null;
-create index if not exists ix_outbox_concurrent_unkeyed on outbox (id) where lane = 'CONCURRENT' and ordering_key is null and relayed_on is null and cancelled_on is null and parked_on is null;
+drop index concurrently if exists ix_outbox_claimed_until;
+create index concurrently ix_outbox_claimed_until on outbox (claimed_until) where claimed_until is not null and relayed_on is null;
+drop index concurrently if exists ix_outbox_ordered_claim;
+create index concurrently ix_outbox_ordered_claim on outbox (id) where (lane is null or lane <> 'CONCURRENT') and relayed_on is null and cancelled_on is null and parked_on is null;
+drop index concurrently if exists ix_outbox_concurrent_keyed;
+create index concurrently ix_outbox_concurrent_keyed on outbox (ordering_key, id) where lane = 'CONCURRENT' and ordering_key is not null and relayed_on is null and cancelled_on is null and parked_on is null;
+drop index concurrently if exists ix_outbox_concurrent_unkeyed;
+create index concurrently ix_outbox_concurrent_unkeyed on outbox (id) where lane = 'CONCURRENT' and ordering_key is null and relayed_on is null and cancelled_on is null and parked_on is null;
 
 comment on column outbox.claimed_until is 'The relay''s lease (1.3.0): stamped now + lease by the claim (next_attempt_on moves with it), cleared by the booking. Future = in flight (not claimable); past = lapsed, claimable again - the late holder''s booking is guarded on the stamped value and books nothing.';
 comment on column outbox.lane is 'The relay lane the row''s publisher named at append (1.3.0), frozen: ORDERED (single relay thread, id order) or CONCURRENT (parallel, keyed). Null = written before 1.3.0 or not through the library writer - rides ORDERED.';
@@ -138,10 +147,10 @@ comment on index ix_outbox_claimed_until is 'Partial index over leased unrelayed
 comment on index ix_outbox_ordered_claim is 'The ORDERED lane''s claim: claimable-candidate rows of that lane only, in id order.';
 comment on index ix_outbox_concurrent_keyed is 'The CONCURRENT lane''s claim, keyed rows: skip-scanned key by key, one head probe per key not in flight.';
 comment on index ix_outbox_concurrent_unkeyed is 'The CONCURRENT lane''s claim, rows without an ordering key, in id order.';
---rollback drop index if exists ix_outbox_concurrent_unkeyed;
---rollback drop index if exists ix_outbox_concurrent_keyed;
---rollback drop index if exists ix_outbox_ordered_claim;
---rollback drop index if exists ix_outbox_claimed_until;
+--rollback drop index concurrently if exists ix_outbox_concurrent_unkeyed;
+--rollback drop index concurrently if exists ix_outbox_concurrent_keyed;
+--rollback drop index concurrently if exists ix_outbox_ordered_claim;
+--rollback drop index concurrently if exists ix_outbox_claimed_until;
 --rollback alter table outbox drop column if exists ordering_key;
 --rollback alter table outbox drop column if exists lane;
 --rollback alter table outbox drop column if exists claimed_until;
