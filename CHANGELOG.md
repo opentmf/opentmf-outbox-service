@@ -115,7 +115,21 @@ the batch's row locks were held across every backend call.
   - Its cost is bounded by those slots plus the keys stepped over. It does not
     grow with the table or with one key's backlog: 0.5–1.3 ms with 5,000,000
     relayed rows, including a 100,000-row one-key backlog and 10,000 keys.
-  - `OutboxClaimPlanIT` pins the plan shape and the buffer count.
+  - Two statement texts: the first pass with a plain lower key bound, and a
+    wrap-around pass with a plain upper bound. No parameter-dependent `OR`.
+    The in-flight keys are an array tested with `<> all(...)`, not a join.
+    So the shape holds under a custom and a generic plan alike; the library
+    never sets `plan_cache_mode`.
+  - The locked row is re-checked against the WHOLE eligibility predicate
+    (hold and due legs included). A row another pod booked into backoff
+    since the snapshot is not taken again.
+  - `ordering_key` is `collate "C"`, so the database's key order and the
+    relay's cursor order agree.
+  - `OutboxClaimPlanIT` pins the plan shape, filter-free key scans and the
+    buffer count under both plan modes.
+  - What still grows with the data: rows that are pending but not yet due
+    (held or in backoff) on the claim's lane, about 17–18 ms per 100,000.
+    The README states it.
 - The relay's nudges coalesce, and a freed CONCURRENT slot nudges the relay.
 - The ITs run twice over the lane: on JDK 17 (platform threads) and, for
   `OutboxHttpLaneVirtualIT`, in a failsafe execution forked on a JDK 21+

@@ -224,8 +224,21 @@ sequenceDiagram
     table, with the lane's backlog, or with one key's backlog.
   - Measured with 5,000,000 relayed rows (`EXPLAIN (ANALYZE, BUFFERS)`):
     idle 0.5 ms; 100,000 pending rows of one key, in flight 1.0 ms, not in
-    flight 0.9 ms; 10,000 keys × 10 rows 1.3 ms. `OutboxClaimPlanIT` pins
-    the shape.
+    flight 0.9 ms; 10,000 keys × 10 rows 1.3 ms. The same under a custom and
+    a generic plan: the statements carry no parameter-dependent `OR` and no
+    join the planner could turn into a full read. `OutboxClaimPlanIT` pins
+    the shape under both plan modes.
+  - **What does grow: rows that are pending but not yet due**, on the claim's
+    own lane. Held rows (`release_at` in the future) and rows in backoff are
+    stepped over on every pass: about **17–18 ms per 100,000 such rows**
+    (ORDERED: 100 due rows behind 100,000 held, 17.9 ms; CONCURRENT: 100,000
+    unkeyed rows in backoff, 17.1 ms). A key whose rows are all in backoff or
+    held costs a step too, plus a walk over its not-due rows: 10,000 keys ×
+    10 rows all in backoff cost 376 ms per pass (about 38 µs per key). The
+    released 1.2.x claim paid more for the same rows (it read the whole
+    pending set). A consumer that keeps very large scheduled sets, or a
+    receiver whose rows all sit in backoff (a dead subscriber), should know
+    it; suspending or dropping such a receiver's rows bounds the cost.
   - Keys are served round-robin, so across keys the claim order follows the
     cursor, not `id`. The library promises no order between keys.
 - **The claim moves `next_attempt_on` to the lease end**, and every booking

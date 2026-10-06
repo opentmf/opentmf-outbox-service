@@ -158,12 +158,11 @@ class OutboxRelayWorker {
    */
   private void claimConcurrent(OffsetDateTime now, List<Leased> concurrent) {
     int free = lane.available();
-    List<OutboxEvent> rows =
-        new ArrayList<>(repository.claimConcurrent(now, keyCursor, null, free, free));
+    List<OutboxEvent> rows = new ArrayList<>(repository.claimConcurrent(now, keyCursor, free));
     String lastKey = lastKey(rows);
     if (rows.size() < free && !keyCursor.isEmpty()) {
       List<OutboxEvent> wrapped =
-          repository.claimConcurrent(now, "", keyCursor, free - rows.size(), 0);
+          repository.claimConcurrentWrap(now, keyCursor, free - rows.size());
       String wrappedLast = lastKey(wrapped);
       lastKey = wrappedLast != null ? wrappedLast : lastKey;
       rows.addAll(wrapped);
@@ -179,6 +178,11 @@ class OutboxRelayWorker {
     }
   }
 
+  /**
+   * The highest key claimed - in Java {@link String} order, which is the database's key order
+   * because {@code ordering_key} is {@code collate "C"} (byte order; the two differ only for
+   * supplementary characters, a fairness skew at worst - every key is still reached).
+   */
   private static String lastKey(List<OutboxEvent> rows) {
     return rows.stream()
         .map(OutboxEvent::getOrderingKey)

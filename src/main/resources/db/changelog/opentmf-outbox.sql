@@ -114,15 +114,17 @@ comment on index ix_outbox_pending is 'Partial index over claimable-candidate ro
 -- lane / ordering_key - what the row's publisher said at APPEND, frozen like headers: ORDERED
 -- (or null: a row written before 1.3.0, or not through the library's writer) rides the single
 -- relay thread in id order; CONCURRENT rides the parallel lane, where rows sharing an
--- ordering_key are never in flight together. Each lane claims over its own partial indexes, so
--- neither ever reads through the other's backlog, and no claim reads the relayed rows: the
+-- ordering_key are never in flight together. ordering_key is collate "C" (byte order): the
+-- claim's round-robin cursor compares keys the way the relay does, and the comparisons are
+-- cheap. Each lane claims over its own partial indexes, so neither ever reads through the
+-- other's backlog, and no claim reads the relayed rows: the
 -- ORDERED claim walks ix_outbox_ordered_claim in id order; the CONCURRENT claim reads the
 -- in-flight keys through ix_outbox_claimed_until, skips from key to key through
 -- ix_outbox_concurrent_keyed (one probe per key not in flight - never one per pending row),
 -- and walks ix_outbox_concurrent_unkeyed for rows without a key.
 alter table outbox add column if not exists claimed_until timestamp with time zone;
 alter table outbox add column if not exists lane varchar(16);
-alter table outbox add column if not exists ordering_key varchar(255);
+alter table outbox add column if not exists ordering_key varchar(255) collate "C";
 
 create index if not exists ix_outbox_claimed_until on outbox (claimed_until) where claimed_until is not null and relayed_on is null;
 create index if not exists ix_outbox_ordered_claim on outbox (id) where (lane is null or lane <> 'CONCURRENT') and relayed_on is null and cancelled_on is null and parked_on is null;

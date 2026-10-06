@@ -51,26 +51,28 @@ public interface OutboxEventRepository
       @Param("now") OffsetDateTime now, @Param("concurrent") Lane concurrent, Limit limit);
 
   /**
-   * The CONCURRENT lane's claim ({@link OutboxClaimSql#CONCURRENT}): the same eligibility over
-   * rows stamped CONCURRENT, plus the ORDERING-KEY rule - a keyed row is claimable only as its
-   * key's first due row and only while no row of its key is in flight. So a key never has two
-   * rows in flight within a pod, and its rows go in {@code id} order on the happy path; a row in
-   * backoff lets later rows of its key pass, as before. Across pods the one exception: a
-   * backed-off row that comes due during another pod's claim of a later row of its key - order
-   * for that key was already given up when the row failed.
+   * The CONCURRENT lane's claim, first pass ({@link OutboxClaimSql#CONCURRENT}): the same
+   * eligibility over rows stamped CONCURRENT, plus the ORDERING-KEY rule - a keyed row is
+   * claimable only as its key's first due row and only while no row of its key is in flight. So
+   * a key never has two rows in flight within a pod, and its rows go in {@code id} order on the
+   * happy path; a row in backoff lets later rows of its key pass, as before. Across pods the one
+   * exception: a backed-off row that comes due during another pod's claim of a later row of its
+   * key - order for that key was already given up when the row failed.
    *
    * @param after the round-robin cursor: only keys above it ({@code ""} = from the first key)
-   * @param until upper key bound, inclusive ({@code null} = none) - the wrap-around pass
    * @param limit rows to claim at most (the free lane slots)
-   * @param unkeyedLimit rows WITHOUT a key to consider at most ({@code 0} on the wrap-around)
    */
   @Query(value = OutboxClaimSql.CONCURRENT, nativeQuery = true)
   List<OutboxEvent> claimConcurrent(
-      @Param("now") OffsetDateTime now,
-      @Param("after") String after,
-      @Param("until") String until,
-      @Param("limit") int limit,
-      @Param("unkeyedLimit") int unkeyedLimit);
+      @Param("now") OffsetDateTime now, @Param("after") String after, @Param("limit") int limit);
+
+  /**
+   * The CONCURRENT lane's wrap-around pass ({@link OutboxClaimSql#CONCURRENT_WRAP}): keyed rows
+   * only, keys from the first up to {@code until} (the cursor), by the same rules.
+   */
+  @Query(value = OutboxClaimSql.CONCURRENT_WRAP, nativeQuery = true)
+  List<OutboxEvent> claimConcurrentWrap(
+      @Param("now") OffsetDateTime now, @Param("until") String until, @Param("limit") int limit);
 
   /**
    * The LEASE GUARD: the row under a waiting {@code for update} lock, but only while it still

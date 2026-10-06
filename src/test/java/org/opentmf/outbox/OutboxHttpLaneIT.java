@@ -242,7 +242,7 @@ class OutboxHttpLaneIT {
   /**
    * Per-receiver order (the HTTP publisher keys on the destination): two rows to ONE slow
    * receiver arrive in id order and are never in flight together, while a row to ANOTHER
-   * receiver, appended after both, overtakes them.
+   * receiver, appended after both, overtakes the second of them.
    */
   @Test
   void rowsToOneReceiver_arriveInIdOrder_whileAnotherReceiverOvertakesThem() {
@@ -262,11 +262,14 @@ class OutboxHttpLaneIT {
                     List.of(first.getId(), second.getId(), other.getId()).stream()
                         .anyMatch(id -> arrival.endsWith(":outbox:" + id)))
             .toList();
-    assertThat(mine)
-        .containsExactly(
-            "keyed:outbox-lane-it:outbox:" + first.getId(),
-            "fast:outbox-lane-it:outbox:" + other.getId(),
-            "keyed:outbox-lane-it:outbox:" + second.getId());
+    String firstKeyed = "keyed:outbox-lane-it:outbox:" + first.getId();
+    String secondKeyed = "keyed:outbox-lane-it:outbox:" + second.getId();
+    String fast = "fast:outbox-lane-it:outbox:" + other.getId();
+    assertThat(mine).containsExactlyInAnyOrder(firstKeyed, secondKeyed, fast);
+    // one receiver: id order; the other receiver overtakes the second of them (whether it also
+    // beats the first depends on whether both went out in one claim - no cross-key order)
+    assertThat(mine.indexOf(firstKeyed)).isLessThan(mine.indexOf(secondKeyed));
+    assertThat(mine.indexOf(fast)).isLessThan(mine.indexOf(secondKeyed));
     assertThat(KEYED_MAX.get()).isEqualTo(1); // never two in flight to the one receiver
   }
 
