@@ -33,6 +33,11 @@ import org.springframework.transaction.annotation.Transactional;
 @RequiredArgsConstructor
 public class OutboxMaintenanceService {
 
+  /** The open ends of an unpark range: before any row was parked, after any will be. */
+  private static final OffsetDateTime OPEN_FROM = OffsetDateTime.parse("1970-01-01T00:00:00Z");
+
+  private static final OffsetDateTime OPEN_TO = OffsetDateTime.parse("9999-12-31T00:00:00Z");
+
   private final OutboxEventRepository repository;
   private final OutboxProperties properties;
   private final ApplicationEventPublisher eventPublisher;
@@ -43,35 +48,61 @@ public class OutboxMaintenanceService {
    * for both, cancelled rows being kept that long for audit. Parked (and held) rows are
    * structurally never pruned: both timestamps are null.
    *
-   * @return the number of rows deleted
+   * <p>Set-based and BOUNDED (1.3.0): batches of {@code opentmf.outbox.maintenance.batch-size}
+   * rows, each its own short transaction, deleted by id without loading a single entity, oldest
+   * first, until none are left or {@code opentmf.outbox.maintenance.time-budget} is spent - then
+   * the result says more remains and the caller calls again. Deliberately NOT one transaction:
+   * up to 1.2.1 the prune loaded every expired row as an entity in one transaction and, on a
+   * multi-million row table, never finished.
    */
-  @Transactional
+  public OutboxPruneResult pruneExpired() {
+    OffsetDateTime cutoff = OffsetDateTime.now(ZoneOffset.UTC).minus(properties.getRetention());
+    long deadline = System.nanoTime() + properties.getMaintenance().getTimeBudget().toNanos();
+    int batch = properties.getMaintenance().getBatchSize();
+    long relayed = 0;
+    long cancelled = 0;
+    boolean relayedLeft = true;
+    boolean cancelledLeft = true;
+    while ((relayedLeft || cancelledLeft) && System.nanoTime() < deadline) {
+      if (relayedLeft) {
+        int deleted = repository.deleteRelayedBatch(cutoff, batch);
+        relayed += deleted;
+        relayedLeft = deleted == batch;
+      } else {
+        int deleted = repository.deleteCancelledBatch(cutoff, batch);
+        cancelled += deleted;
+        cancelledLeft = deleted == batch;
+      }
+    }
+    OutboxPruneResult result =
+        new OutboxPruneResult(relayed, cancelled, relayedLeft || cancelledLeft);
+    if (result.pruned() > 0 || result.moreToPrune()) {
+      log.info(
+          "Pruned {} relayed and {} cancelled outbox rows older than {}{}",
+          relayed,
+          cancelled,
+          cutoff,
+          result.moreToPrune() ? " - more remain, the time budget is spent" : "");
+    }
+    return result;
+  }
+
+  /**
+   * One bounded prune call ({@link #pruneExpired()}), answering only the count; since 1.3.0 a
+   * call may leave expired rows for the next one.
+   *
+   * @return the number of rows deleted by this call
+   */
   public long prune() {
-    return doPrune();
+    return pruneExpired().pruned();
   }
 
   /**
    * The 1.0.0 name of {@link #prune()}, kept for source compatibility; since 1.1.0 it prunes
    * cancelled rows too (there is one retention for terminal rows).
    */
-  @Transactional
   public long pruneRelayed() {
-    return doPrune();
-  }
-
-  /** Un-annotated on purpose: both public names delegate here, never to each other. */
-  private long doPrune() {
-    OffsetDateTime cutoff = OffsetDateTime.now(ZoneOffset.UTC).minus(properties.getRetention());
-    long relayed = repository.deleteByRelayedOnBefore(cutoff);
-    long cancelled = repository.deleteByCancelledOnBefore(cutoff);
-    if (relayed + cancelled > 0) {
-      log.info(
-          "Pruned {} relayed and {} cancelled outbox rows older than {}",
-          relayed,
-          cancelled,
-          cutoff);
-    }
-    return relayed + cancelled;
+    return pruneExpired().pruned();
   }
 
   /**
@@ -124,6 +155,63 @@ public class OutboxMaintenanceService {
     event.setNextAttemptOn(OffsetDateTime.now(ZoneOffset.UTC));
     eventPublisher.publishEvent(new OutboxAppended(outboxId));
     log.info("Outbox row {} unparked - delivery will be retried", outboxId);
+  }
+
+  /**
+   * Unparks by FILTER - the bulk form of {@link #unpark(long)}, for the morning after a
+   * receiver's outage that outlasted its publisher's budget: every parked row of ONE destination
+   * whose {@code parked_on} lies within {@code [parkedFrom, parkedTo)}, optionally of one
+   * {@code reference}. Each row ends exactly as the single unpark leaves it ({@code parked_on}
+   * cleared, {@code attempts} reset, due now, {@code last_error} kept), under the same guard: a
+   * row an ops action or a booking holds is waited for and re-checked. The relay is nudged once.
+   *
+   * <p>Set-based and BOUNDED like {@link #pruneExpired()}: batches of
+   * {@code opentmf.outbox.maintenance.batch-size}, each its own short transaction, oldest parked
+   * first, until none match or {@code opentmf.outbox.maintenance.time-budget} is spent - then
+   * the result says more remain and the caller calls again. What the relay then SENDS stays
+   * bounded by the lanes: at most {@code concurrent.max-in-flight} CONCURRENT sends, at most
+   * {@code batch-size} ORDERED rows per pass. A parked row is never leased (only a booking parks
+   * a row, and that booking clears the lease), so no unparked row carries a live lease.
+   *
+   * @param destination REQUIRED - there is deliberately no "unpark everything"
+   * @param parkedFrom inclusive lower bound of {@code parked_on}, or {@code null} for none
+   * @param parkedTo exclusive upper bound of {@code parked_on}, or {@code null} for none
+   * @param reference only rows of this private correlation, or {@code null} for any
+   * @throws IllegalArgumentException when {@code destination} is missing or blank
+   */
+  public OutboxUnparkResult unpark(
+      String destination, OffsetDateTime parkedFrom, OffsetDateTime parkedTo, String reference) {
+    if (destination == null || destination.isBlank()) {
+      throw new IllegalArgumentException(
+          "An unpark by filter needs a destination - there is no unpark of everything");
+    }
+    // open ends as far bounds: one plain range in the SQL, never an OR on a parameter
+    OffsetDateTime from = parkedFrom != null ? parkedFrom : OPEN_FROM;
+    OffsetDateTime to = parkedTo != null ? parkedTo : OPEN_TO;
+    long deadline = System.nanoTime() + properties.getMaintenance().getTimeBudget().toNanos();
+    int batch = properties.getMaintenance().getBatchSize();
+    long unparked = 0;
+    boolean left = true;
+    while (left && System.nanoTime() < deadline) {
+      OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+      int done =
+          reference == null
+              ? repository.unparkBatch(now, destination, from, to, batch)
+              : repository.unparkBatchByReference(now, destination, from, to, reference, batch);
+      unparked += done;
+      left = done == batch;
+    }
+    if (unparked > 0) {
+      eventPublisher.publishEvent(new OutboxAppended(0)); // one nudge for the whole call
+    }
+    if (unparked > 0 || left) {
+      log.info(
+          "Outbox unpark by filter: {} row(s) to {} unparked{}",
+          unparked,
+          destination,
+          left ? " - more remain, the time budget is spent" : "");
+    }
+    return new OutboxUnparkResult(unparked, left);
   }
 
   private OutboxEvent lock(long outboxId) {

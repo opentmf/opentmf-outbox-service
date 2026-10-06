@@ -2,9 +2,17 @@ package org.opentmf.outbox.internal;
 
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * The outbox meter family under the LIBRARY-STABLE names ({@code opentmf.outbox.*}
@@ -12,8 +20,8 @@ import java.time.ZoneOffset;
  * common tags / scrape identity, never by a per-service metric prefix):
  *
  * <ul>
- *   <li>{@code opentmf.outbox.pending} - gauge, rows not yet relayed nor cancelled (held and
- *       in-flight rows included)
+ *   <li>{@code opentmf.outbox.pending} - gauge, rows not yet relayed nor cancelled (held, parked
+ *       and in-flight rows included)
  *   <li>{@code opentmf.outbox.in-flight} - gauge, pending rows under a live lease: claimed by a
  *       relay (any pod) whose send has not been booked yet (1.3.0)
  *   <li>{@code opentmf.outbox.parked} - gauge, alert when above 0
@@ -24,7 +32,16 @@ import java.time.ZoneOffset;
  *       publisher's DROP policy (never delivered, forensics kept)
  *   <li>{@code opentmf.outbox.attempts} - summary, delivery attempts a relayed row took
  * </ul>
+ *
+ * <p><strong>A scrape never touches the database (1.3.0).</strong> The gauges read the last
+ * SNAPSHOT, which a daemon thread ({@code opentmf-outbox-metrics}) refreshes every
+ * {@code opentmf.outbox.metrics-refresh} (default 15s; the first refresh runs at start). Up to
+ * 1.2.1 every scrape ran the three gauge queries and, on a multi-million-row table, one scrape
+ * outlasted the scrape timeout. Before the first refresh, and after a failed one, the gauges read
+ * NaN - "no value", never a misleading zero. {@code relay-lag} is computed at READ time from the
+ * oldest open row's instant, so it keeps growing between refreshes.
  */
+@Slf4j
 class OutboxMetrics {
 
   static final String PENDING = "opentmf.outbox.pending";
@@ -36,32 +53,78 @@ class OutboxMetrics {
   static final String ATTEMPTS = "opentmf.outbox.attempts";
   static final String TAG_DESTINATION = "destination";
 
+  /**
+   * The last values read from the database; {@code null} instant = no open row; {@code known}
+   * false = no successful refresh yet (or the last one failed): every gauge reads NaN.
+   */
+  record Snapshot(
+      boolean known, double pending, double parked, double inFlight, Instant openSince) {
+
+    static final Snapshot NONE = new Snapshot(false, Double.NaN, Double.NaN, Double.NaN, null);
+  }
+
   private final MeterRegistry registry;
   private final OutboxEventRepository repository;
+  private final Duration refreshEvery;
+  private final AtomicReference<Snapshot> snapshot = new AtomicReference<>(Snapshot.NONE);
+  private ScheduledExecutorService refresher;
 
-  OutboxMetrics(MeterRegistry registry, OutboxEventRepository repository) {
+  OutboxMetrics(MeterRegistry registry, OutboxEventRepository repository, Duration refreshEvery) {
     this.registry = registry;
     this.repository = repository;
-    Gauge.builder(
-            PENDING, repository, OutboxEventRepository::countByRelayedOnIsNullAndCancelledOnIsNull)
+    this.refreshEvery = refreshEvery;
+    Gauge.builder(PENDING, this, m -> m.snapshot.get().pending())
         .description("Outbox rows not yet relayed nor cancelled (pending, in-flight included)")
         .register(registry);
-    Gauge.builder(
-            PARKED,
-            repository,
-            OutboxEventRepository::countByRelayedOnIsNullAndCancelledOnIsNullAndParkedOnIsNotNull)
+    Gauge.builder(PARKED, this, m -> m.snapshot.get().parked())
         .description("Outbox rows parked (delivery budget exhausted) - alert when > 0")
         .register(registry);
-    Gauge.builder(
-            IN_FLIGHT,
-            repository,
-            r -> r.countInFlight(OffsetDateTime.now(ZoneOffset.UTC)))
+    Gauge.builder(IN_FLIGHT, this, m -> m.snapshot.get().inFlight())
         .description("Outbox rows claimed by a live lease whose send is not booked yet")
         .register(registry);
     Gauge.builder(RELAY_LAG, this, OutboxMetrics::relayLagSeconds)
         .baseUnit("seconds")
         .description("How long the oldest released pending outbox row has been deliverable")
         .register(registry);
+  }
+
+  /** Starts the refresher: the first refresh now, then every {@code metrics-refresh}. */
+  @PostConstruct
+  void start() {
+    refresher =
+        Executors.newSingleThreadScheduledExecutor(
+            runnable -> {
+              Thread thread = new Thread(runnable, "opentmf-outbox-metrics");
+              thread.setDaemon(true);
+              return thread;
+            });
+    refresher.scheduleWithFixedDelay(
+        this::refresh, 0, refreshEvery.toMillis(), TimeUnit.MILLISECONDS);
+  }
+
+  /** Stops the refresher. */
+  @PreDestroy
+  void stop() {
+    if (refresher != null) {
+      refresher.shutdownNow();
+    }
+  }
+
+  /**
+   * Re-reads the gauge values - four indexed queries over the OPEN rows only. A failure leaves
+   * NaN (no value) until the next refresh succeeds, and never reaches a scrape.
+   */
+  void refresh() {
+    try {
+      long parked = repository.countParked();
+      long pending = repository.countOpenNotParked() + parked;
+      long inFlight = repository.countInFlight(OffsetDateTime.now(ZoneOffset.UTC));
+      Instant openSince = repository.findOldestOpenSince().orElse(null);
+      snapshot.set(new Snapshot(true, pending, parked, inFlight, openSince));
+    } catch (RuntimeException ex) {
+      snapshot.set(Snapshot.NONE);
+      log.warn("Outbox gauges not refreshed - they read NaN until the next refresh", ex);
+    }
   }
 
   /** Books one DROP exhaustion: the per-destination dropped counter (never the relayed one). */
@@ -75,11 +138,19 @@ class OutboxMetrics {
     registry.summary(ATTEMPTS).record(attempts);
   }
 
+  /**
+   * Seconds since the oldest open row became deliverable, as of NOW (no database read); 0 when
+   * no open row is deliverable yet; NaN before the first refresh.
+   */
   double relayLagSeconds() {
-    OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-    return repository
-        .findOldestPendingSince(now)
-        .map(since -> Math.max(0d, Duration.between(since, now).toMillis() / 1000d))
-        .orElse(0d);
+    Snapshot last = snapshot.get();
+    if (!last.known()) {
+      return Double.NaN;
+    }
+    Instant since = last.openSince();
+    if (since == null) {
+      return 0d;
+    }
+    return Math.max(0d, Duration.between(since, Instant.now()).toMillis() / 1000d);
   }
 }

@@ -49,7 +49,9 @@ import org.springframework.transaction.support.TransactionTemplate;
       "spring.datasource.driver-class-name=org.testcontainers.jdbc.ContainerDatabaseDriver",
       "spring.liquibase.change-log=classpath:db/test-changelog-lease.xml",
       "spring.jpa.hibernate.ddl-auto=validate",
-      "opentmf.outbox.sweep-interval=1s"
+      "opentmf.outbox.sweep-interval=1s",
+      // the gauges follow quickly here: these tests read in-flight as their quiet signal
+      "opentmf.outbox.metrics-refresh=200ms"
     })
 class OutboxLeaseIT {
 

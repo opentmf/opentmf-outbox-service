@@ -53,7 +53,16 @@ class OutboxClaimPlanIT {
 
   /** The parameter types of the claim statements, by name. */
   private static final Map<String, String> TYPES =
-      Map.of("now", "timestamptz", "after", "varchar", "until", "varchar", "limit", "int");
+      Map.of(
+          "now", "timestamptz",
+          "after", "varchar",
+          "until", "varchar",
+          "limit", "int",
+          "cutoff", "timestamptz",
+          "destination", "varchar",
+          "parkedFrom", "timestamptz",
+          "parkedTo", "timestamptz",
+          "reference", "varchar");
 
   private static final List<String> PLAN_MODES = List.of("force_custom_plan", "force_generic_plan");
 
@@ -116,10 +125,11 @@ class OutboxClaimPlanIT {
       c.setAutoCommit(false);
       try {
         st.execute("set plan_cache_mode = " + planMode); // the measuring device, this session only
-        st.execute("prepare claim (" + types + ") as " + sql);
+        st.execute("prepare claim" + (names.isEmpty() ? "" : " (" + types + ")") + " as " + sql);
         try (ResultSet rs =
             st.executeQuery(
-                "explain (analyze, buffers, format json) execute claim (" + values + ")")) {
+                "explain (analyze, buffers, format json) execute claim"
+                    + (names.isEmpty() ? "" : " (" + values + ")"))) {
           rs.next();
           return new ObjectMapper().readTree(rs.getString(1)).get(0);
         }
@@ -234,7 +244,7 @@ class OutboxClaimPlanIT {
   }
 
   @Test
-  @Order(3)
+  @Order(4)
   void theSameBacklog_withItsKeyNotInFlight_claimsExactlyItsHead() throws Exception {
     execute(
         """
@@ -249,13 +259,13 @@ class OutboxClaimPlanIT {
    * of "hub:1" are pending - the bound is an index condition, so not one of them is read.
    */
   @Test
-  @Order(4)
+  @Order(5)
   void theWrapPass_neverReadsTheBacklogAboveTheCursor() throws Exception {
     assertThat(claimedUnderBothModes(mode -> explainWrap(mode, "hub:0"))).containsOnly(0L);
   }
 
   @Test
-  @Order(5)
+  @Order(6)
   void tenThousandKeysOfTenRows_fromAnyCursor() throws Exception {
     execute(
         "delete from outbox where relayed_on is null",
@@ -270,5 +280,132 @@ class OutboxClaimPlanIT {
     assertThat(claimedUnderBothModes(mode -> explainClaim(mode, "hub:k5000"))).containsOnly(8L);
     // the wrap: keys up to the cursor (string order - "hub:k1000" would bound it to five keys)
     assertThat(claimedUnderBothModes(mode -> explainWrap(mode, "hub:k5"))).containsOnly(8L);
+  }
+
+  // ------------------------------------------------------------ gauges and prune (F-1, F-2)
+
+  /**
+   * One statement under both plan modes: no sequential scan of {@code outbox}, and every index
+   * it reads is one of {@code allowed}. Returns the generic run's buffers and time, for the record.
+   */
+  private static String assertIndexedOnly(
+      String what, String statement, Map<String, String> args, List<String> allowed)
+      throws Exception {
+    StringBuilder figures = new StringBuilder(what);
+    for (String mode : PLAN_MODES) {
+      JsonNode explained = explain(statement, mode, args);
+      List<JsonNode> all = nodes(explained.get("Plan"), new ArrayList<>());
+      assertThat(all)
+          .as("%s, %s: no sequential scan of outbox", what, mode)
+          .noneMatch(
+              n ->
+                  n.get("Node Type").asString().equals("Seq Scan")
+                      && "outbox".equals(n.path("Relation Name").asString(null)));
+      assertThat(all)
+          .as("%s, %s: indexes read", what, mode)
+          .filteredOn(n -> n.has("Index Name"))
+          .extracting(n -> n.get("Index Name").asString())
+          .isNotEmpty()
+          .allMatch(allowed::contains);
+      JsonNode plan = explained.get("Plan");
+      figures.append(
+          " | %s %d buffers %.2f ms"
+              .formatted(
+                  mode.substring(6, 13),
+                  plan.get("Shared Hit Blocks").asLong()
+                      + plan.get("Shared Read Blocks").asLong(),
+                  explained.get("Execution Time").asDouble()));
+    }
+    System.out.println("PLAN-FIGURES: " + figures); // the PR's evidence
+    return figures.toString();
+  }
+
+  /** Each gauge statement may read exactly ITS partial index over the open rows - no other. */
+  private static void assertGaugesIndexedOnly(String state) throws Exception {
+    Map<String, String> now = Map.of("now", "now()");
+    assertIndexedOnly(
+        state + " open-not-parked",
+        OutboxGaugeSql.OPEN_NOT_PARKED,
+        now,
+        List.of("ix_outbox_pending"));
+    assertIndexedOnly(state + " parked", OutboxGaugeSql.PARKED, now, List.of("ix_outbox_parked"));
+    assertIndexedOnly(
+        state + " open-since", OutboxGaugeSql.OPEN_SINCE, now, List.of("ix_outbox_open_since"));
+    assertIndexedOnly(
+        state + " in-flight", OutboxGaugeSql.IN_FLIGHT, now, List.of("ix_outbox_claimed_until"));
+  }
+
+  /** The gauges over a million relayed rows and nothing open: none reads the relayed history. */
+  @Test
+  @Order(0)
+  void theGauges_idle_neverReadTheRelayedRows() throws Exception {
+    assertGaugesIndexedOnly("idle");
+  }
+
+  /**
+   * The gauges with a 100,000-row PENDING backlog (one key, its head in flight): still no
+   * sequential scan; their cost grows with the open rows only - the figures are printed.
+   */
+  @Test
+  @Order(3)
+  void theGauges_withA100kPendingBacklog_readOnlyTheOpenRows() throws Exception {
+    // the data of the case before: 100,000 pending rows of one key, its head in flight
+    assertGaugesIndexedOnly("100k-pending");
+  }
+
+  /**
+   * The prune's batch delete over a million relayed rows - all of them expired for this
+   * statement (cutoff now): the oldest batch is found through {@code ix_outbox_relayed_on} and
+   * deleted by primary key, never a sequential scan; the cancelled leg likewise.
+   */
+  @Test
+  @Order(10)
+  void thePruneBatch_findsItsRowsByIndex_andDeletesByPrimaryKey() throws Exception {
+    Map<String, String> args = Map.of("cutoff", "now()", "limit", "5000");
+    assertIndexedOnly(
+        "prune relayed batch",
+        OutboxPruneSql.RELAYED,
+        args,
+        List.of("ix_outbox_relayed_on", "outbox_pkey"));
+    assertIndexedOnly(
+        "prune cancelled batch",
+        OutboxPruneSql.CANCELLED,
+        args,
+        List.of("ix_outbox_cancelled_on", "outbox_pkey"));
+  }
+
+  /**
+   * The unpark by filter over a million relayed rows: the parked rows of one destination within a
+   * range are found through {@code ix_outbox_parked} and updated by primary key - never a
+   * sequential scan; the narrower by-reference statement likewise.
+   */
+  @Test
+  @Order(11)
+  void theUnparkBatch_findsItsRowsByIndex_andUpdatesByPrimaryKey() throws Exception {
+    execute(
+        """
+        insert into outbox (aggregate_type, aggregate_id, event_type, destination, payload,
+          created_on, attempts, next_attempt_on, parked_on, reference, lane)
+        select 't', 'a', 'e', 'hub:' || (g % 3), '{}', now(), 10, now(),
+          now() - interval '1 hour', 'sub-' || (g % 7), 'CONCURRENT'
+        from generate_series(1, 3000) g""");
+    Map<String, String> args =
+        Map.of(
+            "now", "now()",
+            "destination", "'hub:1'",
+            "parkedFrom", "now() - interval '2 hours'",
+            "parkedTo", "now()",
+            "limit", "500",
+            "reference", "'sub-3'");
+    assertIndexedOnly(
+        "unpark batch",
+        OutboxUnparkSql.BY_DESTINATION,
+        args,
+        List.of("ix_outbox_parked", "outbox_pkey"));
+    assertIndexedOnly(
+        "unpark batch by reference",
+        OutboxUnparkSql.BY_REFERENCE,
+        args,
+        List.of("ix_outbox_parked", "outbox_pkey"));
   }
 }

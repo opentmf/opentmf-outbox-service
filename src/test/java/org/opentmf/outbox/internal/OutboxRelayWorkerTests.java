@@ -101,7 +101,7 @@ class OutboxRelayWorkerTests {
           repository,
           new OutboxPublisherRouter(List.of(publisher)),
           new OutboxBackoff(properties),
-          new OutboxMetrics(registry, repository),
+          new OutboxMetrics(registry, repository, Duration.ofSeconds(15)),
           properties,
           listeners,
           tx,

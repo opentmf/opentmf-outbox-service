@@ -66,6 +66,16 @@ public class OutboxProperties {
    */
   @NotNull private Duration shutdownGrace = Duration.ofSeconds(10);
 
+  /**
+   * How often the gauges (pending, parked, in-flight, relay-lag) are re-read from the database. A
+   * scrape reads the last values and never waits on the database; relay-lag is computed at read
+   * time from the oldest open row's instant, so it keeps growing between refreshes. Default 15s.
+   */
+  @NotNull private Duration metricsRefresh = Duration.ofSeconds(15);
+
+  /** The bounded bulk operations: prune, unpark by filter ({@code opentmf.outbox.maintenance}). */
+  @Valid private final Maintenance maintenance = new Maintenance();
+
   /** The ORDERED lane ({@code opentmf.outbox.ordered.*}). */
   @Valid private final Ordered ordered = new Ordered();
 
@@ -93,6 +103,21 @@ public class OutboxProperties {
      * {@code send-timeout}. Default 15s.
      */
     @NotNull private Duration lease = Duration.ofSeconds(15);
+  }
+
+  /** The bounded bulk operations' settings (the prune, the unpark by filter). */
+  @Getter
+  @Setter
+  public static class Maintenance {
+
+    /** Rows per batch - each batch is its own short transaction. Default 5000. */
+    @Positive private int batchSize = 5_000;
+
+    /**
+     * How long one call keeps working through batches before it answers; a call that stops on
+     * the budget says more remains, and the caller calls again. Default 10s.
+     */
+    @NotNull private Duration timeBudget = Duration.ofSeconds(10);
   }
 
   /** The CONCURRENT lane's settings. */

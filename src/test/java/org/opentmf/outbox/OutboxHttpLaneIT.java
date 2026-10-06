@@ -56,7 +56,9 @@ import org.testcontainers.kafka.KafkaContainer;
       "spring.jpa.hibernate.ddl-auto=validate",
       "spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer",
       "spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer",
-      "opentmf.outbox.sweep-interval=1h"
+      "opentmf.outbox.sweep-interval=1h",
+      // the gauges follow quickly here: these tests read in-flight as their quiet signal
+      "opentmf.outbox.metrics-refresh=200ms"
     })
 class OutboxHttpLaneIT {
 
@@ -221,7 +223,8 @@ class OutboxHttpLaneIT {
     assertThat(inFlight.relayedOn()).isNull(); // still answering...
     assertThat(inFlight.inFlight()).isTrue(); // ...and visibly so
     assertThat(inFlight.claimedUntil()).isNotNull();
-    assertThat(inFlightGauge()).isEqualTo(1d);
+    // the gauge is a refreshed snapshot (200 ms here): it settles on the one row still in flight
+    await().atMost(Duration.ofSeconds(2)).until(() -> inFlightGauge() == 1d);
     assertThat(registry.get("opentmf.outbox.pending").gauge().value()).isGreaterThanOrEqualTo(1d);
 
     // the pool, read through JMX (no connection taken to read it), polled over 3 s of the send

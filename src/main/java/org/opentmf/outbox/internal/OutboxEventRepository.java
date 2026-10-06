@@ -2,6 +2,7 @@ package org.opentmf.outbox.internal;
 
 import jakarta.persistence.LockModeType;
 import jakarta.persistence.QueryHint;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
@@ -13,10 +14,12 @@ import org.opentmf.outbox.OutboxWriter;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.querydsl.QuerydslPredicateExecutor;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Transactional;
 
 /**
  * Repository for {@link OutboxEvent}. Accessed only by the library itself (writer, relay,
@@ -83,13 +86,6 @@ public interface OutboxEventRepository
   @Query("select e from OutboxEvent e where e.id = :id and e.claimedUntil = :stamp")
   Optional<OutboxEvent> lockLeased(@Param("id") long id, @Param("stamp") OffsetDateTime stamp);
 
-  /** Pending rows under a live lease - backs the {@code in-flight} gauge. */
-  @Query(
-      """
-      select count(e) from OutboxEvent e
-      where e.relayedOn is null and e.cancelledOn is null and e.claimedUntil > :now""")
-  long countInFlight(@Param("now") OffsetDateTime now);
-
   /**
    * One row under a WAITING {@code for update} lock (no SKIP LOCKED, no timeout hint) - the
    * ops actions (cancel, unpark) read through this so they serialize against a relay claim in
@@ -102,32 +98,67 @@ public interface OutboxEventRepository
   @Query("select e from OutboxEvent e where e.id = :id")
   Optional<OutboxEvent> lockById(@Param("id") long id);
 
-  /** Pending rows (derived state: not relayed, not cancelled) — backs the {@code pending} gauge. */
-  long countByRelayedOnIsNullAndCancelledOnIsNull();
+  /** Open rows that are not parked (pending minus parked) - half of the {@code pending} gauge. */
+  @Query(value = OutboxGaugeSql.OPEN_NOT_PARKED, nativeQuery = true)
+  long countOpenNotParked();
 
-  /** Parked rows (pending AND {@code parked_on} stamped) — backs the {@code parked} gauge. */
-  long countByRelayedOnIsNullAndCancelledOnIsNullAndParkedOnIsNotNull();
-
-  /**
-   * The instant the oldest RELEASED pending row became deliverable — {@code created_on}, or
-   * the hold if that came later — backs the {@code relay-lag} gauge. Held (future
-   * {@code release_at}) and cancelled rows are not lagging and do not count.
-   */
-  @Query(
-      """
-      select min(case when e.releaseAt > e.createdOn then e.releaseAt else e.createdOn end)
-      from OutboxEvent e
-      where e.relayedOn is null and e.cancelledOn is null
-        and (e.releaseAt is null or e.releaseAt <= :now)""")
-  Optional<OffsetDateTime> findOldestPendingSince(@Param("now") OffsetDateTime now);
+  /** Parked rows - the {@code parked} gauge, and the other half of {@code pending}. */
+  @Query(value = OutboxGaugeSql.PARKED, nativeQuery = true)
+  long countParked();
 
   /**
-   * Retention pruning: deletes rows relayed before the cutoff. Parked rows have
-   * {@code relayed_on is null}, so they structurally never match — parked rows are NEVER
-   * pruned automatically.
+   * The instant the oldest open row became deliverable - {@code created_on}, or its hold if that
+   * came later; a held row's instant lies in the future - backs the {@code relay-lag} gauge.
    */
-  long deleteByRelayedOnBefore(OffsetDateTime cutoff);
+  @Query(value = OutboxGaugeSql.OPEN_SINCE, nativeQuery = true)
+  Optional<Instant> findOldestOpenSince(); // a native timestamptz scalar comes back as Instant
 
-  /** Retention pruning of the other terminal state: cancelled rows past the cutoff. */
-  long deleteByCancelledOnBefore(OffsetDateTime cutoff);
+  /** Open rows under a live lease - the {@code in-flight} gauge. */
+  @Query(value = OutboxGaugeSql.IN_FLIGHT, nativeQuery = true)
+  long countInFlight(@Param("now") OffsetDateTime now);
+
+  /**
+   * Retention prune, one BATCH of relayed rows older than the cutoff, in its own transaction.
+   * Parked rows have {@code relayed_on is null}, so they structurally never match.
+   *
+   * @return the rows deleted - fewer than {@code limit} means none are left
+   */
+  @Modifying
+  @Transactional
+  @Query(value = OutboxPruneSql.RELAYED, nativeQuery = true)
+  int deleteRelayedBatch(@Param("cutoff") OffsetDateTime cutoff, @Param("limit") int limit);
+
+  /** Retention prune of the other terminal state: one batch of cancelled rows. */
+  @Modifying
+  @Transactional
+  @Query(value = OutboxPruneSql.CANCELLED, nativeQuery = true)
+  int deleteCancelledBatch(@Param("cutoff") OffsetDateTime cutoff, @Param("limit") int limit);
+
+  /**
+   * Unpark by filter, one BATCH: one destination's parked rows within the parked-on range, oldest
+   * parked first, each left as the single unpark leaves it.
+   *
+   * @return the rows unparked - fewer than {@code limit} means none are left
+   */
+  @Modifying
+  @Transactional
+  @Query(value = OutboxUnparkSql.BY_DESTINATION, nativeQuery = true)
+  int unparkBatch(
+      @Param("now") OffsetDateTime now,
+      @Param("destination") String destination,
+      @Param("parkedFrom") OffsetDateTime parkedFrom,
+      @Param("parkedTo") OffsetDateTime parkedTo,
+      @Param("limit") int limit);
+
+  /** The same, narrowed to one {@code reference}. */
+  @Modifying
+  @Transactional
+  @Query(value = OutboxUnparkSql.BY_REFERENCE, nativeQuery = true)
+  int unparkBatchByReference(
+      @Param("now") OffsetDateTime now,
+      @Param("destination") String destination,
+      @Param("parkedFrom") OffsetDateTime parkedFrom,
+      @Param("parkedTo") OffsetDateTime parkedTo,
+      @Param("reference") String reference,
+      @Param("limit") int limit);
 }
