@@ -7,6 +7,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
@@ -132,6 +133,11 @@ class OutboxRelayWorkerTests {
             inv ->
                 claimConcurrent(
                     inv.getArgument(0), "", inv.getArgument(1), inv.getArgument(2), false));
+    // the cross-pod guard: every key lock is free, the re-check keeps every candidate - unless a
+    // test says otherwise
+    when(repository.tryLockKey(anyInt(), any())).thenReturn(true);
+    when(repository.recheckKeyedHeads(any(), any()))
+        .thenAnswer(inv -> idsOf(inv.getArgument(1)));
     when(repository.lockLeased(anyLong(), any()))
         .thenAnswer(
             inv -> {
@@ -155,6 +161,14 @@ class OutboxRelayWorkerTests {
   @AfterEach
   void closeLane() {
     lane.close();
+  }
+
+  /** The ids of a PostgreSQL array literal such as {@code {7,12}}. */
+  private static List<Long> idsOf(String literal) {
+    String inner = literal.substring(1, literal.length() - 1);
+    return inner.isEmpty()
+        ? List.of()
+        : Stream.of(inner.split(",")).map(Long::valueOf).toList();
   }
 
   private static boolean claimable(OutboxEvent e, OffsetDateTime now) {
@@ -982,6 +996,48 @@ class OutboxRelayWorkerTests {
 
     assertThat(lane.available()).isEqualTo(2);
     assertThat(ordered.getRelayedOn()).isNotNull();
+  }
+
+  @Test
+  void aKeyAnotherPodIsClaiming_isSkippedThisPass_unkeyedRowsGoOn() {
+    OutboxEvent keyed = concurrent(1L, "receiver-a");
+    OutboxEvent unkeyed = concurrent(2L, null);
+    when(repository.tryLockKey(OutboxClaimSql.KEY_LOCK_NAMESPACE, "receiver-a")).thenReturn(false);
+
+    assertThat(relay()).isEqualTo(1);
+
+    assertThat(keyed.getClaimedUntil()).isNull(); // not stamped: left for the next pass
+    assertThat(unkeyed.getRelayedOn()).isNotNull();
+    verify(repository, never()).recheckKeyedHeads(any(), any()); // nothing keyed to re-check
+  }
+
+  @Test
+  void aLockedKeysCandidate_thatTheReCheckDrops_isNotClaimed() {
+    OutboxEvent keyed = concurrent(1L, "receiver-a");
+    doReturn(List.of()).when(repository).recheckKeyedHeads(any(), any()); // in flight by now
+
+    assertThat(relay()).isZero();
+
+    assertThat(keyed.getClaimedUntil()).isNull();
+    verify(repository).recheckKeyedHeads(any(), eq("{1}"));
+  }
+
+  @Test
+  void eachKeyIsLockedOnce_andTheReCheckSeesEveryLockedCandidate() {
+    concurrent(1L, "receiver-a");
+    concurrent(2L, "receiver-b");
+    concurrent(3L, null);
+    // two passes' worth in one: the first pass's candidates, then the wrap's - same key twice
+    doAnswer(inv -> List.of(table.get(1L), table.get(2L), table.get(3L)))
+        .when(repository)
+        .claimConcurrent(any(), any(), anyInt());
+
+    relay();
+
+    verify(repository, times(1)).tryLockKey(OutboxClaimSql.KEY_LOCK_NAMESPACE, "receiver-a");
+    verify(repository, times(1)).tryLockKey(OutboxClaimSql.KEY_LOCK_NAMESPACE, "receiver-b");
+    verify(repository, never()).tryLockKey(anyInt(), isNull());
+    verify(repository).recheckKeyedHeads(any(), eq("{1,2}"));
   }
 
   @Test

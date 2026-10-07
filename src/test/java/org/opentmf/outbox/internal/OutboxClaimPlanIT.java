@@ -53,16 +53,19 @@ class OutboxClaimPlanIT {
 
   /** The parameter types of the claim statements, by name. */
   private static final Map<String, String> TYPES =
-      Map.of(
-          "now", "timestamptz",
-          "after", "varchar",
-          "until", "varchar",
-          "limit", "int",
-          "cutoff", "timestamptz",
-          "destination", "varchar",
-          "parkedFrom", "timestamptz",
-          "parkedTo", "timestamptz",
-          "reference", "varchar");
+      Map.ofEntries(
+          Map.entry("now", "timestamptz"),
+          Map.entry("after", "varchar"),
+          Map.entry("until", "varchar"),
+          Map.entry("limit", "int"),
+          Map.entry("cutoff", "timestamptz"),
+          Map.entry("destination", "varchar"),
+          Map.entry("parkedFrom", "timestamptz"),
+          Map.entry("parkedTo", "timestamptz"),
+          Map.entry("reference", "varchar"),
+          Map.entry("namespace", "int"),
+          Map.entry("key", "varchar"),
+          Map.entry("ids", "varchar"));
 
   private static final List<String> PLAN_MODES = List.of("force_custom_plan", "force_generic_plan");
 
@@ -407,5 +410,59 @@ class OutboxClaimPlanIT {
         OutboxUnparkSql.BY_REFERENCE,
         args,
         List.of("ix_outbox_parked", "outbox_pkey"));
+  }
+
+  // ------------------------------------------------------------ the cross-pod key lock
+
+  /**
+   * The cross-pod guard's two extra statements, on the 10,000-key data with one key's head in
+   * flight: the RE-CHECK of a full claim's candidates reads the primary key and the two key-side
+   * indexes - never a sequential scan - under both plan modes; the KEY LOCK is a function call
+   * that reads nothing. Their cost per claim is printed (the claim statements themselves are
+   * unchanged, so their pins above stand as they are).
+   */
+  @Test
+  @Order(7)
+  void theCrossPodGuard_readsByIndexOnly_andCostsLittle() throws Exception {
+    execute(
+        """
+        update outbox set claimed_until = now() + interval '2 minutes',
+          next_attempt_on = now() + interval '2 minutes'
+        where id = (select min(id) from outbox where ordering_key = 'hub:k1'
+          and relayed_on is null)""");
+    String ids;
+    try (Connection c = connect();
+        Statement st = c.createStatement();
+        ResultSet rs =
+            st.executeQuery(
+                "select '{' || string_agg(id::text, ',') || '}' from (select min(id) id"
+                    + " from outbox where relayed_on is null and lane = 'CONCURRENT'"
+                    + " group by ordering_key order by ordering_key limit 8) h")) {
+      rs.next();
+      ids = rs.getString(1);
+    }
+    assertIndexedOnly(
+        "cross-pod re-check of 8 candidates",
+        OutboxClaimSql.RECHECK,
+        Map.of("now", "now()", "ids", "'" + ids + "'"),
+        List.of("outbox_pkey", "ix_outbox_claimed_until", "ix_outbox_concurrent_keyed"));
+    for (String mode : PLAN_MODES) {
+      JsonNode lock =
+          explain(
+              OutboxClaimSql.KEY_LOCK,
+              mode,
+              Map.of(
+                  "namespace", String.valueOf(OutboxClaimSql.KEY_LOCK_NAMESPACE),
+                  "key", "'hub:k2'"));
+      JsonNode plan = lock.get("Plan");
+      assertThat(nodes(plan, new ArrayList<>()))
+          .noneMatch(n -> "outbox".equals(n.path("Relation Name").asString(null)));
+      System.out.println(
+          "PLAN-FIGURES: key lock | %s %d buffers %.3f ms"
+              .formatted(
+                  mode,
+                  plan.get("Shared Hit Blocks").asLong() + plan.get("Shared Read Blocks").asLong(),
+                  lock.get("Execution Time").asDouble()));
+    }
   }
 }

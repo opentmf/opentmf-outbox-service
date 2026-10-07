@@ -64,11 +64,12 @@ public interface OutboxEventRepository
   /**
    * The CONCURRENT lane's claim, first pass ({@link OutboxClaimSql#CONCURRENT}): the same
    * eligibility over rows stamped CONCURRENT, plus the ORDERING-KEY rule - a keyed row is
-   * claimable only as its key's first due row and only while no row of its key is in flight. So
-   * a key never has two rows in flight within a pod, and its rows go in {@code id} order on the
-   * happy path; a row in backoff lets later rows of its key pass, as before. Across pods the one
-   * exception: a backed-off row that comes due during another pod's claim of a later row of its
-   * key - order for that key was already given up when the row failed.
+   * claimable only as its key's first due row and only while no row of its key is in flight, and
+   * its rows go in {@code id} order on the happy path; a row in backoff lets later rows of its
+   * key pass, as before. These rows are CANDIDATES: across pods the worker then takes each key's
+   * advisory lock ({@link #tryLockKey}) and re-checks them in a new snapshot
+   * ({@link #recheckKeyedHeads}), so a key never has two rows in flight, within a pod or across
+   * pods.
    *
    * @param after the round-robin cursor: only keys above it ({@code ""} = from the first key)
    * @param limit rows to claim at most (the free lane slots)
@@ -84,6 +85,24 @@ public interface OutboxEventRepository
   @Query(value = OutboxClaimSql.CONCURRENT_WRAP, nativeQuery = true)
   List<OutboxEvent> claimConcurrentWrap(
       @Param("now") OffsetDateTime now, @Param("until") String until, @Param("limit") int limit);
+
+  /**
+   * Takes - never waits for - the claim transaction's advisory lock of one ordering key
+   * ({@link OutboxClaimSql#KEY_LOCK}).
+   *
+   * @return whether the lock was taken; {@code false} = another pod is claiming the key now
+   */
+  @Query(value = OutboxClaimSql.KEY_LOCK, nativeQuery = true)
+  boolean tryLockKey(@Param("namespace") int namespace, @Param("key") String key);
+
+  /**
+   * Of the keyed candidates, those still claimable as their key's head with nothing of their key
+   * in flight - in a NEW snapshot, after the key locks ({@link OutboxClaimSql#RECHECK}).
+   *
+   * @param ids the candidates as a PostgreSQL array literal, e.g. {@code {7,12}}
+   */
+  @Query(value = OutboxClaimSql.RECHECK, nativeQuery = true)
+  List<Long> recheckKeyedHeads(@Param("now") OffsetDateTime now, @Param("ids") String ids);
 
   /**
    * The LEASE GUARD: the row under a waiting {@code for update} lock, but only while it still

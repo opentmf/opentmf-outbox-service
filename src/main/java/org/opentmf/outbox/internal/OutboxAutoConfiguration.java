@@ -24,6 +24,7 @@ import org.springframework.core.annotation.Order;
 import org.springframework.core.env.Environment;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.client.RestClient;
 import tools.jackson.databind.ObjectMapper;
@@ -123,8 +124,20 @@ public class OutboxAutoConfiguration {
         metrics,
         properties,
         relayedListeners.orderedStream().toList(),
-        new TransactionTemplate(transactionManager),
+        relayTransactions(transactionManager),
         lane);
+  }
+
+  /**
+   * The relay's short claim and booking transactions, READ COMMITTED whatever the application's
+   * default: the CONCURRENT claim's re-check must see, in a NEW snapshot, the leases another pod
+   * committed before releasing a key's advisory lock - under REPEATABLE READ the transaction's
+   * first snapshot would hide them.
+   */
+  static TransactionTemplate relayTransactions(PlatformTransactionManager transactionManager) {
+    TransactionTemplate template = new TransactionTemplate(transactionManager);
+    template.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+    return template;
   }
 
   @Bean
