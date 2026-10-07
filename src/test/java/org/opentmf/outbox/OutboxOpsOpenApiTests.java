@@ -3,6 +3,7 @@ package org.opentmf.outbox;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.lang.reflect.Method;
+import java.lang.reflect.RecordComponent;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
@@ -81,5 +82,22 @@ class OutboxOpsOpenApiTests {
     Map<String, Object> info = (Map<String, Object>) fragment().get("info");
     assertThat(info.get("version").toString()).matches("\\d+\\.\\d+\\.\\d+");
     assertThat(OutboxOpsOpenApi.RESOURCE).endsWith(".oas.yaml");
+  }
+
+  @Test
+  @DisplayName("the OutboxRow schema names exactly the fields OutboxRowView serves")
+  void rowSchemaMatchesTheRowView() {
+    @SuppressWarnings("unchecked")
+    Map<String, Object> schemas =
+        (Map<String, Object>) ((Map<String, Object>) fragment().get("components")).get("schemas");
+    @SuppressWarnings("unchecked")
+    Map<String, Object> row = (Map<String, Object>) schemas.get("OutboxRow");
+    @SuppressWarnings("unchecked")
+    Set<String> documented = new TreeSet<>(((Map<String, Object>) row.get("properties")).keySet());
+    Set<String> served = new TreeSet<>();
+    for (RecordComponent component : OutboxRowView.class.getRecordComponents()) {
+      served.add(component.getName());
+    }
+    assertThat(documented).isEqualTo(served);
   }
 }

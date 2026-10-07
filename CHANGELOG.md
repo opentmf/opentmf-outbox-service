@@ -91,6 +91,24 @@ the batch's row locks were held across every backend call.
 
 ### Added
 
+- **The `/ops/outbox` OAS fragment, shipped in the jar** (PR #4).
+  `META-INF/openapi/opentmf-outbox-ops.oas.yaml`, read through
+  `OutboxOpsOpenApi.fragment()`, documents the eight ops routes ONCE.
+  - It includes 1.3.0's unpark by filter, `moreToPrune` / `moreToUnpark`, and
+    `inFlight` / `claimedUntil` on the row, and names the meters (`metrics-age`,
+    `in-flight` among them).
+  - It documents the TMF630 paging the toolkit actually answers: 200 / 206 / 416,
+    `X-Total-Count`, `X-Result-Count`, a 1-based `Content-Range`, `Link`, `limit`
+    clamped at `max-limit` rather than rejected, and the toolkit's own error object
+    on 400 and 416.
+  - Four consumers were describing this surface four different ways, none with the
+    paging. Each now pastes the fragment and may pin itself with a drift test
+    (README "OAS fragment").
+- **Guards for the fragment.** `OutboxOpsOpenApiTests` fails when the fragment and
+  `OutboxOpsController` disagree on a route, or when the `OutboxRow` schema and
+  `OutboxRowView` disagree on a field. `OutboxRoundTripIT` pins the paging contract
+  against the real tmf630-toolkit (partial page, past-the-end, clamp, empty result),
+  so a toolkit bump that changes it fails here first.
 - **Unpark by filter** (OUTBOX-BULK-UNPARK-1). `POST /ops/outbox/unpark` (JSON body)
   and `OutboxMaintenanceService.unpark(destination, parkedFrom, parkedTo, reference)`
   return every parked row of ONE destination to delivery. The destination is required;

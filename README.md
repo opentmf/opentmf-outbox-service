@@ -707,11 +707,13 @@ documented absence — never a silently degraded endpoint). A toolkit-less
 consumer keeps the full `OutboxMaintenanceService` API and can wire its own
 endpoints.
 
-### OAS fragment (1.2.1)
+### OAS fragment (1.3.0)
 
 The ops surface is documented ONCE, in the jar:
 `META-INF/openapi/opentmf-outbox-ops.oas.yaml` (`OutboxOpsOpenApi.fragment()` returns its
-text). It carries the seven routes above with the TMF630 paging the toolkit really answers —
+text). It carries the eight routes above — the unpark by filter included, with the bounded
+prune's and unpark's `moreTo…` flags and the row view's `inFlight` / `claimedUntil` — with
+the TMF630 paging the toolkit really answers —
 200 / 206 / 416, `X-Total-Count`, `X-Result-Count`, a 1-based `Content-Range`, `Link`, the
 clamp of `limit` at `max-limit`, and the toolkit's own error object on 400/416 (which does
 NOT pass through the consumer's problem-detail mapper). Consumers paste its `paths` and
@@ -728,7 +730,7 @@ void theOpsSubtreeMatchesTheLibraryFragment() {
 ```
 
 The library's own guard (`OutboxOpsOpenApiTests`) keeps the fragment equal to the
-controller's mappings, and `OutboxRoundTripIT` pins the paging behaviour against the real
+controller's mappings and its `OutboxRow` schema equal to `OutboxRowView`'s fields, and `OutboxRoundTripIT` pins the paging behaviour against the real
 toolkit — a toolkit bump that changes it turns THIS build red, not four consumers' OAS files
 silently wrong.
 
