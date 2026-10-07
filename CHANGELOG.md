@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.3.0 - 2026-10-06
+## 1.3.0 - 2026-10-07
 
 OUTBOX-HTTP-LANE-1: HTTP rows leave the ordered relay, and every row is claimed
 by **lease**. Until now the relay was one thread that published up to
