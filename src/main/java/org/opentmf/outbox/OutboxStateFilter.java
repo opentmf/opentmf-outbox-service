@@ -9,12 +9,16 @@ import java.util.Locale;
  *
  * <ul>
  *   <li>{@code pending} - {@code relayed_on is null and cancelled_on is null} (parked INCLUDED:
- *       parked is a sub-state; HELD rows - a future {@code release_at} - included too)
+ *       parked is a sub-state; HELD rows - a future {@code release_at} - and IN-FLIGHT rows -
+ *       a live lease, {@code inFlight} on the row view - included too)
  *   <li>{@code parked} - pending AND {@code parked_on is not null} (a publisher's budget ran
  *       out with outcome PARK)
  *   <li>{@code relayed} - {@code relayed_on is not null}
  *   <li>{@code cancelled} - {@code cancelled_on is not null}
  * </ul>
+ *
+ * <p>{@code relayed} and {@code cancelled} overlap only for a row cancelled while its send was in
+ * flight and then delivered (sent-but-cancelled, 1.3.0) - it is listed under both, truthfully.
  */
 public enum OutboxStateFilter {
   PENDING,

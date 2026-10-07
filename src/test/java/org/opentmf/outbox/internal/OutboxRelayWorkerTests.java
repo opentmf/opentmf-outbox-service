@@ -1,9 +1,21 @@
 package org.opentmf.outbox.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import io.micrometer.core.instrument.Counter;
@@ -11,27 +23,80 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import jakarta.persistence.Column;
 import java.time.Duration;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.opentmf.outbox.OutboxBooking;
+import org.opentmf.outbox.OutboxBooking.Outcome;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxProperties;
 import org.opentmf.outbox.OutboxPublisher;
+import org.opentmf.outbox.OutboxPublisher.ExhaustionOutcome;
+import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.opentmf.outbox.OutboxRelayedListener;
 import org.opentmf.outbox.TerminalOutboxException;
+import org.springframework.beans.BeanUtils;
 import org.springframework.data.domain.Limit;
+import org.springframework.transaction.support.TransactionCallback;
+import org.springframework.transaction.support.TransactionOperations;
 
 /**
- * Success stamps relayed_on; failure books attempts + the publisher's backoff; exhaustion by the
- * publisher's policy: PARK stamps parked_on, DROP stamps relayed_on without a delivery.
+ * The lease mechanics on a fake table (the real claim query and the real transactions are the
+ * ITs' job): the claim stamps and takes rows by lane, slot and ordering key; each outcome is
+ * booked guarded on the stamp, with the publisher's hook for every outcome; a booking that throws
+ * ROLLS BACK (the fake transaction restores the rows it saw); ORDERED leases are renewed one row
+ * ahead.
  */
 class OutboxRelayWorkerTests {
 
+  private final Map<Long, OutboxEvent> table = new LinkedHashMap<>();
   private final OutboxEventRepository repository = mock(OutboxEventRepository.class);
-  private final OutboxPublisher publisher = mock(OutboxPublisher.class);
+  private final OutboxPublisher publisher = mock(OutboxPublisher.class, CALLS_REAL_METHODS);
   private final OutboxProperties properties = new OutboxProperties();
   private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
   private final List<OutboxRelayedListener> listeners = new ArrayList<>();
+  private final List<OutboxBooking> bookings = new CopyOnWriteArrayList<>();
+  private final OutboxConcurrentLane lane =
+      new OutboxConcurrentLane(2, false, Duration.ofSeconds(5));
+  private int committed;
+  private int rolledBack;
+  private boolean failCommits;
+
+  /** Commits = keep; a thrown callback = restore every row to its state before the callback. */
+  private final TransactionOperations tx =
+      new TransactionOperations() {
+        @Override
+        public <T> T execute(TransactionCallback<T> action) {
+          Map<Long, OutboxEvent> before = new LinkedHashMap<>();
+          table.forEach((id, row) -> before.put(id, copy(row)));
+          try {
+            T result = action.doInTransaction(null);
+            if (failCommits) {
+              throw new IllegalStateException("database gone at commit");
+            }
+            committed++;
+            return result;
+          } catch (RuntimeException ex) {
+            rolledBack++;
+            before.forEach((id, row) -> BeanUtils.copyProperties(row, table.get(id)));
+            throw ex;
+          }
+        }
+      };
+
   private final OutboxRelayWorker worker =
       new OutboxRelayWorker(
           repository,
@@ -39,44 +104,190 @@ class OutboxRelayWorkerTests {
           new OutboxBackoff(properties),
           new OutboxMetrics(registry, repository),
           properties,
-          listeners);
+          listeners,
+          tx,
+          lane);
 
-  private static OutboxEvent pending(long id, int attempts) {
+  OutboxRelayWorkerTests() {
+    when(publisher.supports(any())).thenReturn(true);
+    doThrow(new AssertionError("unstubbed publish")).when(publisher).publish(any());
+    doReturn(null).when(publisher).deliver(any()); // delivered, no result - per test overridden
+    // the two lane claims, emulated on the fake table (the real SQL is the ITs' job)
+    when(repository.claimOrdered(any(), any(), any(Limit.class)))
+        .thenAnswer(
+            inv -> {
+              OffsetDateTime now = inv.getArgument(0);
+              Limit limit = inv.getArgument(2);
+              return table.values().stream()
+                  .filter(e -> e.getLane() != Lane.CONCURRENT && claimable(e, now))
+                  .limit(limit.max())
+                  .toList();
+            });
+    when(repository.claimConcurrent(any(), any(), anyInt()))
+        .thenAnswer(
+            inv ->
+                claimConcurrent(
+                    inv.getArgument(0), inv.getArgument(1), null, inv.getArgument(2), true));
+    when(repository.claimConcurrentWrap(any(), any(), anyInt()))
+        .thenAnswer(
+            inv ->
+                claimConcurrent(
+                    inv.getArgument(0), "", inv.getArgument(1), inv.getArgument(2), false));
+    // the cross-pod guard: every key lock is free, the re-check keeps every candidate - unless a
+    // test says otherwise
+    when(repository.tryLockKey(anyInt(), any())).thenReturn(true);
+    when(repository.recheckKeyedHeads(any(), any()))
+        .thenAnswer(inv -> idsOf(inv.getArgument(1)));
+    when(repository.lockLeased(anyLong(), any()))
+        .thenAnswer(
+            inv -> {
+              OutboxEvent row = table.get(inv.<Long>getArgument(0));
+              return Optional.ofNullable(row)
+                  .filter(e -> Objects.equals(e.getClaimedUntil(), inv.getArgument(1)));
+            });
+    doBookingsRecorded();
+  }
+
+  private void doBookingsRecorded() {
+    doAnswer(
+            inv -> {
+              bookings.add(inv.getArgument(1));
+              return null;
+            })
+        .when(publisher)
+        .onBooked(any(), any());
+  }
+
+  @AfterEach
+  void closeLane() {
+    lane.close();
+  }
+
+  /** The ids of a PostgreSQL array literal such as {@code {7,12}}. */
+  private static List<Long> idsOf(String literal) {
+    String inner = literal.substring(1, literal.length() - 1);
+    return inner.isEmpty()
+        ? List.of()
+        : Stream.of(inner.split(",")).map(Long::valueOf).toList();
+  }
+
+  private static boolean claimable(OutboxEvent e, OffsetDateTime now) {
+    return e.getRelayedOn() == null
+        && e.getCancelledOn() == null
+        && e.getParkedOn() == null
+        && (e.getReleaseAt() == null || !e.getReleaseAt().isAfter(now))
+        && !e.getNextAttemptOn().isAfter(now)
+        && (e.getClaimedUntil() == null || !e.getClaimedUntil().isAfter(now));
+  }
+
+  /**
+   * {@link OutboxClaimSql#CONCURRENT} / {@code CONCURRENT_WRAP} on the fake table: keys
+   * round-robin above {@code after} / up to {@code until}, each key not in flight contributing its
+   * first due row, until {@code limit} heads; rows without a key in id order (first pass only);
+   * the union in id order, {@code limit} rows.
+   */
+  private List<OutboxEvent> claimConcurrent(
+      OffsetDateTime now, String after, String until, int limit, boolean withUnkeyed) {
+    List<OutboxEvent> pendingConcurrent =
+        table.values().stream()
+            .filter(
+                e ->
+                    e.getLane() == Lane.CONCURRENT
+                        && e.getRelayedOn() == null
+                        && e.getCancelledOn() == null
+                        && e.getParkedOn() == null)
+            .toList();
+    Set<String> inFlight =
+        table.values().stream()
+            .filter(
+                e ->
+                    e.getLane() == Lane.CONCURRENT
+                        && e.getRelayedOn() == null
+                        && e.getOrderingKey() != null
+                        && e.getClaimedUntil() != null
+                        && e.getClaimedUntil().isAfter(now))
+            .map(OutboxEvent::getOrderingKey)
+            .collect(Collectors.toSet());
+    List<OutboxEvent> heads = new ArrayList<>();
+    pendingConcurrent.stream()
+        .map(OutboxEvent::getOrderingKey)
+        .filter(Objects::nonNull)
+        .filter(k -> k.compareTo(after) > 0 && (until == null || k.compareTo(until) <= 0))
+        .distinct()
+        .sorted()
+        .filter(k -> !inFlight.contains(k))
+        .forEach(
+            k ->
+                pendingConcurrent.stream()
+                    .filter(e -> k.equals(e.getOrderingKey()) && claimable(e, now))
+                    .findFirst()
+                    .filter(head -> heads.size() < limit)
+                    .ifPresent(heads::add));
+    List<OutboxEvent> unkeyed =
+        pendingConcurrent.stream()
+            .filter(e -> withUnkeyed && e.getOrderingKey() == null && claimable(e, now))
+            .limit(limit)
+            .toList();
+    return Stream.concat(heads.stream(), unkeyed.stream())
+        .sorted(Comparator.comparing(OutboxEvent::getId))
+        .limit(limit)
+        .toList();
+  }
+
+  private static OutboxEvent copy(OutboxEvent row) {
+    OutboxEvent copy = new OutboxEvent();
+    BeanUtils.copyProperties(row, copy);
+    return copy;
+  }
+
+  private OutboxEvent pending(long id, int attempts) {
     OutboxEvent event = new OutboxEvent();
     event.setId(id);
     event.setDestination("comm.delivery.v1");
     event.setAttempts(attempts);
     event.setNextAttemptOn(OffsetDateTime.now().minusSeconds(1));
+    table.put(id, event);
     return event;
   }
 
-  /** A mock publisher with the DEFAULT policy (Mockito returns 0/null/null otherwise). */
-  private void supportsWithDefaultPolicy() {
-    when(publisher.supports(any())).thenReturn(true);
-    when(publisher.onExhausted(any())).thenReturn(OutboxPublisher.ExhaustionOutcome.PARK);
-    when(publisher.backoff(any(), any(Integer.class))).thenReturn(null); // Mockito would say ZERO
+  /** A CONCURRENT row as the writer stamps it at append. */
+  private OutboxEvent concurrent(long id, String key) {
+    OutboxEvent event = pending(id, 0);
+    event.setLane(Lane.CONCURRENT);
+    event.setOrderingKey(key);
+    return event;
   }
 
-  private void claims(OutboxEvent... events) {
-    when(repository.claimBatch(any(), any(Limit.class))).thenReturn(List.of(events));
+  /** In flight elsewhere: a live lease, next_attempt_on moved with it. */
+  private static void leasedElsewhere(OutboxEvent event) {
+    OffsetDateTime lease = OffsetDateTime.now().plusMinutes(1);
+    event.setClaimedUntil(lease);
+    event.setNextAttemptOn(lease);
   }
 
   private double counter(String name) {
     return registry.find(name).counters().stream().mapToDouble(Counter::count).sum();
   }
 
-  @Test
-  void successfulRelay_stampsRelayedOn() {
-    supportsWithDefaultPolicy();
-    OutboxEvent event = pending(1L, 0);
-    claims(event);
-
+  /** One batch, then wait for the CONCURRENT lane to return every slot. */
+  private int relay() {
     int claimed = worker.relayBatch();
+    await().atMost(Duration.ofSeconds(5)).until(() -> lane.available() == 2);
+    return claimed;
+  }
+
+  // ------------------------------------------------------------ the ORDERED lane, 1.2.x policy
+
+  @Test
+  void successfulRelay_stampsRelayedOn_clearsTheLease_booksTheMetrics() {
+    OutboxEvent event = pending(1L, 0);
+
+    int claimed = relay();
 
     assertThat(claimed).isEqualTo(1);
     assertThat(event.getRelayedOn()).isNotNull();
+    assertThat(event.getClaimedUntil()).isNull(); // the booking released the lease
     assertThat(event.getParkedOn()).isNull();
-    // the relay BOOKS the success: counter by destination, attempts = tries taken (0+1)
     assertThat(
             registry
                 .get(OutboxMetrics.RELAYED)
@@ -85,61 +296,76 @@ class OutboxRelayWorkerTests {
                 .count())
         .isEqualTo(1d);
     assertThat(registry.get(OutboxMetrics.ATTEMPTS).summary().totalAmount()).isEqualTo(1d);
+    // the ORDERED claim, the CONCURRENT claim (a slot was free), one booking: three SHORT
+    // transactions, the send in none
+    assertThat(committed).isEqualTo(3);
   }
 
   @Test
   void failure_booksAttemptAndBackoff_aFailedRowDoesNotStopTheBatch() {
-    supportsWithDefaultPolicy();
     OutboxEvent failing = pending(1L, 0);
     OutboxEvent fine = pending(2L, 0);
-    claims(failing, fine);
-    doThrow(new RuntimeException("broker down")).when(publisher).publish(failing);
+    doThrow(new RuntimeException("broker down")).when(publisher).deliver(failing);
 
-    worker.relayBatch();
+    relay();
 
     assertThat(failing.getRelayedOn()).isNull();
     assertThat(failing.getAttempts()).isEqualTo(1);
     // EXACT format: SimpleName + message (toString would carry the package prefix)
     assertThat(failing.getLastError()).isEqualTo("RuntimeException: broker down");
     assertThat(failing.getNextAttemptOn()).isAfter(OffsetDateTime.now());
+    assertThat(failing.getClaimedUntil()).isNull();
     assertThat(fine.getRelayedOn()).isNotNull();
   }
 
   @Test
-  void relayedListeners_runInsideTheSuccessPath_withTheStampVisible() {
-    supportsWithDefaultPolicy();
+  void theDefaultDeliver_callsPublish() {
+    OutboxPublisher plain = mock(OutboxPublisher.class, CALLS_REAL_METHODS);
+    doThrow(new RuntimeException("from publish")).when(plain).publish(any());
     OutboxEvent event = pending(1L, 0);
-    claims(event);
+
+    assertThatThrownBy(() -> plain.deliver(event))
+        .hasMessage("from publish");
+    assertThat(plain.lane(event)).isEqualTo(Lane.ORDERED);
+    assertThat(plain.orderingKey(event)).isNull();
+    assertThat(plain.lease(event)).isNull();
+    assertThat(plain.onExhausted(event)).isEqualTo(ExhaustionOutcome.PARK);
+  }
+
+  @Test
+  void relayedListeners_runInsideTheBooking_withTheStampVisible() {
+    OutboxEvent event = pending(1L, 0);
     List<Object> seenRelayedOn = new ArrayList<>();
     listeners.add(e -> seenRelayedOn.add(e.getRelayedOn()));
 
-    worker.relayBatch();
+    relay();
 
-    // the listener saw relayedOn ALREADY SET - the atomic-with-the-stamp contract
     assertThat(seenRelayedOn).hasSize(1);
     assertThat(seenRelayedOn.get(0)).isNotNull();
     assertThat(event.getRelayedOn()).isNotNull();
   }
 
   @Test
-  void aThrowingListener_undoesTheStamp_andBooksAnOrdinaryFailure() {
-    supportsWithDefaultPolicy();
+  void aThrowingListener_rollsTheStampBack_andBooksAnOrdinaryFailure() {
     OutboxEvent event = pending(1L, 0);
-    claims(event);
     listeners.add(
         e -> {
+          e.setReference("written by the listener before it threw");
           throw new IllegalStateException("bookkeeping refused");
         });
 
-    worker.relayBatch();
+    relay();
 
-    // NOT relayed-with-attempts++ nonsense: the stamp is undone, the failure books normally
-    // and the publish will repeat (at-least-once - the destination dedups on the key)
+    assertThat(rolledBack).isEqualTo(1);
     assertThat(event.getRelayedOn()).isNull();
+    assertThat(event.getReference()).isNull(); // the listener's write rolled back with the stamp
     assertThat(event.getAttempts()).isEqualTo(1);
     assertThat(event.getLastError()).isEqualTo("IllegalStateException: bookkeeping refused");
-    // the success metric was NOT booked for the failed round
     assertThat(registry.find(OutboxMetrics.RELAYED).counters()).isEmpty();
+    // the hook saw the refused success, then the failure it became
+    assertThat(bookings)
+        .extracting(OutboxBooking::outcome)
+        .containsExactly(Outcome.RELAYED, Outcome.RETRY);
   }
 
   /**
@@ -149,18 +375,15 @@ class OutboxRelayWorkerTests {
    */
   @Test
   void backoff_neverTouchesTheReleaseHold() throws NoSuchFieldException {
-    supportsWithDefaultPolicy();
     OffsetDateTime hold = OffsetDateTime.now().minusSeconds(1); // released, so claimable
     OutboxEvent event = pending(1L, 0);
     event.setReleaseAt(hold);
-    claims(event);
-    doThrow(new RuntimeException("broker down")).when(publisher).publish(event);
+    doThrow(new RuntimeException("broker down")).when(publisher).deliver(event);
 
-    worker.relayBatch();
+    relay();
 
     assertThat(event.getNextAttemptOn()).isAfter(OffsetDateTime.now()); // backoff booked...
     assertThat(event.getReleaseAt()).isEqualTo(hold); // ...the hold untouched
-    // and structurally: the mapping itself refuses to UPDATE the column, whatever the code does
     assertThat(OutboxEvent.class.getDeclaredField("releaseAt").getAnnotation(Column.class))
         .extracting(Column::updatable)
         .isEqualTo(false);
@@ -168,109 +391,775 @@ class OutboxRelayWorkerTests {
 
   @Test
   void theFinalFailedAttempt_parksTheRow_byStampingParkedOn() {
-    supportsWithDefaultPolicy();
     OutboxEvent event = pending(1L, properties.getMaxAttempts() - 1);
-    claims(event);
-    doThrow(new RuntimeException("still down")).when(publisher).publish(event);
+    doThrow(new RuntimeException("still down")).when(publisher).deliver(event);
 
-    worker.relayBatch();
+    relay();
 
-    // attempts now AT the library max = PARKED: parked_on stamped (the claim predicate reads
-    // the stamp, not the count), gauge alerts, unpark is explicit
     assertThat(event.getAttempts()).isEqualTo(properties.getMaxAttempts());
     assertThat(event.getParkedOn()).isNotNull();
     assertThat(event.getRelayedOn()).isNull();
+    assertThat(bookings)
+        .singleElement()
+        .satisfies(
+            b -> {
+              assertThat(b.outcome()).isEqualTo(Outcome.EXHAUSTED);
+              assertThat(b.exhaustion()).isEqualTo(ExhaustionOutcome.PARK);
+              assertThat(b.failure()).hasMessage("still down");
+            });
   }
 
   @Test
   void aPublishersOwnBudgetAndBackoff_areHonoured() {
-    supportsWithDefaultPolicy();
     when(publisher.maxAttempts(any())).thenReturn(3);
     when(publisher.backoff(any(), any(Integer.class))).thenReturn(Duration.ofHours(5));
     OutboxEvent retrying = pending(1L, 0);
     OutboxEvent lastChance = pending(2L, 2); // library max is 10 - the publisher says 3
-    claims(retrying, lastChance);
-    doThrow(new RuntimeException("hub 503")).when(publisher).publish(any());
+    doThrow(new RuntimeException("hub 503")).when(publisher).deliver(any());
 
-    worker.relayBatch();
+    relay();
 
     assertThat(retrying.getParkedOn()).isNull();
     assertThat(retrying.getNextAttemptOn()).isAfter(OffsetDateTime.now().plusHours(4));
     assertThat(lastChance.getAttempts()).isEqualTo(3);
-    assertThat(lastChance.getParkedOn()).isNotNull(); // exhausted at THE PUBLISHER'S 3
+    assertThat(lastChance.getParkedOn()).isNotNull();
   }
 
   @Test
   void dropOutcome_stampsRelayedOn_firesNoListener_countsDroppedNotRelayed() {
-    supportsWithDefaultPolicy();
     when(publisher.maxAttempts(any())).thenReturn(1);
-    when(publisher.onExhausted(any())).thenReturn(OutboxPublisher.ExhaustionOutcome.DROP);
+    when(publisher.onExhausted(any())).thenReturn(ExhaustionOutcome.DROP);
     OutboxEvent event = pending(1L, 0);
-    claims(event);
-    doThrow(new RuntimeException("hub 410 gone")).when(publisher).publish(event);
+    doThrow(new RuntimeException("hub 410 gone")).when(publisher).deliver(event);
     List<Long> listened = new ArrayList<>();
     listeners.add(e -> listened.add(e.getId()));
 
-    worker.relayBatch();
+    relay();
 
-    assertThat(event.getRelayedOn()).isNotNull(); // leaves the pending set...
+    assertThat(event.getRelayedOn()).isNotNull();
     assertThat(event.getParkedOn()).isNull();
-    // ...forensics kept
     assertThat(event.getLastError()).isEqualTo("RuntimeException: hub 410 gone");
-    assertThat(listened).isEmpty(); // nothing was delivered - no bookkeeping seam
+    assertThat(listened).isEmpty();
     assertThat(counter(OutboxMetrics.DROPPED)).isEqualTo(1d);
     assertThat(counter(OutboxMetrics.RELAYED)).isZero();
+    assertThat(bookings)
+        .extracting(OutboxBooking::exhaustion)
+        .containsExactly(ExhaustionOutcome.DROP);
   }
 
   @Test
   void aTerminalException_reachesTheExhaustionOutcomeImmediately() {
-    supportsWithDefaultPolicy();
-    OutboxEvent event = pending(1L, 0); // first attempt, budget of 10 untouched
-    claims(event);
+    OutboxEvent event = pending(1L, 0);
     doThrow(new TerminalOutboxException("400 bad request - retrying is pointless"))
         .when(publisher)
-        .publish(event);
+        .deliver(event);
 
-    worker.relayBatch();
+    relay();
 
     assertThat(event.getAttempts()).isEqualTo(1);
-    assertThat(event.getParkedOn()).isNotNull(); // PARK by default, on the FIRST attempt
+    assertThat(event.getParkedOn()).isNotNull();
     assertThat(event.getLastError()).contains("retrying is pointless");
   }
 
   @Test
-  void anUnroutableRow_booksWithTheLibraryPolicy() {
+  void anUnroutableRow_booksWithTheLibraryPolicy_inTheClaim() {
     when(publisher.supports(any())).thenReturn(false);
     OutboxEvent event = pending(1L, properties.getMaxAttempts() - 1);
-    claims(event);
 
-    worker.relayBatch();
+    int claimed = relay();
 
+    assertThat(claimed).isZero();
     assertThat(event.getLastError()).contains("No OutboxPublisher supports");
-    assertThat(event.getParkedOn()).isNotNull(); // library max, library PARK
+    assertThat(event.getParkedOn()).isNotNull();
+    assertThat(event.getClaimedUntil()).isNull(); // never leased
+    assertThat(bookings).isEmpty(); // no publisher, no hook
+  }
+
+  @Test
+  void anUnroutableRowInFlight_isLeftToItsHolder() {
+    when(publisher.supports(any())).thenReturn(false);
+    OutboxEvent event = pending(1L, 0);
+    leasedElsewhere(event);
+
+    relay();
+
+    assertThat(event.getAttempts()).isZero();
   }
 
   @Test
   void aMessagelessException_isDescribedByItsToString() {
-    supportsWithDefaultPolicy();
     OutboxEvent event = pending(1L, 0);
-    claims(event);
-    doThrow(new RuntimeException()).when(publisher).publish(event);
+    doThrow(new RuntimeException()).when(publisher).deliver(event);
 
-    worker.relayBatch();
+    relay();
 
     assertThat(event.getLastError()).contains("RuntimeException");
   }
 
   @Test
   void anOversizedErrorMessage_isTruncatedForTheForensicColumn() {
-    supportsWithDefaultPolicy();
     OutboxEvent event = pending(1L, 0);
-    claims(event);
-    doThrow(new RuntimeException("x".repeat(10_000))).when(publisher).publish(event);
+    doThrow(new RuntimeException("x".repeat(10_000))).when(publisher).deliver(event);
+
+    relay();
+
+    assertThat(event.getLastError()).hasSize(OutboxRelayWorker.LAST_ERROR_MAX_LENGTH);
+  }
+
+  // ------------------------------------------------------------ the booking hook
+
+  @Test
+  void theBookingHook_receivesTheDeliveryResult_insideTheBooking_beforeTheListeners() {
+    OutboxEvent event = pending(1L, 0);
+    doReturn("acrm-42").when(publisher).deliver(event);
+    List<String> order = new ArrayList<>();
+    doAnswer(
+            inv -> {
+              OutboxEvent row = inv.getArgument(0);
+              OutboxBooking booking = inv.getArgument(1);
+              assertThat(row.getRelayedOn()).isNotNull(); // the stamp is already set
+              row.setReference(String.valueOf(booking.result())); // the write rides the booking
+              order.add("hook");
+              return null;
+            })
+        .when(publisher)
+        .onBooked(any(), any());
+    listeners.add(e -> order.add("listener"));
+
+    relay();
+
+    assertThat(event.getReference()).isEqualTo("acrm-42");
+    assertThat(order).containsExactly("hook", "listener");
+  }
+
+  @Test
+  void aRefusingHookOnAFailure_booksNothing_theLeaseLapses() {
+    OutboxEvent event = pending(1L, 0);
+    doThrow(new RuntimeException("receiver 503")).when(publisher).deliver(event);
+    doThrow(new IllegalStateException("hook refused"))
+        .when(publisher)
+        .onBooked(any(), any());
+
+    relay(); // logged, never thrown out of the pass
+
+    assertThat(event.getAttempts()).isZero(); // rolled back
+    assertThat(event.getClaimedUntil()).isNotNull(); // still leased: it lapses, then repeats
+    assertThat(rolledBack).isEqualTo(1);
+  }
+
+  @Test
+  void aRefusingHookOnTheFirstOrderedRow_stopsTheBatch_theRestLapse() {
+    OutboxEvent first = pending(1L, 0);
+    OutboxEvent second = pending(2L, 0);
+    doThrow(new RuntimeException("down")).when(publisher).deliver(first);
+    doThrow(new IllegalStateException("hook refused"))
+        .when(publisher)
+        .onBooked(any(), any());
+
+    relay();
+
+    verify(publisher, never()).deliver(second); // the relay thread stopped the batch
+    assertThat(second.getClaimedUntil()).isNotNull();
+  }
+
+  // ------------------------------------------------------------ the lease guard
+
+  @Test
+  void aLapsedLease_booksNothing_anotherHolderOwnsTheRow() {
+    OutboxEvent event = pending(1L, 0);
+    OffsetDateTime otherHolder = OffsetDateTime.now().plusHours(1);
+    doAnswer(
+            inv -> {
+              event.setClaimedUntil(otherHolder); // lapsed and re-stamped while we sent
+              return null;
+            })
+        .when(publisher)
+        .deliver(event);
+
+    relay();
+
+    assertThat(event.getRelayedOn()).isNull();
+    assertThat(event.getClaimedUntil()).isEqualTo(otherHolder);
+    assertThat(bookings).isEmpty();
+    assertThat(rolledBack).isZero(); // the lapse is booked as nothing - not as a refusal
+    verify(repository, times(1)).lockLeased(anyLong(), any());
+    assertThat(counter(OutboxMetrics.RELAYED)).isZero();
+  }
+
+  @Test
+  void aLapsedLeaseOnFailure_booksNothingEither_andTheBatchGoesOn() {
+    OutboxEvent event = pending(1L, 0);
+    OutboxEvent next = pending(2L, 0);
+    doAnswer(
+            inv -> {
+              event.setClaimedUntil(OffsetDateTime.now().plusHours(1));
+              throw new RuntimeException("late failure");
+            })
+        .when(publisher)
+        .deliver(event);
+
+    relay();
+
+    assertThat(event.getAttempts()).isZero();
+    assertThat(next.getRelayedOn()).isNotNull(); // the lapse did not stop the ORDERED batch
+    assertThat(rolledBack).isZero();
+  }
+
+  @Test
+  void theStamp_isLeaseFromNow_truncatedToMicros_perLane_andADeclaredLeaseWins() {
+    OutboxEvent ordered = pending(1L, 0);
+    List<OffsetDateTime> stamps = new ArrayList<>();
+    doAnswer(
+            inv -> {
+              stamps.add(inv.<OutboxEvent>getArgument(0).getClaimedUntil());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+    OffsetDateTime before = OffsetDateTime.now(ZoneOffset.UTC);
+
+    relay();
+
+    OffsetDateTime stamp = stamps.get(0);
+    assertThat(stamp)
+        .isEqualTo(stamp.truncatedTo(ChronoUnit.MICROS))
+        .isBetween(before.plusSeconds(14), before.plusSeconds(16)); // ordered lease 15s
+    assertThat(ordered.getRelayedOn()).isNotNull();
+
+    concurrent(2L, null);
+    relay();
+    assertThat(stamps.get(1)).isAfter(OffsetDateTime.now().plusSeconds(100)); // lease 2min
+
+    when(publisher.lease(any())).thenReturn(Duration.ofSeconds(3));
+    concurrent(3L, null);
+    relay();
+    assertThat(stamps.get(2)).isBefore(OffsetDateTime.now().plusSeconds(4));
+  }
+
+  // ------------------------------------------------------------ cancel against a live lease
+
+  @Test
+  void aRowCancelledInFlight_thatIsDelivered_isBookedSentButCancelled() {
+    OutboxEvent event = pending(1L, 0);
+    List<Long> listened = new ArrayList<>();
+    listeners.add(e -> listened.add(e.getId()));
+    doAnswer(
+            inv -> {
+              event.setCancelledOn(OffsetDateTime.now()); // ops cancel, the lease still live
+              return null;
+            })
+        .when(publisher)
+        .deliver(event);
+
+    relay();
+
+    assertThat(event.getRelayedOn()).isNotNull();
+    assertThat(event.getCancelledOn()).isNotNull(); // both stamps - the truth on /ops
+    assertThat(listened).containsExactly(1L); // the effect DID leave: its bookkeeping runs
+    assertThat(bookings).extracting(OutboxBooking::outcome).containsExactly(Outcome.RELAYED);
+  }
+
+  @Test
+  void aRowCancelledInFlight_thatFails_retiresCancelled_noRetryNoPark() {
+    OutboxEvent event = pending(1L, properties.getMaxAttempts() - 1);
+    doAnswer(
+            inv -> {
+              event.setCancelledOn(OffsetDateTime.now());
+              throw new RuntimeException("receiver 503");
+            })
+        .when(publisher)
+        .deliver(event);
+
+    relay();
+
+    assertThat(event.getParkedOn()).isNull();
+    assertThat(event.getRelayedOn()).isNull();
+    assertThat(event.getClaimedUntil()).isNull();
+    assertThat(event.getLastError()).contains("receiver 503");
+    assertThat(event.getNextAttemptOn()).isBeforeOrEqualTo(OffsetDateTime.now()); // no lease end
+    assertThat(bookings).extracting(OutboxBooking::outcome).containsExactly(Outcome.CANCELLED);
+  }
+
+  // ------------------------------------------------------------ ORDERED renewal
+
+  @Test
+  void eachOrderedLease_isRenewedRightBeforeItsSend_byThePreviousBooking() {
+    OutboxEvent first = pending(1L, 0);
+    OutboxEvent second = pending(2L, 0);
+    Map<Long, OffsetDateTime> leaseAtSend = new LinkedHashMap<>();
+    doAnswer(
+            inv -> {
+              OutboxEvent row = inv.getArgument(0);
+              leaseAtSend.put(row.getId(), table.get(row.getId()).getClaimedUntil());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    relay();
+
+    assertThat(first.getRelayedOn()).isNotNull();
+    assertThat(second.getRelayedOn()).isNotNull();
+    assertThat(leaseAtSend.get(2L)).isAfter(leaseAtSend.get(1L)); // renewed, not the claim's
+  }
+
+  @Test
+  void theRenewal_reachesExactlyOneRowAhead_andMovesItsNextAttemptToo() {
+    pending(1L, 0);
+    pending(2L, 0);
+    pending(3L, 0);
+    List<Boolean> nextAttemptIsLeaseEnd = new ArrayList<>();
+    doAnswer(
+            inv -> {
+              OutboxEvent sent = table.get(inv.<OutboxEvent>getArgument(0).getId());
+              nextAttemptIsLeaseEnd.add(sent.getNextAttemptOn().equals(sent.getClaimedUntil()));
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    relay();
+
+    // own guard x3 + one renewal for row 2 and one for row 3 - never two rows ahead
+    verify(repository, times(5)).lockLeased(anyLong(), any());
+    assertThat(nextAttemptIsLeaseEnd).containsExactly(true, true, true);
+  }
+
+  @Test
+  void aRowLostToAnotherHolder_passesTheRenewalOnToTheRowAfterIt() {
+    OutboxEvent first = pending(1L, 0);
+    OutboxEvent taken = pending(2L, 0);
+    pending(3L, 0);
+    Map<Long, OffsetDateTime> leaseAtSend = new LinkedHashMap<>();
+    Map<Long, OffsetDateTime> claimStamp = new LinkedHashMap<>();
+    doAnswer(
+            inv -> {
+              OutboxEvent row = table.get(inv.<OutboxEvent>getArgument(0).getId());
+              if (row.getId() == 1L) {
+                claimStamp.put(3L, table.get(3L).getClaimedUntil());
+                taken.setClaimedUntil(OffsetDateTime.now().plusHours(1)); // re-stamped elsewhere
+              }
+              leaseAtSend.put(row.getId(), row.getClaimedUntil());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    relay();
+
+    assertThat(first.getRelayedOn()).isNotNull();
+    assertThat(leaseAtSend).containsOnlyKeys(1L, 3L);
+    assertThat(leaseAtSend.get(3L)).isAfter(claimStamp.get(3L)); // renewed, not the claim's
+  }
+
+  @Test
+  void aRowCancelledBeforeItsTurn_passesTheRenewalOnToTheRowAfterIt() {
+    pending(1L, 0);
+    OutboxEvent cancelled = pending(2L, 0);
+    pending(3L, 0);
+    Map<Long, OffsetDateTime> claimStamp = new LinkedHashMap<>();
+    Map<Long, OffsetDateTime> leaseAtSend = new LinkedHashMap<>();
+    doAnswer(
+            inv -> {
+              OutboxEvent row = table.get(inv.<OutboxEvent>getArgument(0).getId());
+              if (row.getId() == 1L) {
+                claimStamp.put(3L, table.get(3L).getClaimedUntil());
+                cancelled.setCancelledOn(OffsetDateTime.now());
+              }
+              leaseAtSend.put(row.getId(), row.getClaimedUntil());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    relay();
+
+    assertThat(leaseAtSend).containsOnlyKeys(1L, 3L);
+    assertThat(leaseAtSend.get(3L)).isAfter(claimStamp.get(3L));
+  }
+
+  @Test
+  void anOrderedRowCancelledBeforeItsTurn_isReleasedUnsent_andTheNextIsRenewed() {
+    OutboxEvent first = pending(1L, 0);
+    OutboxEvent cancelled = pending(2L, 0);
+    OutboxEvent third = pending(3L, 0);
+    doAnswer(
+            inv -> {
+              cancelled.setCancelledOn(OffsetDateTime.now());
+              return null;
+            })
+        .when(publisher)
+        .deliver(first);
+
+    relay();
+
+    verify(publisher, never()).deliver(cancelled);
+    assertThat(cancelled.getClaimedUntil()).isNull();
+    assertThat(cancelled.getRelayedOn()).isNull();
+    assertThat(third.getRelayedOn()).isNotNull();
+  }
+
+  @Test
+  void anOrderedRowWhoseLeaseWasTaken_isSkipped() {
+    OutboxEvent first = pending(1L, 0);
+    OutboxEvent taken = pending(2L, 0);
+    OffsetDateTime otherHolder = OffsetDateTime.now().plusHours(1);
+    doAnswer(
+            inv -> {
+              taken.setClaimedUntil(otherHolder);
+              return null;
+            })
+        .when(publisher)
+        .deliver(first);
+
+    relay();
+
+    verify(publisher, never()).deliver(taken);
+    assertThat(taken.getClaimedUntil()).isEqualTo(otherHolder);
+  }
+
+  @Test
+  void anInFlightOrderedRow_isNotClaimedAgain() {
+    OutboxEvent leased = pending(1L, 0);
+    leasedElsewhere(leased);
+
+    assertThat(relay()).isZero();
+    verify(publisher, never()).deliver(leased);
+  }
+
+  @Test
+  void theOrderedLane_takesAtMostOneBatch() {
+    properties.setBatchSize(2);
+    pending(1L, 0);
+    pending(2L, 0);
+    OutboxEvent third = pending(3L, 0);
+
+    assertThat(relay()).isEqualTo(2);
+    assertThat(third.getRelayedOn()).isNull();
+    assertThat(relay()).isEqualTo(1);
+    assertThat(third.getRelayedOn()).isNotNull();
+  }
+
+  @Test
+  void aSystemicCommitFailure_inTheBooking_propagatesNothing_andStopsTheBatch() {
+    OutboxEvent first = pending(1L, 0);
+    OutboxEvent second = pending(2L, 0);
+    doAnswer(
+            inv -> {
+              failCommits = true; // the database goes away while the first row is sent
+              return null;
+            })
+        .when(publisher)
+        .deliver(first);
+
+    relay();
+
+    verify(publisher, never()).deliver(second);
+    assertThat(first.getRelayedOn()).isNull(); // nothing booked: redelivered after the lease
+  }
+
+  // ------------------------------------------------------------ the CONCURRENT lane
+
+  @Test
+  void concurrentRows_runOffTheRelayThread_andReturnTheirSlots() {
+    OutboxEvent row = concurrent(1L, null);
+    List<String> threads = new CopyOnWriteArrayList<>();
+    doAnswer(
+            inv -> {
+              threads.add(Thread.currentThread().getName());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    assertThat(relay()).isEqualTo(1);
+
+    await().atMost(Duration.ofSeconds(5)).until(() -> row.getRelayedOn() != null);
+    assertThat(threads).singleElement().asString().startsWith("opentmf-outbox-send-");
+    assertThat(lane.isVirtual()).isFalse();
+  }
+
+  @Test
+  void theStampedLaneWins_overWhatThePublisherSaysNow() {
+    when(publisher.lane(any())).thenReturn(Lane.CONCURRENT); // the publisher changed its mind
+    OutboxEvent stampedOrdered = pending(1L, 0); // appended as ORDERED (or before 1.3.0)
+    OutboxEvent stampedConcurrent = concurrent(2L, null);
+    when(publisher.lane(stampedConcurrent)).thenReturn(Lane.ORDERED);
+    List<String> threads = new CopyOnWriteArrayList<>();
+    doAnswer(
+            inv -> {
+              long id = inv.<OutboxEvent>getArgument(0).getId();
+              threads.add(id + "@" + Thread.currentThread().getName());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    relay();
+
+    await().atMost(Duration.ofSeconds(5)).until(() -> stampedConcurrent.getRelayedOn() != null);
+    assertThat(stampedOrdered.getRelayedOn()).isNotNull();
+    assertThat(threads)
+        .anyMatch(t -> t.startsWith("1@") && !t.contains("opentmf-outbox-send-"))
+        .anyMatch(t -> t.startsWith("2@opentmf-outbox-send-"));
+  }
+
+  @Test
+  void theClaim_movesNextAttemptToTheLeaseEnd_andTheBookingMovesItBack() {
+    OutboxEvent row = pending(1L, 0);
+    List<OffsetDateTime> atSend = new ArrayList<>();
+    doAnswer(
+            inv -> {
+              OutboxEvent sent = table.get(1L);
+              assertThat(sent.getNextAttemptOn()).isEqualTo(sent.getClaimedUntil());
+              atSend.add(sent.getNextAttemptOn());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    relay();
+
+    assertThat(atSend).singleElement().satisfies(t -> assertThat(t).isAfter(OffsetDateTime.now()));
+    assertThat(row.getNextAttemptOn()).isEqualTo(row.getRelayedOn()); // no future value left
+  }
+
+  @Test
+  void theClaim_takesOnlyAsManyConcurrentRowsAsThereAreFreeSlots() {
+    concurrent(1L, null);
+    concurrent(2L, null);
+    OutboxEvent third = concurrent(3L, null);
+    CountDownLatch gate = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              gate.await();
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    assertThat(worker.relayBatch()).isEqualTo(2); // two slots
+    assertThat(third.getClaimedUntil()).isNull(); // never stamped: no lease burns in a queue
+    gate.countDown();
+    await().atMost(Duration.ofSeconds(5)).until(() -> lane.available() == 2);
+    assertThat(relay()).isEqualTo(1);
+    await().atMost(Duration.ofSeconds(5)).until(() -> third.getRelayedOn() != null);
+  }
+
+  @Test
+  void noFreeSlot_meansNoConcurrentClaimAtAll() {
+    OutboxEvent row = concurrent(1L, null);
+    assertThat(lane.tryAcquire()).isTrue();
+    assertThat(lane.tryAcquire()).isTrue();
+
+    assertThat(worker.relayBatch()).isZero();
+
+    verify(repository, never()).claimConcurrent(any(), any(), anyInt());
+    assertThat(row.getClaimedUntil()).isNull();
+    lane.releaseUnused(2);
+  }
+
+  @Test
+  void rowsSharingAnOrderingKey_areNeverInFlightTogether_andGoInIdOrder() {
+    OutboxEvent firstOfA = concurrent(1L, "receiver-a");
+    OutboxEvent secondOfA = concurrent(2L, "receiver-a");
+    OutboxEvent independent = concurrent(3L, null);
+
+    assertThat(relay()).isEqualTo(2); // 1 and 3 - the second of the key waits its turn
+    assertThat(firstOfA.getRelayedOn()).isNotNull();
+    assertThat(independent.getRelayedOn()).isNotNull();
+    assertThat(secondOfA.getRelayedOn()).isNull();
+
+    assertThat(relay()).isEqualTo(1);
+    assertThat(secondOfA.getRelayedOn()).isNotNull();
+  }
+
+  @Test
+  void aRowCancelledWhileInFlight_stillHoldsItsKey() {
+    OutboxEvent flying = concurrent(1L, "receiver-a");
+    leasedElsewhere(flying);
+    flying.setCancelledOn(OffsetDateTime.now()); // cancelled, but its send is still running
+    OutboxEvent next = concurrent(2L, "receiver-a");
+
+    assertThat(relay()).isZero();
+    assertThat(next.getClaimedUntil()).isNull();
+  }
+
+  @Test
+  void aConcurrentClaimThatDoesNotCommit_returnsItsSlots_andTheOrderedRowsGoOn() {
+    concurrent(1L, null);
+    OutboxEvent ordered = pending(2L, 0);
+    when(repository.claimConcurrent(any(), any(), anyInt()))
+        .thenThrow(new IllegalStateException("database gone mid-claim"));
+
+    worker.relayBatch(); // logged - the pass goes on
+
+    assertThat(lane.available()).isEqualTo(2);
+    assertThat(ordered.getRelayedOn()).isNotNull();
+  }
+
+  @Test
+  void aKeyAnotherPodIsClaiming_isSkippedThisPass_unkeyedRowsGoOn() {
+    OutboxEvent keyed = concurrent(1L, "receiver-a");
+    OutboxEvent unkeyed = concurrent(2L, null);
+    when(repository.tryLockKey(OutboxClaimSql.KEY_LOCK_NAMESPACE, "receiver-a")).thenReturn(false);
+
+    assertThat(relay()).isEqualTo(1);
+
+    assertThat(keyed.getClaimedUntil()).isNull(); // not stamped: left for the next pass
+    assertThat(unkeyed.getRelayedOn()).isNotNull();
+    verify(repository, never()).recheckKeyedHeads(any(), any()); // nothing keyed to re-check
+  }
+
+  @Test
+  void aLockedKeysCandidate_thatTheReCheckDrops_isNotClaimed() {
+    OutboxEvent keyed = concurrent(1L, "receiver-a");
+    doReturn(List.of()).when(repository).recheckKeyedHeads(any(), any()); // in flight by now
+
+    assertThat(relay()).isZero();
+
+    assertThat(keyed.getClaimedUntil()).isNull();
+    verify(repository).recheckKeyedHeads(any(), eq("{1}"));
+  }
+
+  @Test
+  void eachKeyIsLockedOnce_andTheReCheckSeesEveryLockedCandidate() {
+    concurrent(1L, "receiver-a");
+    concurrent(2L, "receiver-b");
+    concurrent(3L, null);
+    // two passes' worth in one: the first pass's candidates, then the wrap's - same key twice
+    doAnswer(inv -> List.of(table.get(1L), table.get(2L), table.get(3L)))
+        .when(repository)
+        .claimConcurrent(any(), any(), anyInt());
+
+    relay();
+
+    verify(repository, times(1)).tryLockKey(OutboxClaimSql.KEY_LOCK_NAMESPACE, "receiver-a");
+    verify(repository, times(1)).tryLockKey(OutboxClaimSql.KEY_LOCK_NAMESPACE, "receiver-b");
+    verify(repository, never()).tryLockKey(anyInt(), isNull());
+    verify(repository).recheckKeyedHeads(any(), eq("{1,2}"));
+  }
+
+  @Test
+  void aConcurrentClaimWhoseCommitFails_returnsTheSlotsOfTheRowsItStamped_andSendsNone() {
+    OutboxEvent row = concurrent(1L, null);
+    doAnswer(
+            inv -> {
+              failCommits = true; // the stamps are set, then the commit fails
+              return claimConcurrent(
+                  inv.getArgument(0), inv.getArgument(1), null, inv.getArgument(2), true);
+            })
+        .when(repository)
+        .claimConcurrent(any(), any(), anyInt());
+
+    assertThat(worker.relayBatch()).isZero(); // nothing claimed, nothing submitted
+
+    assertThat(lane.available()).isEqualTo(2);
+    verify(publisher, never()).deliver(row);
+    assertThat(row.getClaimedUntil()).isNull(); // rolled back
+  }
+
+  @Test
+  void anOrderedClaimThatDoesNotCommit_failsThePass() {
+    pending(1L, 0);
+    failCommits = true;
+
+    assertThatThrownBy(worker::relayBatch).hasMessageContaining("database gone");
+
+    assertThat(lane.available()).isEqualTo(2);
+  }
+
+  @Test
+  void keysAreServedRoundRobin_fromTheCursor_wrappingRound() {
+    concurrent(1L, "a");
+    concurrent(2L, "a");
+    concurrent(3L, "b");
+    concurrent(4L, "b");
+    concurrent(5L, "c");
+    concurrent(6L, "c");
+    List<String> served = new CopyOnWriteArrayList<>();
+    doAnswer(
+            inv -> {
+              served.add(inv.<OutboxEvent>getArgument(0).getOrderingKey());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    relay(); // two slots: a, b - the cursor moves to b
+    relay(); // c, then wraps round to a
+    relay(); // b, c
+
+    assertThat(served).containsExactly("a", "b", "c", "a", "b", "c");
+    verify(repository).claimConcurrent(any(), eq("b"), eq(2));
+    verify(repository).claimConcurrentWrap(any(), eq("b"), eq(1)); // the wrap
+    // after the wrap the cursor is the WRAPPED pass's last key (a), not the first pass's (c)
+    verify(repository).claimConcurrent(any(), eq("a"), eq(2));
+    // a pass that filled every slot never wraps
+    verify(repository, times(1)).claimConcurrentWrap(any(), any(), anyInt());
+  }
+
+  @Test
+  void anUnroutableConcurrentRow_isBookedInTheClaim_andTakesNoSlot() {
+    when(publisher.supports(any())).thenReturn(false);
+    OutboxEvent row = concurrent(1L, null);
+
+    assertThat(relay()).isZero();
+
+    assertThat(row.getAttempts()).isEqualTo(1);
+    assertThat(lane.available()).isEqualTo(2);
+  }
+
+  @Test
+  void aSendTheClosingLaneRefuses_returnsItsSlot_theLeaseLapses() {
+    OutboxEvent row = concurrent(1L, null);
+    lane.close();
+
+    assertThat(worker.relayBatch()).isEqualTo(1);
+
+    assertThat(lane.available()).isEqualTo(2);
+    assertThat(row.getRelayedOn()).isNull();
+    assertThat(row.getClaimedUntil()).isNotNull();
+  }
+
+  @Test
+  void aBookingFailureOnTheConcurrentLane_isLogged_andTheSlotStillReturns() {
+    OutboxEvent row = concurrent(1L, null);
+    doAnswer(
+            inv -> {
+              failCommits = true;
+              return null;
+            })
+        .when(publisher)
+        .deliver(row);
 
     worker.relayBatch();
 
-    assertThat(event.getLastError()).hasSize(OutboxRelayWorker.LAST_ERROR_MAX_LENGTH);
+    await().atMost(Duration.ofSeconds(5)).until(() -> lane.available() == 2);
+    assertThat(row.getRelayedOn()).isNull();
+  }
+
+  @Test
+  void anOrderedRow_isClaimedWhateverTheConcurrentBacklog() {
+    CountDownLatch gate = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              if (inv.<OutboxEvent>getArgument(0).getLane() == Lane.CONCURRENT) {
+                gate.await();
+              }
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+    for (long id = 1; id <= 500; id++) {
+      concurrent(id, "one-slow-receiver");
+    }
+    OutboxEvent ordered = pending(501L, 0);
+
+    worker.relayBatch();
+
+    assertThat(ordered.getRelayedOn()).isNotNull();
+    gate.countDown();
+    await().atMost(Duration.ofSeconds(5)).until(() -> lane.available() == 2);
   }
 }

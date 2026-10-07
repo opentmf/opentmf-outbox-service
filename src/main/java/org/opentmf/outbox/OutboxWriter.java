@@ -3,9 +3,10 @@ package org.opentmf.outbox;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.Map;
-import lombok.RequiredArgsConstructor;
+import java.util.function.Supplier;
 import org.opentmf.outbox.internal.OutboxAppended;
 import org.opentmf.outbox.internal.OutboxEventRepository;
+import org.opentmf.outbox.internal.OutboxLaneStamper;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -16,15 +17,39 @@ import tools.jackson.databind.ObjectMapper;
  * (propagation {@code MANDATORY} — never dual-write, never a transaction of its own). The
  * payload is serialized at write time: the event is a fact frozen at commit, not re-read later.
  *
+ * <p>Since 1.3.0 the row is also stamped with the LANE and ORDERING KEY its publisher names,
+ * through the relay's own router - frozen at write time like the headers. The router is
+ * resolved lazily, so a publisher that itself appends through this writer creates no cycle.
+ *
  * <p>After the insert an {@code OutboxAppended} application event is published; it fires the
  * relay nudge only AFTER the caller's transaction commits.
  */
-@RequiredArgsConstructor
 public class OutboxWriter {
 
   private final OutboxEventRepository repository;
   private final ApplicationEventPublisher eventPublisher;
   private final ObjectMapper objectMapper;
+  private final Supplier<OutboxLaneStamper> laneStamper;
+
+  /** A writer that stamps no lane - every row it appends rides ORDERED. */
+  public OutboxWriter(
+      OutboxEventRepository repository,
+      ApplicationEventPublisher eventPublisher,
+      ObjectMapper objectMapper) {
+    this(repository, eventPublisher, objectMapper, () -> null);
+  }
+
+  /** The library's writer: rows are stamped by the (lazily resolved) lane stamper. */
+  public OutboxWriter(
+      OutboxEventRepository repository,
+      ApplicationEventPublisher eventPublisher,
+      ObjectMapper objectMapper,
+      Supplier<OutboxLaneStamper> laneStamper) {
+    this.repository = repository;
+    this.eventPublisher = eventPublisher;
+    this.objectMapper = objectMapper;
+    this.laneStamper = laneStamper;
+  }
 
   /**
    * Appends an outbox row without extra headers. The relay stamps the relay headers
@@ -104,6 +129,10 @@ public class OutboxWriter {
     event.setNextAttemptOn(OffsetDateTime.now(ZoneOffset.UTC));
     event.setReleaseAt(request.releaseAt());
     event.setReference(request.reference());
+    OutboxLaneStamper stamper = laneStamper.get();
+    if (stamper != null) {
+      stamper.stamp(event);
+    }
     OutboxEvent saved = repository.save(event);
     eventPublisher.publishEvent(new OutboxAppended(saved.getId()));
     return saved;

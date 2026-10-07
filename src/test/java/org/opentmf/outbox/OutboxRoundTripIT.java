@@ -33,7 +33,6 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.interceptor.TransactionAspectSupport;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -73,7 +72,7 @@ class OutboxRoundTripIT {
   /** Rows the post-relay seam saw — proves the auto-config collects listener beans. */
   static final Set<Long> RELAYED_SEEN = ConcurrentHashMap.newKeySet();
 
-  /** The row whose FIRST claim transaction is rolled back after the publish (crash window). */
+  /** The row whose FIRST booking is refused after the publish (the booking rolls back). */
   static final AtomicLong CRASH_AFTER_PUBLISH_OF = new AtomicLong(-1);
 
   @TestConfiguration
@@ -89,15 +88,16 @@ class OutboxRoundTripIT {
     }
 
     /**
-     * Models the crash window: the effect is delivered, then the claim transaction does NOT
-     * commit (rollback-only, once). Nothing is booked - not even attempts++ - so the row comes
-     * back exactly as it was and is published again.
+     * The effect is delivered, then its booking is REFUSED once: the booking transaction rolls
+     * back (stamp included) and the row is booked as an ordinary failure, then published again.
+     * (The crash proper - nothing booked at all - redelivers once the lease lapses; OutboxLeaseIT
+     * pins that.)
      */
     @Bean
     OutboxRelayedListener crashWindowListener() {
       return event -> {
         if (CRASH_AFTER_PUBLISH_OF.compareAndSet(event.getId(), -1)) {
-          TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+          throw new IllegalStateException("booking refused after the publish");
         }
       };
     }
@@ -222,9 +222,10 @@ class OutboxRoundTripIT {
   }
 
   /**
-   * CR §23 crash window (H.4): publish succeeds, the claim transaction rolls back before
-   * commit - the row is redelivered on the next pass with the SAME idempotency key, and the
-   * outcome is at-least-once: two records on the wire, one row relayed, no attempt booked.
+   * CR §23 window (H.4, re-stated for 1.3.0): publish succeeds, the booking rolls back - the row
+   * is redelivered with the SAME idempotency key, and the outcome is at-least-once: two records
+   * on the wire, one row relayed. Since 1.3.0 a refused booking books ONE failed attempt (the
+   * send ran outside the booking, so the rollback cannot pretend it never happened).
    */
   @Test
   void aRollbackAfterPublish_redeliversWithTheSameIdempotencyKey() {
@@ -251,7 +252,7 @@ class OutboxRoundTripIT {
           .atMost(Duration.ofSeconds(10))
           .untilAsserted(
               () -> assertThat(maintenance.inspect(row.getId()).relayedOn()).isNotNull());
-      assertThat(maintenance.inspect(row.getId()).attempts()).isZero(); // a rollback, not a failure
+      assertThat(maintenance.inspect(row.getId()).attempts()).isEqualTo(1); // booked as a failure
     }
   }
 

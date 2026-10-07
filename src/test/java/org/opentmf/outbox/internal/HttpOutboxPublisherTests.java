@@ -1,5 +1,6 @@
 package org.opentmf.outbox.internal;
 
+import org.opentmf.outbox.OutboxPublisher;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.header;
@@ -130,5 +131,15 @@ class HttpOutboxPublisherTests {
     OutboxEvent event = event("https://hub/cb", null);
     assertThatExceptionOfType(RestClientResponseException.class)
         .isThrownBy(() -> publisher.publish(event));
+  }
+
+  @Test
+  void anHttpRow_ridesTheConcurrentLane_keyedByItsReceiver() {
+    HttpOutboxPublisher publisher =
+        new HttpOutboxPublisher(RestClient.create(), null, new ObjectMapper(), "svc");
+    OutboxEvent row = event("https://hub/cb", null);
+
+    assertThat(publisher.lane(row)).isEqualTo(OutboxPublisher.Lane.CONCURRENT);
+    assertThat(publisher.orderingKey(row)).isEqualTo("https://hub/cb");
   }
 }

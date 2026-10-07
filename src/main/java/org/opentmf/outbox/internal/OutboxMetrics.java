@@ -12,8 +12,10 @@ import java.time.ZoneOffset;
  * common tags / scrape identity, never by a per-service metric prefix):
  *
  * <ul>
- *   <li>{@code opentmf.outbox.pending} - gauge, rows not yet relayed nor cancelled (held rows
- *       included)
+ *   <li>{@code opentmf.outbox.pending} - gauge, rows not yet relayed nor cancelled (held and
+ *       in-flight rows included)
+ *   <li>{@code opentmf.outbox.in-flight} - gauge, pending rows under a live lease: claimed by a
+ *       relay (any pod) whose send has not been booked yet (1.3.0)
  *   <li>{@code opentmf.outbox.parked} - gauge, alert when above 0
  *   <li>{@code opentmf.outbox.relay-lag} - gauge, how long the oldest RELEASED pending row has
  *       been deliverable (seconds) - a held row is not lagging until its hold passes
@@ -27,6 +29,7 @@ class OutboxMetrics {
 
   static final String PENDING = "opentmf.outbox.pending";
   static final String PARKED = "opentmf.outbox.parked";
+  static final String IN_FLIGHT = "opentmf.outbox.in-flight";
   static final String RELAY_LAG = "opentmf.outbox.relay-lag";
   static final String RELAYED = "opentmf.outbox.relayed";
   static final String DROPPED = "opentmf.outbox.dropped";
@@ -41,13 +44,19 @@ class OutboxMetrics {
     this.repository = repository;
     Gauge.builder(
             PENDING, repository, OutboxEventRepository::countByRelayedOnIsNullAndCancelledOnIsNull)
-        .description("Outbox rows not yet relayed nor cancelled (pending)")
+        .description("Outbox rows not yet relayed nor cancelled (pending, in-flight included)")
         .register(registry);
     Gauge.builder(
             PARKED,
             repository,
             OutboxEventRepository::countByRelayedOnIsNullAndCancelledOnIsNullAndParkedOnIsNotNull)
         .description("Outbox rows parked (delivery budget exhausted) - alert when > 0")
+        .register(registry);
+    Gauge.builder(
+            IN_FLIGHT,
+            repository,
+            r -> r.countInFlight(OffsetDateTime.now(ZoneOffset.UTC)))
+        .description("Outbox rows claimed by a live lease whose send is not booked yet")
         .register(registry);
     Gauge.builder(RELAY_LAG, this, OutboxMetrics::relayLagSeconds)
         .baseUnit("seconds")

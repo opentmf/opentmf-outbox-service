@@ -13,13 +13,14 @@
 
   <groupId>org.opentmf.util</groupId>
   <artifactId>opentmf-outbox-service</artifactId>
-  <version>1.2.2-SNAPSHOT</version>
+  <version>1.3.0-SNAPSHOT</version>
   <packaging>jar</packaging>
 
   <name>opentmf-outbox-service</name>
   <url>https://github.com/opentmf/opentmf-outbox-service</url>
   <description>Transactional outbox as a Spring Boot starter: library-owned
-    Liquibase DDL, an at-least-once single-relay with SKIP LOCKED claims, a pluggable
+    Liquibase DDL, an at-least-once relay claiming by lease (an ordered lane and a
+    concurrent lane), a pluggable
     publisher SPI (Kafka default, HTTP with per-row client-profile selection), and the
     /ops maintenance TRIO — prune, unpark, and a TMF630-shaped pending list.
   </description>
@@ -72,10 +73,10 @@
     <!-- An opentmf library never imports the opentmf-versions BOM (the BOM
          aggregates the libraries — a library importing it would be a cycle in
          spirit and a lockstep coupling in practice). Direct property pin. -->
-    <tmf630-toolkit.version>3.3.0</tmf630-toolkit.version>
+    <tmf630-toolkit.version>3.4.0</tmf630-toolkit.version>
 
     <!-- Non-BOM-managed pins live here so versions:display-property-updates sees them. -->
-    <archunit.version>1.5.0</archunit.version>
+    <archunit.version>1.5.1</archunit.version>
     <jacoco-maven-plugin.version>0.8.15</jacoco-maven-plugin.version>
     <maven-enforcer-plugin.version>3.6.3</maven-enforcer-plugin.version>
 
@@ -357,7 +358,12 @@
           <goals>deploy</goals>
         </configuration>
       </plugin>
-      <!-- *IT classes (Testcontainers round-trips) run under failsafe at verify. -->
+      <!-- *IT classes (Testcontainers round-trips) run under failsafe at verify - twice
+           over the lane: the default execution on the build JDK (17, platform threads), and
+           virtual-threads-it forked on a JDK 21+ TOOLCHAIN for the *VirtualIT classes (the
+           bytecode stays 17; virtual threads exist only at runtime). A machine without a 21+
+           entry in ~/.m2/toolchains.xml fails the build there - "both executors tested" must
+           never quietly mean one. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
@@ -367,6 +373,27 @@
               <goal>integration-test</goal>
               <goal>verify</goal>
             </goals>
+            <configuration>
+              <excludes>
+                <exclude>**/*VirtualIT.java</exclude>
+              </excludes>
+            </configuration>
+          </execution>
+          <execution>
+            <id>virtual-threads-it</id>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+            <configuration>
+              <includes>
+                <include>**/*VirtualIT.java</include>
+              </includes>
+              <jdkToolchain>
+                <version>[21,)</version>
+              </jdkToolchain>
+              <summaryFile>${project.build.directory}/failsafe-reports/failsafe-summary-virtual.xml</summaryFile>
+            </configuration>
           </execution>
         </executions>
       </plugin>
