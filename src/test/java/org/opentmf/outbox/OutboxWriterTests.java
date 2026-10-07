@@ -1,6 +1,8 @@
 package org.opentmf.outbox;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -11,6 +13,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.opentmf.outbox.internal.OutboxAppended;
 import org.opentmf.outbox.internal.OutboxEventRepository;
+import org.opentmf.outbox.internal.OutboxLaneStamper;
 import org.springframework.context.ApplicationEventPublisher;
 import tools.jackson.databind.ObjectMapper;
 
@@ -97,5 +100,32 @@ class OutboxWriterTests {
     // the nudge is harmless - the relay simply finds nothing claimable
     assertThat(saved.getNextAttemptOn()).isBeforeOrEqualTo(OffsetDateTime.now());
     verify(events).publishEvent(new OutboxAppended(42L));
+  }
+
+  @Test
+  void append_stampsTheLaneThroughTheLazilyResolvedStamper() {
+    stubSave();
+    OutboxLaneStamper stamper = mock(OutboxLaneStamper.class);
+    doAnswer(
+            inv -> {
+              inv.<OutboxEvent>getArgument(0).setLane(OutboxPublisher.Lane.CONCURRENT);
+              return null;
+            })
+        .when(stamper)
+        .stamp(any());
+    OutboxWriter stamping = new OutboxWriter(repository, events, new ObjectMapper(), () -> stamper);
+
+    OutboxEvent saved = stamping.append("agg", "a-1", "e.v1", "https://hub/x", Map.of());
+
+    assertThat(saved.getLane()).isEqualTo(OutboxPublisher.Lane.CONCURRENT);
+  }
+
+  @Test
+  void theThreeArgumentWriter_stampsNoLane() {
+    stubSave();
+
+    OutboxEvent saved = writer.append("agg", "a-1", "e.v1", "https://hub/x", Map.of());
+
+    assertThat(saved.getLane()).isNull(); // rides ORDERED
   }
 }

@@ -16,11 +16,16 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.thread.Threading;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
+import org.springframework.core.env.Environment;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.client.RestClient;
 import tools.jackson.databind.ObjectMapper;
 
@@ -53,8 +58,15 @@ public class OutboxAutoConfiguration {
   public OutboxWriter outboxWriter(
       OutboxEventRepository repository,
       ApplicationEventPublisher eventPublisher,
-      ObjectMapper objectMapper) {
-    return new OutboxWriter(repository, eventPublisher, objectMapper);
+      ObjectMapper objectMapper,
+      ObjectProvider<OutboxLaneStamper> laneStamper) {
+    // lazy: a consumer publisher that appends through the writer must not form a cycle
+    return new OutboxWriter(repository, eventPublisher, objectMapper, laneStamper::getObject);
+  }
+
+  @Bean
+  OutboxLaneStamper outboxLaneStamper(OutboxPublisherRouter router) {
+    return new OutboxLaneStamper(router);
   }
 
   @Bean
@@ -64,18 +76,33 @@ public class OutboxAutoConfiguration {
 
   @Bean
   OutboxMetrics outboxMetrics(
-      ObjectProvider<MeterRegistry> registry, OutboxEventRepository repository) {
+      ObjectProvider<MeterRegistry> registry,
+      OutboxEventRepository repository,
+      OutboxProperties properties) {
     // No registry bean (a consumer without actuator) = a simple local registry: the relay
     // keeps working, the gauges just have no exporter. Consumers with actuator get the real
     // one automatically.
     return new OutboxMetrics(
         registry.getIfAvailable(io.micrometer.core.instrument.simple.SimpleMeterRegistry::new),
-        repository);
+        repository,
+        properties.getMetricsRefresh());
   }
 
   @Bean
   OutboxPublisherRouter outboxPublisherRouter(List<OutboxPublisher> publishers) {
     return new OutboxPublisherRouter(publishers);
+  }
+
+  /**
+   * The CONCURRENT lane: virtual threads when the runtime is 21+ AND the application enables
+   * {@code spring.threads.virtual.enabled} (Boot's own test), platform threads otherwise.
+   */
+  @Bean
+  OutboxConcurrentLane outboxConcurrentLane(OutboxProperties properties, Environment environment) {
+    return new OutboxConcurrentLane(
+        properties.getConcurrent().getMaxInFlight(),
+        Threading.VIRTUAL.isActive(environment),
+        properties.getShutdownGrace());
   }
 
   @Bean
@@ -85,17 +112,38 @@ public class OutboxAutoConfiguration {
       OutboxBackoff backoff,
       OutboxMetrics metrics,
       OutboxProperties properties,
-      ObjectProvider<OutboxRelayedListener> relayedListeners) {
+      ObjectProvider<OutboxRelayedListener> relayedListeners,
+      PlatformTransactionManager transactionManager,
+      OutboxConcurrentLane lane) {
     // the post-relay seam: zero or more consumer beans, invoked in bean order inside the
-    // claim transaction (see OutboxRelayedListener)
+    // booking transaction that stamps relayed_on (see OutboxRelayedListener)
     return new OutboxRelayWorker(
-        repository, router, backoff, metrics, properties,
-        relayedListeners.orderedStream().toList());
+        repository,
+        router,
+        backoff,
+        metrics,
+        properties,
+        relayedListeners.orderedStream().toList(),
+        relayTransactions(transactionManager),
+        lane);
+  }
+
+  /**
+   * The relay's short claim and booking transactions, READ COMMITTED whatever the application's
+   * default: the CONCURRENT claim's re-check must see, in a NEW snapshot, the leases another pod
+   * committed before releasing a key's advisory lock - under REPEATABLE READ the transaction's
+   * first snapshot would hide them.
+   */
+  static TransactionTemplate relayTransactions(PlatformTransactionManager transactionManager) {
+    TransactionTemplate template = new TransactionTemplate(transactionManager);
+    template.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+    return template;
   }
 
   @Bean
-  OutboxRelay outboxRelay(OutboxRelayWorker worker, OutboxProperties properties) {
-    return new OutboxRelay(worker, properties);
+  OutboxRelay outboxRelay(
+      OutboxRelayWorker worker, OutboxProperties properties, OutboxConcurrentLane lane) {
+    return new OutboxRelay(worker, properties, lane);
   }
 
   @Bean
@@ -111,36 +159,62 @@ public class OutboxAutoConfiguration {
     return new OutboxMaintenanceService(repository, properties, eventPublisher);
   }
 
-  /** Kafka default publisher - LOWEST precedence so consumer publishers match first. */
-  @Bean
-  @Order(Ordered.LOWEST_PRECEDENCE)
-  @ConditionalOnClass(KafkaTemplate.class)
-  @ConditionalOnBean(KafkaTemplate.class)
-  OutboxPublisher kafkaOutboxPublisher(
-      KafkaTemplate<Object, Object> kafkaTemplate,
-      OutboxProperties properties,
-      ObjectMapper objectMapper,
-      org.springframework.core.env.Environment environment) {
-    return new KafkaOutboxPublisher(
-        kafkaTemplate,
-        properties,
-        objectMapper,
-        environment.getProperty("spring.application.name", "unknown"));
+  /**
+   * The publisher defaults live in NESTED, name-guarded configurations so this outer class
+   * names no Kafka or web type in any bean-method signature. A method-level guard is not
+   * enough: Spring evaluates it from ASM metadata and skips the bean, but still introspects the
+   * enclosing class's methods reflectively to resolve the OTHER factory methods - and a type
+   * missing from the consumer's classpath then throws {@code NoClassDefFoundError} and no
+   * context starts (found on a Kafka-less consumer, 1.2.0). A class-level name-based guard is
+   * evaluated BEFORE the nested class is loaded, so the guarded type is linked only when the
+   * condition holds; the outer {@code afterName} ordering is inherited by the nested classes.
+   *
+   * <p>Deliberately NOT {@code @Configuration}: the nested classes are lite member classes
+   * (bean methods only). A {@code @Configuration} nested class is a component-scan candidate,
+   * and a consumer whose scan root covers {@code org.opentmf.outbox} (the library's own test
+   * application is one) would register it AHEAD of the auto-configuration order - its
+   * {@code @ConditionalOnBean(KafkaTemplate)} then evaluates before {@code KafkaAutoConfiguration}
+   * has registered the template and the publisher silently vanishes ("No OutboxPublisher
+   * supports destination"). A member class without the stereotype is invisible to the scan and
+   * is processed only as part of this auto-configuration. {@code KafkaLessStartupTests} pins
+   * all three facts.
+   */
+  @ConditionalOnClass(name = "org.springframework.kafka.core.KafkaTemplate")
+  static class KafkaPublisherConfiguration {
+
+    /** Kafka default publisher - LOWEST precedence so consumer publishers match first. */
+    @Bean
+    @Order(Ordered.LOWEST_PRECEDENCE)
+    @ConditionalOnBean(KafkaTemplate.class)
+    OutboxPublisher kafkaOutboxPublisher(
+        KafkaTemplate<Object, Object> kafkaTemplate,
+        OutboxProperties properties,
+        ObjectMapper objectMapper,
+        Environment environment) {
+      return new KafkaOutboxPublisher(
+          kafkaTemplate,
+          properties,
+          objectMapper,
+          environment.getProperty("spring.application.name", "unknown"));
+    }
   }
 
-  /** HTTP publisher for http(s):// destinations - just above the Kafka fallback. */
-  @Bean
-  @Order(Ordered.LOWEST_PRECEDENCE - 1)
-  @ConditionalOnClass(RestClient.class)
-  OutboxPublisher httpOutboxPublisher(
-      ObjectProvider<OutboxClientProfileResolver> profileResolver,
-      ObjectMapper objectMapper,
-      org.springframework.core.env.Environment environment) {
-    return new HttpOutboxPublisher(
-        RestClient.create(),
-        profileResolver.getIfAvailable(),
-        objectMapper,
-        environment.getProperty("spring.application.name", "unknown"));
+  @ConditionalOnClass(name = "org.springframework.web.client.RestClient")
+  static class HttpPublisherConfiguration {
+
+    /** HTTP publisher for http(s):// destinations - just above the Kafka fallback. */
+    @Bean
+    @Order(Ordered.LOWEST_PRECEDENCE - 1)
+    OutboxPublisher httpOutboxPublisher(
+        ObjectProvider<OutboxClientProfileResolver> profileResolver,
+        ObjectMapper objectMapper,
+        Environment environment) {
+      return new HttpOutboxPublisher(
+          RestClient.create(),
+          profileResolver.getIfAvailable(),
+          objectMapper,
+          environment.getProperty("spring.application.name", "unknown"));
+    }
   }
 
   /**

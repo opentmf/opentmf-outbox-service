@@ -1,25 +1,234 @@
 # Changelog
 
-## 1.2.1
+## 1.3.0 - 2026-10-06
 
-Documentation-and-guard release: no behaviour changes, no schema changes. A
-1.2.0 consumer upgrades unchanged.
+OUTBOX-HTTP-LANE-1: HTTP rows leave the ordered relay, and every row is claimed
+by **lease**. Until now the relay was one thread that published up to
+`batch-size` rows one after another inside ONE transaction. A slow HTTP
+subscriber delayed every Kafka row behind it, and a database connection plus
+the batch's row locks were held across every backend call.
+
+### Fixed
+
+- **The metrics gauges read the whole table on every scrape.** `pending`, `parked` and
+  `relay-lag` ran unindexed queries over every row, relayed history included. On
+  3.5–4.8 M-row tables that took 7–20 s per query and about 3 PostgreSQL cores with no
+  traffic. Scrapes outlasted their 10 s timeout, so flow and 681 read `up=0` exactly
+  under load (load test 2026-10-06, F-2).
+  - The gauges now read a snapshot that a daemon thread refreshes every
+    `opentmf.outbox.metrics-refresh` (default 15 s), so a scrape never touches the
+    database. Before the first refresh, and after a failed one, they read NaN.
+  - Each refresh query has a 5 s query timeout, so a database that does not answer
+    becomes a failed refresh, not a hung refresher with stale values standing. A new
+    gauge `opentmf.outbox.metrics-age` gives the seconds since the last successful
+    refresh; alert on it beside `parked`.
+  - Each refresh query is served by a partial index over the OPEN rows only
+    (`ix_outbox_pending`, `ix_outbox_parked`, `ix_outbox_open_since`,
+    `ix_outbox_claimed_until`). Pinned in `OutboxClaimPlanIT` over 1,000,000 relayed
+    rows, under both plan-cache modes.
+- **The retention prune could not prune a large table.** `prune()` ran one transaction
+  around Spring Data derived deletes. It loaded every expired row as an entity, found
+  them by a full scan (`relayed_on` had no index), and removed them one by one. The
+  nightly job ran dnms-681 and dnms-flow out of CPU and memory, failed liveness twice
+  each, and pruned nothing (load test 2026-10-06, F-1).
+  - The prune now deletes set-based in batches (`opentmf.outbox.maintenance.batch-size`,
+    default 5,000), oldest first. Each batch is its own short transaction
+    (`REQUIRES_NEW`, so a caller already in a transaction neither holds the batches in
+    it nor undoes them with its rollback), driven by
+    `ix_outbox_relayed_on` / `ix_outbox_cancelled_on`, with no entity loaded.
+  - A call is bounded by `opentmf.outbox.maintenance.time-budget` (default 10 s). The
+    endpoint answers `{"outboxRowsPruned": n, "moreToPrune": bool}`: the 1.0.0 key is
+    unchanged, `moreToPrune` is new, and the caller calls again while it is true.
+  - `OutboxMaintenanceService.pruneExpired()` returns an `OutboxPruneResult`.
+    `prune()` / `pruneRelayed()` still return the count but are no longer one
+    transaction, and a call may leave expired rows for the next one.
+- Changeset `005-outbox-gauge-and-prune-indexes` adds the four indexes. They are built
+  `CONCURRENTLY` (the changeset runs outside a transaction), so a deploy onto a large
+  table does not block the appends of the pods still running. Each build is preceded by
+  `drop index concurrently if exists`, so a failed build's INVALID index is rebuilt,
+  not skipped. `ix_outbox_relayed_on` is about 107 MB on 5,000,000 relayed rows.
+
+### Changed (behaviour - read before upgrading)
+
+- **A publisher's own database write moves from `publish` to the booking
+  hook.** `publish` now runs in NO transaction. The 1.1.0 contract (a write
+  inside `publish` commits with `relayed_on`, the claim transaction) is
+  replaced by `OutboxPublisher.onBooked(event, OutboxBooking)`. The hook runs
+  inside the short booking transaction for EVERY outcome: `RELAYED` with the
+  result `deliver` returned, `RETRY`, `EXHAUSTED` (PARK/DROP), `CANCELLED`. Its
+  writes commit with the row's bookkeeping and roll back with it.
+  `OutboxRelayedListener.onRelayed` keeps its guarantee on both lanes: it runs
+  in the transaction that stamps `relayed_on`, after the hook.
+- **HTTP rows are no longer in `id` order against other rows.** The library's
+  `HttpOutboxPublisher` rides the new CONCURRENT lane. An HTTP row keeps no
+  order against Kafka (ORDERED) rows, nor against HTTP rows to other
+  receivers. Rows to the SAME receiver keep their `id` order on the happy path
+  (the destination is the ordering key; a failed row backs off, and later rows
+  may pass it).
+- **Cancel of a row in flight succeeds at once.** It used to block behind the
+  claim and then refuse with "already relayed". The booking honours the
+  cancel: a send that fails retires the row cancelled (no retry, no park), and
+  a send that succeeds is booked **sent-but-cancelled**. Both `relayed_on` and
+  `cancelled_on` are set, the row is listed under both states, and the relayed
+  listeners fire, because the effect did leave.
+- **A crash between send and booking redelivers once the lease lapses**, not
+  on the next pass: up to 15 s on the ORDERED lane, up to the CONCURRENT
+  lease (2 min by default).
+- A booking refused by a hook or listener now books one failed attempt
+  (`attempts++`). The send ran outside the booking, so the rollback cannot
+  pretend the attempt never happened.
+- **The lane and ordering key are stamped at APPEND**, frozen like the
+  headers: the writer asks the row's publisher through the relay's router.
+  The stamped lane wins at claim time, so changing a publisher's lane affects
+  only rows appended afterwards. A row not written through `OutboxWriter`
+  (raw SQL, migrated data, rows from before 1.3.0) has no lane and rides
+  ORDERED.
+- While a 1.3.0 relay holds a row's lease, the row's `next_attempt_on` reads
+  as the lease end (the claim moves it there; every booking sets it again).
+  This is what keeps a 1.2.x pod off leased rows during a rolling upgrade.
+  While old and new pods overlap, sends are not duplicated, but per-key order
+  is not guaranteed.
 
 ### Added
 
-- **The `/ops/outbox` OAS fragment, shipped in the jar.**
-  `META-INF/openapi/opentmf-outbox-ops.oas.yaml` (read through
-  `OutboxOpsOpenApi.fragment()`) documents the seven ops routes ONCE, with the
-  TMF630 paging the toolkit actually answers — 200 / 206 / 416, `X-Total-Count`,
-  `X-Result-Count`, a 1-based `Content-Range`, `Link`, `limit` clamped at
-  `max-limit` rather than rejected, and the toolkit's own error object on 400 and
-  416. Four consumers were describing this surface four different ways, none with
-  the paging; each now pastes the fragment and may pin itself with a drift test
-  (README "OAS fragment").
-- **Two guards.** `OutboxOpsOpenApiTests` fails when the fragment and
-  `OutboxOpsController` disagree on a route; `OutboxRoundTripIT` pins the paging
-  contract against the real tmf630-toolkit (partial page, past-the-end, clamp,
-  empty result), so a toolkit bump that changes it fails here first.
+- **Unpark by filter** (OUTBOX-BULK-UNPARK-1). `POST /ops/outbox/unpark` (JSON body)
+  and `OutboxMaintenanceService.unpark(destination, parkedFrom, parkedTo, reference)`
+  return every parked row of ONE destination to delivery. The destination is required;
+  a `parked_on` range and a `reference` are optional.
+  - Each row ends as the single unpark leaves it, under the same waiting-lock guard.
+  - Set-based and bounded like the prune (`opentmf.outbox.maintenance.batch-size` /
+    `time-budget`). The answer is `{"outboxRowsUnparked": n, "moreToUnpark": bool}`
+    (`OutboxUnparkResult`).
+  - The resend stays bounded by the lanes. A parked row is never leased, so no
+    unparked row carries a lease.
+  - Served by `ix_outbox_parked (destination, parked_on, id)` in changeset 005.
+- **Two lanes, chosen by the publisher:** `OutboxPublisher.lane(event)` is
+  `ORDERED` (the default: the single relay thread, `id` order) or `CONCURRENT`
+  (parallel sends, at most `opentmf.outbox.concurrent.max-in-flight`, default
+  8, per pod). The Kafka publisher stays ORDERED and the HTTP publisher is
+  CONCURRENT.
+- **Ordering key** for the CONCURRENT lane: `OutboxPublisher.orderingKey(event)`.
+  Rows sharing a non-null key are never in flight together, within a pod and
+  across pods, and are taken in `id` order on the happy path. Across pods, a
+  keyed candidate is claimed only after its key's transaction-scoped PostgreSQL
+  advisory lock is taken (`pg_try_advisory_xact_lock`, never waited for) and a
+  re-check in a fresh snapshot confirms it; the claim transactions run READ
+  COMMITTED. A key over 255 characters is stored as `sha256:<hex>`.
+- **Claim by lease.** New nullable column `claimed_until`. A short claim
+  transaction stamps `now + lease` and commits, the send runs in no
+  transaction and holds no database connection, and a short booking
+  transaction writes the outcome, guarded on the stamped value. A holder whose
+  lease lapsed books nothing. The lease is per publisher
+  (`OutboxPublisher.lease(event)`), with lane defaults `opentmf.outbox.lease`
+  (2 min, CONCURRENT) and `opentmf.outbox.ordered.lease` (15 s, ORDERED;
+  validated to exceed `send-timeout`). Each ORDERED row's lease is renewed by
+  the booking of the row before it, so it covers one send.
+- **Virtual threads where available.** The CONCURRENT lane runs on Spring's
+  `SimpleAsyncTaskExecutor`: virtual threads on a JDK 21+ runtime with
+  `spring.threads.virtual.enabled=true`, platform threads otherwise. The claim
+  takes the slot before it stamps the row, so `max-in-flight` is also the
+  platform-thread bound. The library's bytecode stays on Java 17.
+- `OutboxPublisher.deliver(event)` (returns a result for the booking; the
+  default calls `publish`), `OutboxBooking` (outcome, result, failure,
+  exhaustion).
+- `opentmf.outbox.shutdown-grace` (default 10 s): on stop, sends in flight get
+  this long to finish and book; the rest lapse by lease.
+- Gauge `opentmf.outbox.in-flight` (pending rows under a live lease, across
+  pods); `OutboxRowView` gains `inFlight` and `claimedUntil`. The `pending`
+  gauge still counts in-flight rows.
+- Changeset `004-outbox-claim-lease`: `claimed_until`, `lane` and
+  `ordering_key`, plus the partial indexes `ix_outbox_claimed_until`,
+  `ix_outbox_ordered_claim`, `ix_outbox_concurrent_keyed` and
+  `ix_outbox_concurrent_unkeyed`. It is additive
+  and `if not exists`, so it applies to an onboarded pre-library table too.
+  001–003 are untouched (their checksums hold, pinned against the released
+  1.2.1 changelog). Its four indexes are built `CONCURRENTLY` (the changeset
+  runs outside a transaction), each preceded by `drop index concurrently if
+  exists`, so a deploy does not block the appends of the pods still running and
+  a failed build's INVALID index is rebuilt, not skipped. With 005's four, the
+  eight builds take about 2.3 s per million rows (7.2 s on 3.1 M rows / 2.5 GB);
+  the consumer's startup probe must allow for the first start.
+
+### Dependencies
+
+- tmf630-toolkit 3.3.0 → 3.4.0; archunit 1.5.0 → 1.5.1. Parent
+  `spring-boot-starter-parent` 4.1.1 is the latest release.
+- **Named hold:** pitest-maven stays at 1.19.6 (1.30.0 available). Free
+  incremental history (`withHistory`) moved behind the commercial arcmutate
+  plugin from 1.20, and the bare flag fails the run there. Decided by Gökhan;
+  the standing hold of this repo.
+
+### Internal
+
+- Each lane claims over its own query and partial indexes with
+  `FOR UPDATE SKIP LOCKED`, each in its own short transaction on the relay
+  thread (the CONCURRENT one only when a lane slot is free). Neither reads
+  relayed rows or the other lane's backlog.
+- The CONCURRENT claim is native SQL (`OutboxClaimSql`).
+  - It reads the in-flight keys through the lease index (a live lease holds
+    its key even on a cancelled row).
+  - It steps key by key through `(ordering_key, id)`, round-robin from a
+    per-pod cursor, with one head probe per key not in flight, and stops at
+    the free slots.
+  - Its cost is bounded by those slots plus the keys stepped over. It does not
+    grow with the table or with one key's backlog: 0.5–1.3 ms with 5,000,000
+    relayed rows, including a 100,000-row one-key backlog and 10,000 keys.
+  - Two statement texts: the first pass with a plain lower key bound, and a
+    wrap-around pass with a plain upper bound. No parameter-dependent `OR`.
+    The in-flight keys are an array tested with `<> all(...)`, not a join.
+    So the shape holds under a custom and a generic plan alike; the library
+    never sets `plan_cache_mode`.
+  - The locked row is re-checked against the WHOLE eligibility predicate
+    (hold and due legs included). A row another pod booked into backoff
+    since the snapshot is not taken again.
+  - `ordering_key` is `collate "C"`, so the database's key order and the
+    relay's cursor order agree.
+  - `OutboxClaimPlanIT` pins the plan shape, filter-free key scans and the
+    buffer count under both plan modes.
+  - What still grows with the data: rows that are pending but not yet due
+    (held or in backoff) on the claim's lane, about 17–18 ms per 100,000.
+    The README states it.
+- The relay's nudges coalesce, and a freed CONCURRENT slot nudges the relay.
+- The ITs run twice over the lane: on JDK 17 (platform threads) and, for
+  `OutboxHttpLaneVirtualIT`, in a failsafe execution forked on a JDK 21+
+  toolchain (virtual threads).
+
+## 1.2.1 - 2026-09-21
+
+### Fixed
+
+- **A consumer without `spring-kafka` could not start.** `OutboxAutoConfiguration`
+  named `KafkaTemplate` in a bean-method signature; the method-level
+  `@ConditionalOnClass` did skip the bean, but Spring still introspects the
+  auto-configuration class reflectively to resolve its other factory methods,
+  and the missing type threw `NoClassDefFoundError: org/springframework/kafka/core/KafkaTemplate`
+  before any context came up. The Kafka publisher now lives in a nested,
+  name-guarded member class (`KafkaPublisherConfiguration`), so a Kafka-less
+  consumer starts with the HTTP publisher only and nothing Kafka-typed is
+  linked. Found on dnms-catalog 1.2.0 (Yusuf, 2026-09-11) — the first consumer
+  without Kafka; the six Kafka consumers were never affected. A consumer that
+  worked around it by adding `spring-kafka` and excluding
+  `KafkaAutoConfiguration` can drop both at its next touch.
+
+### Changed
+
+- **The HTTP publisher's guard is name-based and nested** for the same reason
+  (`HttpPublisherConfiguration`, `@ConditionalOnClass(name =
+  "org.springframework.web.client.RestClient")`): a web-less consumer (a pure
+  Kafka relay) also starts. No behaviour change for any consumer that has
+  spring-web.
+- Neither nested class is `@Configuration`: a stereotype would make it a
+  component-scan candidate, and a consumer whose scan root covers
+  `org.opentmf.outbox` would register it ahead of the auto-configuration
+  order, where `@ConditionalOnBean(KafkaTemplate)` evaluates before
+  `KafkaAutoConfiguration` exists and the publisher silently vanishes. Lite
+  member classes are processed only through the outer auto-configuration.
+- Compiled against `tmf630-toolkit-all` 3.3.0 (was 3.1.1) — the line the
+  opentmf-versions BOM pins for consumers; the dependency stays optional.
+- `KafkaLessStartupTests` pins all of it: a child-first test classloader that
+  DEFINES the library classes without the hidden package (Boot's
+  `FilteredClassLoader` cannot reproduce the reflective failure), a signature
+  scan of the outer class, and the no-stereotype rule on the nested ones.
 
 ## 1.2.0 - 2026-08-27
 

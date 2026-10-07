@@ -4,16 +4,22 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.querydsl.core.types.Predicate;
+import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.opentmf.outbox.internal.OutboxAppended;
@@ -180,18 +186,133 @@ class OutboxMaintenanceServiceTests {
   }
 
   @Test
-  void prune_deletesRelayedAndCancelledRowsPastRetention_quietWhenNothingQualifies() {
-    when(repository.deleteByRelayedOnBefore(any(OffsetDateTime.class))).thenReturn(3L);
-    when(repository.deleteByCancelledOnBefore(any(OffsetDateTime.class))).thenReturn(2L);
-    assertThat(service.prune()).isEqualTo(5L);
-    // both legs use the SAME cutoff - one retention for terminal rows
-    ArgumentCaptor<OffsetDateTime> cutoff = ArgumentCaptor.forClass(OffsetDateTime.class);
-    verify(repository).deleteByRelayedOnBefore(cutoff.capture());
-    verify(repository).deleteByCancelledOnBefore(cutoff.getValue());
+  void prune_deletesInBatches_relayedThenCancelled_untilABatchComesBackShort() {
+    when(repository.deleteRelayedBatch(any(OffsetDateTime.class), anyInt()))
+        .thenReturn(5_000, 5_000, 1_200);
+    when(repository.deleteCancelledBatch(any(OffsetDateTime.class), anyInt())).thenReturn(7);
 
-    when(repository.deleteByRelayedOnBefore(any(OffsetDateTime.class))).thenReturn(0L);
-    when(repository.deleteByCancelledOnBefore(any(OffsetDateTime.class))).thenReturn(0L);
-    assertThat(service.pruneRelayed()).isZero(); // the 1.0.0 name, same pass
+    OutboxPruneResult result = service.pruneExpired();
+
+    assertThat(result.relayed()).isEqualTo(11_200L);
+    assertThat(result.cancelled()).isEqualTo(7L);
+    assertThat(result.pruned()).isEqualTo(11_207L);
+    assertThat(result.moreToPrune()).isFalse();
+    // every batch of both legs uses the SAME cutoff (one retention) and the configured size
+    ArgumentCaptor<OffsetDateTime> cutoff = ArgumentCaptor.forClass(OffsetDateTime.class);
+    verify(repository, times(3)).deleteRelayedBatch(cutoff.capture(), eq(5_000));
+    verify(repository).deleteCancelledBatch(cutoff.getValue(), 5_000);
+    assertThat(cutoff.getAllValues()).containsOnly(cutoff.getValue());
+    assertThat(cutoff.getValue())
+        .isBetween(
+            OffsetDateTime.now().minusDays(7).minusMinutes(1), OffsetDateTime.now().minusDays(7));
+  }
+
+  @Test
+  void prune_stopsOnItsTimeBudget_andSaysMoreRemain() {
+    OutboxProperties properties = new OutboxProperties();
+    properties.getMaintenance().setTimeBudget(Duration.ZERO); // spent before the first batch
+    OutboxMaintenanceService bounded =
+        new OutboxMaintenanceService(repository, properties, events);
+
+    OutboxPruneResult result = bounded.pruneExpired();
+
+    assertThat(result.pruned()).isZero();
+    assertThat(result.moreToPrune()).isTrue();
+    verifyNoInteractions(repository);
+  }
+
+  @Test
+  void prune_stopsMidwayOnItsTimeBudget_withTheRowsSoFar() {
+    OutboxProperties properties = new OutboxProperties();
+    properties.getMaintenance().setTimeBudget(Duration.ofMillis(200));
+    OutboxMaintenanceService bounded =
+        new OutboxMaintenanceService(repository, properties, events);
+    when(repository.deleteRelayedBatch(any(OffsetDateTime.class), anyInt()))
+        .thenAnswer(
+            inv -> {
+              assertThat(new CountDownLatch(1).await(60, TimeUnit.MILLISECONDS)).isFalse();
+              return 5_000; // always a full batch: the backlog never ends within the budget
+            });
+
+    OutboxPruneResult result = bounded.pruneExpired();
+
+    assertThat(result.relayed()).isPositive().isLessThan(50_000L);
+    assertThat(result.moreToPrune()).isTrue();
+    verify(repository, never()).deleteCancelledBatch(any(), anyInt());
+  }
+
+  @Test
+  void prune_andItsOldName_answerTheCount() {
+    when(repository.deleteRelayedBatch(any(OffsetDateTime.class), anyInt())).thenReturn(3);
+    when(repository.deleteCancelledBatch(any(OffsetDateTime.class), anyInt())).thenReturn(2);
+
+    assertThat(service.prune()).isEqualTo(5L);
+    assertThat(service.pruneRelayed()).isEqualTo(5L); // the 1.0.0 name, same pass
+  }
+
+  @Test
+  void unparkByFilter_needsADestination_thereIsNoUnparkOfEverything() {
+    assertThatIllegalArgumentException()
+        .isThrownBy(() -> service.unpark(null, null, null, null))
+        .withMessageContaining("destination");
+    assertThatIllegalArgumentException().isThrownBy(() -> service.unpark(" ", null, null, null));
+    verifyNoInteractions(repository, events);
+  }
+
+  @Test
+  void unparkByFilter_runsBatchesUntilOneComesBackShort_andNudgesTheRelayOnce() {
+    when(repository.unparkBatch(any(), eq("hub:a"), any(), any(), eq(5_000)))
+        .thenReturn(5_000, 120);
+
+    OutboxUnparkResult result = service.unpark("hub:a", null, null, null);
+
+    assertThat(result.unparked()).isEqualTo(5_120L);
+    assertThat(result.moreToUnpark()).isFalse();
+    // open ends become far bounds - one plain range, never an OR on a parameter
+    ArgumentCaptor<OffsetDateTime> from = ArgumentCaptor.forClass(OffsetDateTime.class);
+    ArgumentCaptor<OffsetDateTime> to = ArgumentCaptor.forClass(OffsetDateTime.class);
+    verify(repository, times(2))
+        .unparkBatch(any(), eq("hub:a"), from.capture(), to.capture(), eq(5_000));
+    assertThat(from.getValue()).isBefore(OffsetDateTime.parse("1971-01-01T00:00:00Z"));
+    assertThat(to.getValue()).isAfter(OffsetDateTime.parse("9000-01-01T00:00:00Z"));
+    verify(events, times(1)).publishEvent(new OutboxAppended(0));
+  }
+
+  @Test
+  void unparkByFilter_withARangeAndAReference_usesTheNarrowStatement() {
+    OffsetDateTime from = OffsetDateTime.now().minusHours(2);
+    OffsetDateTime to = OffsetDateTime.now();
+    when(repository.unparkBatchByReference(any(), any(), any(), any(), any(), anyInt()))
+        .thenReturn(3);
+
+    OutboxUnparkResult result = service.unpark("hub:a", from, to, "sub-7");
+
+    assertThat(result.unparked()).isEqualTo(3L);
+    verify(repository)
+        .unparkBatchByReference(any(), eq("hub:a"), eq(from), eq(to), eq("sub-7"), eq(5_000));
+    verify(repository, never()).unparkBatch(any(), any(), any(), any(), anyInt());
+  }
+
+  @Test
+  void unparkByFilter_nothingMatching_isQuiet_noNudge() {
+    OutboxUnparkResult result = service.unpark("hub:a", null, null, null);
+
+    assertThat(result.unparked()).isZero();
+    assertThat(result.moreToUnpark()).isFalse();
+    verifyNoInteractions(events);
+  }
+
+  @Test
+  void unparkByFilter_stopsOnItsTimeBudget_andSaysMoreRemain() {
+    OutboxProperties properties = new OutboxProperties();
+    properties.getMaintenance().setTimeBudget(Duration.ZERO);
+
+    OutboxUnparkResult result =
+        new OutboxMaintenanceService(repository, properties, events)
+            .unpark("hub:a", null, null, null);
+
+    assertThat(result.moreToUnpark()).isTrue();
+    verifyNoInteractions(repository, events);
   }
 
   @Test

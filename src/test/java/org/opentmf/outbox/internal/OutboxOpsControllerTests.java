@@ -6,8 +6,11 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import java.time.OffsetDateTime;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxMaintenanceService;
+import org.opentmf.outbox.OutboxPruneResult;
+import org.opentmf.outbox.OutboxUnparkResult;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.ErrorResponse;
@@ -70,5 +73,41 @@ class OutboxOpsControllerTests {
       return ex;
     }
     throw new AssertionError("expected an exception");
+  }
+
+  @Test
+  void prune_answersTheCount_andWhetherMoreRemain() {
+    when(maintenance.pruneExpired()).thenReturn(new OutboxPruneResult(40_000, 12, true));
+
+    assertThat(controller.prune())
+        .containsEntry("outboxRowsPruned", 40_012L) // the 1.0.0 key, unchanged
+        .containsEntry("moreToPrune", true);
+  }
+
+  @Test
+  void unparkByFilter_answersTheCount_andWhetherMoreRemain() {
+    OffsetDateTime from = OffsetDateTime.now().minusHours(1);
+    when(maintenance.unpark("hub:a", from, null, null))
+        .thenReturn(new OutboxUnparkResult(42, true));
+
+    assertThat(
+            controller.unparkByFilter(
+                new OutboxOpsController.UnparkFilter("hub:a", from, null, null)))
+        .containsEntry("outboxRowsUnparked", 42L)
+        .containsEntry("moreToUnpark", true);
+  }
+
+  @Test
+  void unparkByFilter_withoutADestination_isA400() {
+    when(maintenance.unpark(null, null, null, null))
+        .thenThrow(new IllegalArgumentException("An unpark by filter needs a destination"));
+
+    Throwable thrown =
+        catchThrowable(
+            () ->
+                controller.unparkByFilter(
+                    new OutboxOpsController.UnparkFilter(null, null, null, null)));
+
+    assertErrorResponse(thrown, HttpStatus.BAD_REQUEST);
   }
 }

@@ -37,9 +37,18 @@ class OutboxOnboardingIT {
 
   private static final String LIBRARY_CHANGELOG = "db/changelog/opentmf-outbox.sql";
   private static final String RELEASED_1_1_0_CHANGELOG = "db/changelog-1.1.0/opentmf-outbox.sql";
+  private static final String RELEASED_1_2_1_CHANGELOG = "db/changelog-1.2.1/opentmf-outbox.sql";
   private static final List<String> LIBRARY_COLUMNS =
       List.of(
-          "client_profile", "release_at", "cancelled_on", "parked_on", "reference", "relayed_on");
+          "client_profile",
+          "release_at",
+          "cancelled_on",
+          "parked_on",
+          "reference",
+          "relayed_on",
+          "claimed_until",
+          "lane",
+          "ordering_key");
 
   private static String urlFor(String database) {
     return postgres.getJdbcUrl().replaceAll("/[^/?]+(\\?|$)", "/" + database + "$1");
@@ -84,12 +93,11 @@ class OutboxOnboardingIT {
    * records carry the identity ({@code db/changelog/opentmf-outbox.sql}) the 1.2.0 file must
    * be recognised against.
    */
-  private static Path released110ChangelogRoot() throws Exception {
-    Path root = Files.createTempDirectory("outbox-1.1.0");
+  private static Path releasedChangelogRoot(String released) throws Exception {
+    Path root = Files.createTempDirectory("outbox-released");
     Path file = root.resolve(LIBRARY_CHANGELOG);
     Files.createDirectories(file.getParent());
-    try (var in =
-        OutboxOnboardingIT.class.getClassLoader().getResourceAsStream(RELEASED_1_1_0_CHANGELOG)) {
+    try (var in = OutboxOnboardingIT.class.getClassLoader().getResourceAsStream(released)) {
       Files.copy(in, file);
     }
     return root;
@@ -158,18 +166,36 @@ class OutboxOnboardingIT {
   }
 
   private static String pendingIndexPredicate(String url) throws SQLException {
+    return indexDefinition(url, "ix_outbox_pending");
+  }
+
+  /** Indexes PostgreSQL marks INVALID - a failed concurrent build leaves one behind. */
+  private static long invalidIndexes(String url) throws SQLException {
     try (Connection c =
             DriverManager.getConnection(url, postgres.getUsername(), postgres.getPassword());
         Statement st = c.createStatement();
         ResultSet rs =
             st.executeQuery(
-                "select indexdef from pg_indexes where indexname = 'ix_outbox_pending'")) {
+                "select count(*) from pg_index i join pg_class c on c.oid = i.indrelid"
+                    + " where c.relname = 'outbox' and not i.indisvalid")) {
+      rs.next();
+      return rs.getLong(1);
+    }
+  }
+
+  private static String indexDefinition(String url, String index) throws SQLException {
+    try (Connection c =
+            DriverManager.getConnection(url, postgres.getUsername(), postgres.getPassword());
+        Statement st = c.createStatement();
+        ResultSet rs =
+            st.executeQuery(
+                "select indexdef from pg_indexes where indexname = '" + index + "'")) {
       return rs.next() ? rs.getString(1) : null;
     }
   }
 
   @Test
-  void aFreshSchema_installsAllThreeChangesets() throws Exception {
+  void aFreshSchema_installsAllFourChangesets() throws Exception {
     String url = freshDatabase("fresh");
 
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
@@ -178,7 +204,9 @@ class OutboxOnboardingIT {
         .containsExactly(
             Map.entry("001-outbox", "EXECUTED"),
             Map.entry("002-outbox-hold-and-cancel", "EXECUTED"),
-            Map.entry("003-outbox-policy-reference-onboarding", "EXECUTED"));
+            Map.entry("003-outbox-policy-reference-onboarding", "EXECUTED"),
+            Map.entry("004-outbox-claim-lease", "EXECUTED"),
+            Map.entry("005-outbox-gauge-and-prune-indexes", "EXECUTED"));
     assertThat(columnNullability(url)).containsKeys(LIBRARY_COLUMNS.toArray(String[]::new));
     assertThat(pendingIndexPredicate(url))
         .contains("relayed_on IS NULL")
@@ -212,9 +240,15 @@ class OutboxOnboardingIT {
         .containsExactly(
             Map.entry("001-outbox", "MARK_RAN"),
             Map.entry("002-outbox-hold-and-cancel", "EXECUTED"),
-            Map.entry("003-outbox-policy-reference-onboarding", "EXECUTED"));
+            Map.entry("003-outbox-policy-reference-onboarding", "EXECUTED"),
+            Map.entry("004-outbox-claim-lease", "EXECUTED"),
+            Map.entry("005-outbox-gauge-and-prune-indexes", "EXECUTED"));
     assertThat(columnNullability(url)).containsKeys(LIBRARY_COLUMNS.toArray(String[]::new));
     assertThat(pendingIndexPredicate(url)).contains("parked_on IS NULL");
+    assertThat(indexDefinition(url, "ix_outbox_claimed_until")).isNotNull(); // 1.2.0-F + 004
+    assertThat(indexDefinition(url, "ix_outbox_ordered_claim")).isNotNull();
+    assertThat(indexDefinition(url, "ix_outbox_concurrent_keyed")).isNotNull();
+    assertThat(indexDefinition(url, "ix_outbox_concurrent_unkeyed")).isNotNull();
   }
 
   @Test
@@ -242,7 +276,9 @@ class OutboxOnboardingIT {
         .containsExactly(
             Map.entry("001-outbox", "MARK_RAN"),
             Map.entry("002-outbox-hold-and-cancel", "MARK_RAN"),
-            Map.entry("003-outbox-policy-reference-onboarding", "EXECUTED"));
+            Map.entry("003-outbox-policy-reference-onboarding", "EXECUTED"),
+            Map.entry("004-outbox-claim-lease", "EXECUTED"),
+            Map.entry("005-outbox-gauge-and-prune-indexes", "EXECUTED"));
     Map<String, Boolean> nullability = columnNullability(url);
     assertThat(nullability)
         .containsKeys(LIBRARY_COLUMNS.toArray(String[]::new))
@@ -261,7 +297,7 @@ class OutboxOnboardingIT {
       throws Exception {
     String url = freshDatabase("from110");
     // exactly what a 1.1.0 consumer recorded: the released file, under the included path
-    liquibaseUpdate(url, LIBRARY_CHANGELOG, released110ChangelogRoot());
+    liquibaseUpdate(url, LIBRARY_CHANGELOG, releasedChangelogRoot(RELEASED_1_1_0_CHANGELOG));
     List<String> recordedBy110 = rawRows(url);
     assertThat(recordedBy110).hasSize(2);
 
@@ -269,15 +305,68 @@ class OutboxOnboardingIT {
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
 
     // the two recorded rows are UNTOUCHED (same filename identity, same checksum, still
-    // EXECUTED - not re-run, not re-inserted under another path) and 003 was added
+    // EXECUTED - not re-run, not re-inserted under another path) and 003 + 004 were added
     List<String> after = rawRows(url);
-    assertThat(after).hasSize(3).startsWith(recordedBy110.toArray(String[]::new));
+    assertThat(after).hasSize(5).startsWith(recordedBy110.toArray(String[]::new));
     assertThat(after.get(2))
         .startsWith("003-outbox-policy-reference-onboarding|")
         .endsWith("|EXECUTED");
-    assertThat(columnNullability(url)).containsKeys("parked_on", "reference");
-    // and a second run is a no-op (003 is idempotent and recorded)
+    assertThat(columnNullability(url)).containsKeys("parked_on", "reference", "claimed_until");
+    // and a second run is a no-op (003/004 are idempotent and recorded)
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
-    assertThat(changelogRows(url)).hasSize(3);
+    assertThat(changelogRows(url)).hasSize(5);
+  }
+
+  /**
+   * 1.3.0 over a database the RELEASED 1.2.1 changelog migrated: 001-003 keep their recorded
+   * checksums (004 is appended, nothing above it edited) and 004 adds the lease column and its
+   * partial index; a second run is a no-op.
+   */
+  @Test
+  void aDatabaseMigratedByTheReleased121Changelog_gainsTheLease_withItsChecksumsIntact()
+      throws Exception {
+    String url = freshDatabase("from121");
+    liquibaseUpdate(url, LIBRARY_CHANGELOG, releasedChangelogRoot(RELEASED_1_2_1_CHANGELOG));
+    List<String> recordedBy121 = rawRows(url);
+    assertThat(recordedBy121).hasSize(3);
+    assertThat(columnNullability(url)).doesNotContainKey("claimed_until");
+
+    liquibaseUpdate(url, LIBRARY_CHANGELOG);
+
+    List<String> after = rawRows(url);
+    assertThat(after).hasSize(5).startsWith(recordedBy121.toArray(String[]::new));
+    assertThat(after.get(3)).startsWith("004-outbox-claim-lease|").endsWith("|EXECUTED");
+    assertThat(after.get(4))
+        .startsWith("005-outbox-gauge-and-prune-indexes|")
+        .endsWith("|EXECUTED");
+    // the gauge and prune indexes, built CONCURRENTLY and VALID
+    assertThat(indexDefinition(url, "ix_outbox_open_since"))
+        .contains("GREATEST(created_on, COALESCE(release_at, created_on))")
+        .contains("relayed_on IS NULL")
+        .contains("cancelled_on IS NULL");
+    assertThat(indexDefinition(url, "ix_outbox_parked")).contains("parked_on IS NOT NULL");
+    assertThat(indexDefinition(url, "ix_outbox_relayed_on")).contains("(relayed_on)");
+    assertThat(indexDefinition(url, "ix_outbox_cancelled_on")).contains("(cancelled_on)");
+    assertThat(invalidIndexes(url)).isZero();
+    assertThat(columnNullability(url))
+        .containsEntry("claimed_until", true)
+        .containsEntry("lane", true)
+        .containsEntry("ordering_key", true);
+    assertThat(indexDefinition(url, "ix_outbox_claimed_until"))
+        .contains("claimed_until IS NOT NULL")
+        .contains("relayed_on IS NULL");
+    assertThat(indexDefinition(url, "ix_outbox_ordered_claim")).contains("lane IS NULL");
+    assertThat(indexDefinition(url, "ix_outbox_concurrent_keyed"))
+        .contains("(ordering_key, id)")
+        .contains("'CONCURRENT'")
+        .contains("ordering_key IS NOT NULL");
+    assertThat(indexDefinition(url, "ix_outbox_concurrent_unkeyed"))
+        .contains("(id)")
+        .contains("ordering_key IS NULL");
+    // a live lease holds its key even on a cancelled row: the lease index ignores the cancel
+    assertThat(indexDefinition(url, "ix_outbox_claimed_until")).doesNotContain("cancelled_on");
+    assertThat(invalidIndexes(url)).isZero(); // the concurrent builds all completed
+    liquibaseUpdate(url, LIBRARY_CHANGELOG);
+    assertThat(changelogRows(url)).hasSize(5);
   }
 }

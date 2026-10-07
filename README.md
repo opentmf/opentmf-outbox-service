@@ -23,7 +23,7 @@ schema evolution arrives by library version bump):
 
 | Table Name | Description                                                            |
 |------------|------------------------------------------------------------------------|
-| OUTBOX     | Events frozen at commit, relayed at-least-once in id order              |
+| OUTBOX     | Events frozen at commit, relayed at-least-once, claimed by lease        |
 
 ```mermaid
 erDiagram
@@ -44,13 +44,17 @@ erDiagram
         timestamptz parked_on          "exhaustion stamp, outcome PARK (nullable, 1.2.0)"
         timestamptz relayed_on         "delivery completion (or DROP exhaustion); null while pending/parked"
         timestamptz cancelled_on       "cancellation of an unreleased effect (nullable, 1.1.0)"
+        timestamptz claimed_until      "the relay's lease; future = in flight (nullable, 1.3.0)"
+        varchar(16) lane               "ORDERED | CONCURRENT, stamped at append; null = ORDERED (1.3.0)"
+        varchar(255) ordering_key      "CONCURRENT rows sharing it are never in flight together (1.3.0)"
         text        last_error         "last failure, truncated — ops forensics (nullable)"
     }
 ```
 
 State is **derived** — there is no status column to corrupt. Four legs —
-pending, parked, relayed, cancelled — plus **held**, the pending sub-state
-with a future `release_at`:
+pending, parked, relayed, cancelled — plus two pending sub-states: **held**
+(a future `release_at`) and **in flight** (a future `claimed_until`: a relay
+holds the row's lease and its send is not booked yet, 1.3.0):
 
 ```mermaid
 flowchart LR
@@ -76,7 +80,16 @@ relayed rows.
 
 A partial index (`ix_outbox_pending` on `next_attempt_on where relayed_on is
 null and cancelled_on is null and parked_on is null`) keeps the relay's claim
-query cheap regardless of the terminal backlog.
+query cheap regardless of the terminal backlog. Since 1.3.0 each lane claims
+over its own partial indexes: `ix_outbox_ordered_claim` for the ORDERED lane;
+`ix_outbox_claimed_until` (leased unrelayed rows), `ix_outbox_concurrent_keyed`
+and `ix_outbox_concurrent_unkeyed` for the CONCURRENT lane, whose claim reads
+neither relayed rows nor more than one row per key.
+
+`relayed` and `cancelled` overlap in exactly one case: a row cancelled while
+its send was in flight, whose send then succeeded — booked
+**sent-but-cancelled**, both stamps set, listed under both states (see the
+lease below).
 
 ## How It Works
 
@@ -87,6 +100,7 @@ sequenceDiagram
     participant DB as outbox table
     participant T as OutboxRelayTrigger
     participant R as OutboxRelay (1 thread)
+    participant L as CONCURRENT lane (≤ max-in-flight)
     participant Pub as OutboxPublisher SPI
     participant K as Kafka / HTTP endpoint
 
@@ -96,23 +110,74 @@ sequenceDiagram
     DB-->>T: AFTER_COMMIT event
     T->>R: poke (normal path, milliseconds)
     Note over R: a fixed-delay sweep (default 5s)<br/>is the safety net for missed pokes
-    R->>DB: claim batch — FOR UPDATE SKIP LOCKED, id order
-    R->>Pub: publish(event) — first supports() wins
-    Pub->>K: deliver + x-idempotency-key / x-event-type / x-producer
+    R->>DB: CLAIM tx — stamp claimed_until = now + lease, COMMIT
+    R->>L: CONCURRENT rows (slot taken before the stamp)
+    R->>Pub: ORDERED rows, one by one, id order
+    L->>Pub: one send per (virtual) thread
+    Pub->>K: deliver — NO transaction, NO connection held
     K-->>Pub: ack
-    R->>DB: relayed_on = now() (same claim transaction)
+    Pub->>DB: BOOKING tx — guarded on the stamped lease:<br/>relayed_on + publisher hook + listeners, COMMIT
 ```
 
-- **One relay thread per pod, id-ascending.** Ordering is a contract **at one
-  replica**: rows appended in one business transaction — or for one aggregate
-  in successive ones — are delivered in `id` order (the "PI before bounce"
-  guarantee). **Across replicas** `FOR UPDATE SKIP LOCKED` is the guard, and it
-  interleaves: two pods take disjoint rows concurrently, so strict per-key
-  order across pods is not promised. A consumer needing it runs one replica or
-  accepts the interleave. Each pass drains: it keeps claiming batches while
-  full batches come back.
-- **At-least-once, consumer-dedupable.** A crash between delivery and commit
-  means redelivery; `x-idempotency-key = <spring.application.name>:outbox:<id>`
+- **Two lanes, chosen by the publisher (1.3.0) AT APPEND.** `OutboxPublisher.lane(event)`
+  is `ORDERED` (the default) or `CONCURRENT`. The writer asks the row's
+  publisher (through the relay's own router) and stamps `lane` and
+  `ordering_key` on the row, **frozen like the headers**. The stamped lane
+  wins at claim time even if the publisher would now say otherwise, so
+  changing a publisher's lane affects only rows appended afterwards. A row
+  not written through `OutboxWriter` (a raw SQL insert, migrated data, a row
+  from before 1.3.0) has no lane and rides ORDERED. An append never fails on
+  this account: a row no publisher supports, or whose publisher throws while
+  naming its lane, is stored without one and the relay books it as before.
+  The **ORDERED** lane is the single relay thread per pod: rows go one by one
+  in `id` order — the 1.2.x behaviour; the Kafka publisher rides it. The **CONCURRENT** lane sends rows
+  in parallel, one per thread, at most `concurrent.max-in-flight` (default 8)
+  at a time; the HTTP publisher rides it, so a slow subscriber never delays a
+  Kafka row again. CONCURRENT rows keep **no order** against ORDERED rows, nor
+  against CONCURRENT rows with another **ordering key**. Rows sharing a key
+  are never in flight together and go in `id` order on the happy path (a
+  failed row backs off, and later rows of its key may pass it). The HTTP
+  publisher's key is the destination, so rows to one receiver keep their order.
+  A key over 255 characters is stored as `sha256:<hex>`. **Each lane claims
+  over its own query and index**, so no backlog of one lane can hide a row of
+  the other: an ORDERED row relays within seconds behind 1,500 pending rows of
+  one slow subscriber (`OutboxBacklogIT`).
+- **Claimed by lease, not by a lock held across the send.** A short claim
+  transaction stamps `claimed_until = now + lease` on the rows it takes and
+  commits. The send runs in **no transaction and holds no database
+  connection**. A short booking transaction then writes the outcome, guarded
+  on `id = ? and claimed_until = <the value this holder stamped>`. If the lease
+  lapsed (the call outlived it, or the pod died) any relay may claim the row
+  again, and the late holder books nothing. **A publisher's lease must exceed
+  its longest call** (`lease(event)`, or the lane default:
+  `opentmf.outbox.lease` 2 min for CONCURRENT, `opentmf.outbox.ordered.lease`
+  15 s for ORDERED, which must exceed `send-timeout`). Each ORDERED row's lease
+  is renewed in the booking of the row before it, so it covers one send, never
+  the batch.
+- **The CONCURRENT claim takes only free slots.** The slot (permit) is taken by
+  the claim before it stamps a row, never inside the send task, so no lease
+  burns while a row waits in a queue. On a JDK 21+ runtime with
+  `spring.threads.virtual.enabled=true` the sends run on virtual threads. Any
+  other runtime uses platform threads, and that fallback is safe only because
+  of this ordering: Spring's `SimpleAsyncTaskExecutor` starts one thread per
+  task, so `max-in-flight` is also the thread bound. The library's bytecode
+  stays on Java 17.
+- **Ordering at one replica** therefore means: ORDERED rows in `id` order,
+  CONCURRENT rows in `id` order per ordering key. **Across replicas**
+  `FOR UPDATE SKIP LOCKED` plus the lease is the guard: two pods never take
+  one row twice. A row another pod is claiming is skipped, and once that claim
+  commits the row carries a live lease. Pods still interleave ORDERED rows, so
+  strict order across pods is not promised. Rows of one ordering key are
+  **never in flight together, within a pod and across pods**. Each keyed
+  candidate is claimed only after its key's transaction-scoped **PostgreSQL
+  advisory lock** (`pg_try_advisory_xact_lock`, tried, never waited for) is
+  taken and a re-check in a fresh snapshot still finds it the key's head with
+  nothing of its key in flight. A pod that loses the lock skips the key for
+  one pass and sees the other pod's committed lease on the next. The claim
+  transactions run READ COMMITTED whatever the application's default.
+- **At-least-once, consumer-dedupable.** A crash between delivery and booking
+  means redelivery once the row's lease lapses (seconds on the ORDERED lane,
+  up to the lease on the CONCURRENT lane); `x-idempotency-key = <spring.application.name>:outbox:<id>`
   makes consumer dedup trivial. **The key format is a cross-service contract**
   (downstream dedup tables key on it) — it never changes shape; the constants
   and the formatter are public in `OutboxHeaders`. Set
@@ -135,24 +200,86 @@ sequenceDiagram
   delivery, kept failing — the destination saw N idempotent copies); and the
   001/002 onboarding preconditions probe `information_schema` for
   `current_schema()`, i.e. the outbox lives in the consumer's own schema.
-- **Claim eligibility lives in ONE place** — the claim query:
+- **Claim eligibility lives in ONE place**, the two lane claims (one
+  repository, side by side):
   `relayed_on is null and cancelled_on is null and parked_on is null and
-  (release_at is null or release_at <= now) and next_attempt_on <= now`, in
-  `id` order (no attempt-count leg: the budget is per publisher). A held row
-  waits for its hold; a cancelled or parked row never comes back on its own.
-  The ops actions (`cancel`, `unpark`) read their row under a waiting
-  `FOR UPDATE` **with no timeout**: one that races a claim in flight blocks for
-  that one publish, then sees the row as the relay left it — a cancel that
-  arrives while the relay holds the row fails with "already relayed" rather
-  than silently marking a delivered effect cancelled.
+  (release_at is null or release_at <= now) and next_attempt_on <= now and
+  (claimed_until is null or claimed_until <= now)`, in `id` order, `FOR UPDATE
+  SKIP LOCKED` (no attempt-count leg: the budget is per publisher). The
+  ORDERED claim adds `lane is null or lane <> 'CONCURRENT'`. The CONCURRENT
+  claim adds `lane = 'CONCURRENT'` and, for a keyed row, the ordering-key
+  rule: no row of its key with a lower id is due, and no row of its key at all
+  is in flight. A live lease holds its key even if its row was cancelled
+  meanwhile, because the send is still running. A row in backoff lets later
+  rows of its key pass. A held row waits for its hold; a cancelled or parked
+  row never comes back on its own.
+- **What a claim costs.** Both claims run on the relay thread, each in its own
+  short transaction: ORDERED first, then CONCURRENT, only when a lane slot is
+  free. The ORDERED sends start after both. Neither claim reads relayed rows
+  or the other lane's backlog.
+  - The ORDERED claim reads its batch from its own index in `id` order.
+  - The CONCURRENT claim reads the keys in flight through the lease index. It
+    steps from key to key through the keyed index, **round-robin from a
+    per-pod cursor**, and probes one head row per key not in flight. It stops
+    as soon as it holds as many rows as there are free slots.
+  - So the CONCURRENT claim's cost is bounded by the free slots plus the keys
+    it steps over: those in flight (bounded by the slots across pods) and
+    those whose rows are all backing off or held. It does not grow with the
+    table, with the lane's backlog, or with one key's backlog.
+  - Measured with 5,000,000 relayed rows (`EXPLAIN (ANALYZE, BUFFERS)`):
+    idle 0.5 ms; 100,000 pending rows of one key, in flight 1.0 ms, not in
+    flight 0.9 ms; 10,000 keys × 10 rows 1.3 ms. The same under a custom and
+    a generic plan: the statements carry no parameter-dependent `OR` and no
+    join the planner could turn into a full read. `OutboxClaimPlanIT` pins
+    the shape under both plan modes.
+  - **What does grow: rows that are pending but not yet due**, on the claim's
+    own lane. Held rows (`release_at` in the future) and rows in backoff are
+    stepped over on every pass: about **17–18 ms per 100,000 such rows**
+    (ORDERED: 100 due rows behind 100,000 held, 17.9 ms; CONCURRENT: 100,000
+    unkeyed rows in backoff, 17.1 ms). A key whose rows are all in backoff or
+    held costs a step too, plus a walk over its not-due rows: 10,000 keys ×
+    10 rows all in backoff cost 376 ms per pass (about 38 µs per key). The
+    released 1.2.x claim paid more for the same rows (it read the whole
+    pending set). A consumer that keeps very large scheduled sets, or a
+    receiver whose rows all sit in backoff (a dead subscriber), should know
+    it; suspending or dropping such a receiver's rows bounds the cost.
+  - Keys are served round-robin, so across keys the claim order follows the
+    cursor, not `id`. The library promises no order between keys.
+- **The claim moves `next_attempt_on` to the lease end**, and every booking
+  sets it again: the publisher's backoff on a failure, the booking time
+  otherwise. Two consequences. A **pre-1.3.0 relay**, which knows no lease,
+  sees a leased row as not due and leaves it alone during a rolling upgrade.
+  The row view's `nextAttemptOn` of an in-flight row reads as its lease end.
+  The retry schedule is still computed from `attempts`, and `release_at` is
+  never touched.
+- **Ops actions against a row in flight.** `cancel` and `unpark` read their row
+  under a waiting `FOR UPDATE`. Since 1.3.0 that serialises only against the
+  short claim and booking transactions, never against a send (the claims skip
+  a row an ops action holds). A **cancel of a
+  row in flight succeeds at once**, and the booking honours it. A send that
+  then fails retires the row cancelled (no retry, no park; the booking hook
+  sees `CANCELLED`). A send that succeeds is booked **sent-but-cancelled**:
+  both stamps, listed under relayed and cancelled, the relayed listeners fire
+  because the effect did leave, and a WARN names it. An ORDERED row cancelled
+  before its turn is released unsent. An `unpark` never meets a live lease:
+  only a booking parks a row, and that booking clears the lease.
+- **Shutdown.** The relay stops claiming, gives the sends in flight
+  `shutdown-grace` (default 10 s) to finish and book, and abandons the rest:
+  they book nothing, and their rows are redelivered once their leases lapse.
 - **Publisher routing.** Everything that is not an `http(s)://` URL is a Kafka
   topic (the Kafka publisher registers at lowest precedence as the default).
   HTTP destinations are POSTed the payload with the relay headers. Consumers
   may contribute their own `OutboxPublisher` beans — first `supports()` wins,
   so `@Order` a consumer publisher ahead of the defaults (e.g. an `adapter:`
-  scheme). A publisher runs INSIDE the claim transaction and **may write to the
-  same database there** (flow's "mark recorded"): its writes commit together
-  with `relayed_on`.
+  scheme). A consumer without Kafka on the classpath gets the HTTP publisher
+  only; nothing Kafka-typed is linked (and a web-less consumer, conversely,
+  gets only the Kafka one). **A publisher's own database write** (flow's "mark
+  recorded", 681's subscription suspension) belongs in its **booking hook**
+  `onBooked(event, booking)`. The hook runs inside the booking transaction for
+  every outcome (`RELAYED` with `deliver`'s result, `RETRY`, `EXHAUSTED`,
+  `CANCELLED` with the failure), so the write commits and rolls back with the
+  row's bookkeeping. Until 1.2.x such a write lived in `publish`, inside the
+  claim transaction. Since 1.3.0 `publish` runs in no transaction.
 - **Wire headers vs private reference.** Both built-in publishers forward
   every stored header, then stamp `x-idempotency-key`, `x-event-type` and
   `x-producer`, **replacing** a stored header of the same name (both legs,
@@ -168,9 +295,12 @@ sequenceDiagram
 
 ## Requirements
 
-- Java 17+
+- Java 17+ (Java 21+ with `spring.threads.virtual.enabled=true` puts the
+  CONCURRENT lane on virtual threads; platform threads otherwise)
 - Spring Boot 4.1+
-- A JPA datasource (PostgreSQL is the shipped DDL dialect) and Liquibase
+- A JPA datasource and Liquibase. **PostgreSQL** is the shipped DDL dialect (the
+  changelog's precondition probes for it), and the CONCURRENT claim relies on
+  PostgreSQL advisory locks and `hashtext` for its cross-pod ordering-key guard
 - Kafka destinations: `spring-kafka` + `spring-boot-kafka` (both optional here)
 - HTTP destinations: `spring-web` on the classpath (the HTTP publisher rides
   `RestClient`; without spring-web an `http(s)://` row is unroutable and parks)
@@ -191,6 +321,16 @@ opentmf:
     backoff-cap: 10m         # delay ceiling
     retention: 7d            # relayed AND cancelled rows older than this are pruned
     send-timeout: 10s        # broker-acknowledgement wait per publish
+    lease: 2m                # CONCURRENT lane default lease (> the longest call)
+    shutdown-grace: 10s      # how long a stopping relay lets sends in flight finish
+    metrics-refresh: 15s     # how often the gauges are re-read (a scrape never queries)
+    maintenance:             # the bounded bulk operations: prune, unpark by filter
+      batch-size: 5000       # rows per batch - each its own short transaction
+      time-budget: 10s       # one call stops after this and says more remain
+    ordered:
+      lease: 15s             # ORDERED lane default lease - short, > send-timeout
+    concurrent:
+      max-in-flight: 8       # CONCURRENT sends at once per pod (also the thread bound)
     ops-endpoints: true      # serve the /ops surface (see below) - a conditional switch,
                              # not a field of OutboxProperties
 ```
@@ -205,6 +345,13 @@ opentmf:
 | `backoff-cap`    | `Duration` | `10m`   | Ceiling for the exponential delay.                                    |
 | `retention`      | `Duration` | `7d`    | Used by the prune (`OutboxMaintenanceService.prune()`): relayed AND cancelled rows. |
 | `send-timeout`   | `Duration` | `10s`   | Non-transactional Kafka sends await the ack this long.                |
+| `lease`          | `Duration` | `2m`    | Lease of a CONCURRENT row when its publisher declares none; must exceed the lane's longest call. |
+| `ordered.lease`  | `Duration` | `15s`   | Lease of an ORDERED row when its publisher declares none. Short on purpose: after a pod stop the row waits this long. Must exceed `send-timeout` (validated at boot). |
+| `concurrent.max-in-flight` | `int` | `8` | CONCURRENT sends in flight per pod; the claim takes no more rows than free slots. |
+| `shutdown-grace` | `Duration` | `10s`   | On stop: the relay thread's and the in-flight sends' time to finish; the rest lapse by lease. |
+| `metrics-refresh` | `Duration` | `15s`  | How often the gauges are re-read from the database; a scrape reads the last values. |
+| `maintenance.batch-size` | `int`    | `5000`  | Rows per batch of a bulk operation (prune, unpark by filter); each batch is its own transaction, no entity loaded. |
+| `maintenance.time-budget` | `Duration` | `10s` | One bulk call stops after this; the answer says `moreToPrune` / `moreToUnpark` and the caller calls again. |
 | `ops-endpoints`  | `boolean`  | `true`  | `false` removes the library's `/ops` controller entirely. A `@ConditionalOnProperty` key read at boot, not a bound field. |
 
 ## Metrics
@@ -214,10 +361,29 @@ distinguished by the registry's common tags / scrape identity, never by a
 per-service metric prefix. Without a `MeterRegistry` bean the relay still works
 (a local simple registry, no exporter).
 
+**A scrape never touches the database (1.3.0).** The gauges read the last values that a
+daemon thread (`opentmf-outbox-metrics`) refreshes every `metrics-refresh` (default
+15 s, first refresh at start). Each refresh runs four queries, each served by its own
+partial index over the OPEN rows; none reads the relayed history.
+- **A database that does not answer cannot hang the refresher**: each refresh query has a
+  5 s query timeout, so it becomes a failed refresh. `metrics-age` (seconds since the last
+  successful refresh) keeps growing meanwhile; alert on it beside `parked`.
+- **Before the first refresh, and after a failed one**, the gauges read NaN: no value,
+  never a misleading zero.
+- `relay-lag` is computed at read time from the oldest open row's instant, so it keeps
+  growing between refreshes.
+- **Measured** with 1,000,000 relayed rows: idle, each query 0.1–0.7 ms. With 100,000
+  rows pending, the pending count reads its index in about 7 ms (it grows with the
+  OPEN rows only); the other three stay under 1 ms.
+- Up to 1.2.1 every scrape ran these queries over the whole table: 7–20 s each on
+  3.5–4.8 M-row tables, which put the scrape past its timeout.
+
 | Metric                     | Type    | Meaning                                            |
 |----------------------------|---------|----------------------------------------------------|
-| `opentmf.outbox.pending`   | gauge   | Rows not yet relayed nor cancelled (held and parked included) |
+| `opentmf.outbox.pending`   | gauge   | Rows not yet relayed nor cancelled (held, parked and in-flight included) |
+| `opentmf.outbox.in-flight` | gauge   | Pending rows under a live lease, across pods — claimed, send not booked yet (1.3.0) |
 | `opentmf.outbox.parked`    | gauge   | Rows with `parked_on` stamped — **alert when > 0** |
+| `opentmf.outbox.metrics-age` | gauge | Seconds since the gauges were last refreshed successfully — **alert when above a few refresh periods** (e.g. > 60 s with the default 15 s): the values above are stale or NaN |
 | `opentmf.outbox.relay-lag` | gauge   | Seconds the oldest *released* pending row has been deliverable (a held row is not lagging) |
 | `opentmf.outbox.relayed`   | counter | Successful relays, tagged by `destination`         |
 | `opentmf.outbox.dropped`   | counter | Rows given up by a publisher's DROP policy, tagged by `destination` (never counted as relayed) |
@@ -365,6 +531,41 @@ the exhaustion outcome (the destination said retrying is pointless); any other
 + the `dropped` counter — no relayed listener fires and `relayed` is not
 incremented.
 
+### Lanes, lease and the booking hook (`OutboxPublisher`, 1.3.0)
+
+Five more default methods. Leave them all alone and a publisher stays on the
+ORDERED lane exactly as in 1.2.x, except for where a database write must live
+(below):
+
+```java
+return new OutboxPublisher() {
+  public boolean supports(OutboxEvent e) { return e.getDestination().startsWith("hub:"); }
+  public void publish(OutboxEvent e) { deliver(e); }
+  public Lane lane(OutboxEvent e) { return Lane.CONCURRENT; }          // default ORDERED
+  public String orderingKey(OutboxEvent e) { return e.getDestination(); } // null = independent
+  public Duration lease(OutboxEvent e) { return Duration.ofSeconds(30); } // > the longest call; null = lane default
+  public Object deliver(OutboxEvent e) { return hub.post(e); }         // runs in NO transaction
+  public void onBooked(OutboxEvent e, OutboxBooking b) {              // runs IN the booking transaction
+    if (b.outcome() == OutboxBooking.Outcome.EXHAUSTED) subscriptions.suspend(e.getReference());
+  }
+};
+```
+
+- `deliver` is the relay's entry point. By default it calls `publish` and
+  returns `null`; override it when the booking needs something from the
+  answer (an id the receiver assigned).
+- `onBooked` sees **every** booked attempt: `RELAYED` (with `deliver`'s
+  result), `RETRY`, `EXHAUSTED` (with `PARK`/`DROP`) and `CANCELLED`, each
+  with its failure. It runs inside the booking transaction, after the row's
+  own bookkeeping and before the relayed listeners. Its writes commit with
+  that bookkeeping and roll back with it. When it throws, the booking rolls
+  back. A refused `RELAYED` booking is then booked as an ordinary failure, and
+  the hook sees that outcome too. A refused failure booking books nothing, and
+  the row is redelivered once its lease lapses.
+- A publisher that wrote to the database inside `publish` (1.1.0's documented
+  contract) must move the write into `onBooked`. In `publish` it would now
+  commit on its own, or fail for want of a transaction.
+
 ### Named HTTP clients (`OutboxClientProfileResolver`)
 
 The library deliberately does NOT depend on any HTTP-client stack beyond
@@ -395,15 +596,18 @@ OutboxRelayedListener recordStateStamp(RecordRepository records) {
 }
 ```
 
-The listener runs inside the claim transaction, after the effect is delivered,
-with `relayedOn` already set on the managed entity; several listeners run in
-bean order. A thrown exception undoes the stamp and books an ordinary delivery
-failure under the row's publisher policy — the publish then repeats, so the
+The listener runs **inside the transaction that stamps `relayed_on`**, on both
+lanes. Since 1.3.0 that is the short booking transaction, after the
+publisher's `onBooked` hook, with `relayedOn` already set on the managed
+entity; several listeners run in bean order. A thrown exception rolls the
+booking back (the stamp and every hook and listener write go with it) and
+books an ordinary delivery failure under the row's publisher policy — the publish then repeats, so the
 destination dedups via the idempotency key as for any at-least-once redelivery
 — and a listener that keeps failing exhausts the row only after that many
 republishes, so make it idempotent and reliable. Listeners never fire for a
-DROPPED row (nothing was delivered). Keep implementations same-database and
-fast: they run on the single relay thread.
+DROPPED row (nothing was delivered); they DO fire for a sent-but-cancelled
+row (the effect left). Keep implementations same-database and fast: the
+booking holds the row lock while they run.
 
 ### Ops endpoints
 
@@ -415,13 +619,72 @@ surface):
 
 | Method | Path                          | What                                                                  |
 |--------|-------------------------------|-----------------------------------------------------------------------|
-| POST   | `/ops/outbox/maintenance/prune` | Deletes relayed + cancelled rows past retention; wire to a CronJob kicker |
+| POST   | `/ops/outbox/maintenance/prune` | Deletes relayed + cancelled rows past retention, BOUNDED: answers `{"outboxRowsPruned": n, "moreToPrune": bool}`; wire to a CronJob that calls again while `moreToPrune` |
 | POST   | `/ops/outbox/{id}/unpark`     | Break-glass after the root cause is fixed: `parked_on` cleared, attempts reset, due now |
+| POST   | `/ops/outbox/unpark`          | Unpark by FILTER (JSON body `{"destination": …, "parkedFrom": …, "parkedTo": …, "reference": …}`, destination required), BOUNDED: answers `{"outboxRowsUnparked": n, "moreToUnpark": bool}`. Gate it like the single unpark |
 | POST   | `/ops/outbox/{id}/cancel`     | Withdraws an unreleased effect: never relayed, retained for audit     |
 | GET    | `/ops/outbox`                 | TMF630 triage list (attribute filtering + paging), payloads omitted   |
 | GET    | `/ops/outbox/state/{state}`   | The list narrowed to one derived-state leg (`pending`, `parked`, `relayed`, `cancelled`; unknown → 400), same filtering + paging on top |
 | GET    | `/ops/outbox/parked`          | Runbook alias of `/ops/outbox/state/parked`                           |
 | GET    | `/ops/outbox/{id}`            | One row in full — payload + `last_error`, the pre-unpark forensic read (behind the consumer's admin role, by ruling) |
+
+**The prune at scale (1.3.0).**
+- **How it deletes.** Batches of `maintenance.batch-size` terminal rows, oldest first, found
+  through `ix_outbox_relayed_on` / `ix_outbox_cancelled_on` and deleted by id in one
+  set-based statement per batch, each its own short transaction. No entity is loaded.
+  Parked rows are never pruned.
+- **Independent of the caller.** Each batch runs in its OWN transaction
+  (`REQUIRES_NEW`), even when the caller is inside one: a consumer calling `prune()` from
+  its own `@Transactional` service does not hold every batch in one long transaction,
+  and its rollback does not undo them. While a batch runs, the caller's connection
+  stays checked out beside the batch's, so the pool needs one connection to spare. The
+  same holds for the unpark by filter.
+- **Bounded.** A call stops after `maintenance.time-budget` and answers `moreToPrune: true`.
+  The CronJob loops while it is true, and a request thread never works through the
+  whole backlog.
+- **Measured.** 305,000 expired rows in one 479 ms call in the IT. A 5,000-row batch on
+  a 5,000,000-row table takes about 70 ms.
+- **What it costs.** `ix_outbox_relayed_on` is about as large as the primary key:
+  107 MB on 5,000,000 relayed rows.
+- **Why a B-tree on `relayed_on`.** It is exact and ordered: each batch starts at the
+  oldest expired row and never walks retained, parked or pending rows. A BRIN index
+  relies on physical order, which updates and vacuum reuse destroy. An id-ordered walk
+  would step over every parked and retained row on each call.
+- **Up to 1.2.1** the prune loaded every expired row as an entity in one transaction.
+  On 3.5–4.8 M-row tables it ran the pods out of CPU and memory and pruned nothing.
+- **The CronJob side** (`concurrencyPolicy: Forbid`, `backoffLimit: 0`) is the
+  deployment's.
+
+**Unpark by filter (1.3.0)**, for after a receiver's outage that outlasted its
+publisher's budget. With the defaults (10 attempts, 5 s doubling to 10 min) every row
+older than about 31 minutes is then parked. Use it **once the receiver is back**:
+`POST /ops/outbox/unpark` (or `OutboxMaintenanceService.unpark(destination, from, to,
+reference)` from your own ops code).
+- **What it unparks.** Every parked row of that destination, optionally within a
+  `parked_on` range and of one `reference`. The destination is required: there is no
+  "unpark everything".
+- **What each row looks like after.** Exactly as the single unpark leaves it: parked
+  stamp cleared, attempts reset, due now, `last_error` kept. It runs under the same
+  guard: a row an ops action holds is waited for and re-checked.
+- **Bounded.** It works in batches of `maintenance.batch-size` within
+  `maintenance.time-budget`. Call again while `moreToUnpark`.
+- **The resend stays bounded by the lanes.** At most `concurrent.max-in-flight`
+  CONCURRENT sends at a time, at most `batch-size` ORDERED rows per pass.
+- **A row parked by a `TerminalOutboxException`** (a refused body, say) comes back
+  parked on its first attempt unless the cause was fixed.
+
+**The list's total count on a large table.** The TMF630 list pages with a total count
+over its filter. Measured on 5,000,000 rows (120,000 open):
+
+| List | Count |
+|---|---|
+| `/ops/outbox` without a filter | ~90 ms |
+| `/state/relayed` | ~95–100 ms |
+| `/state/pending` | ~8 ms |
+| `/ops/outbox/parked` | ~165 ms (a scan: the state filter is broader than `ix_outbox_parked`) |
+| `/state/cancelled` | ~2 ms |
+
+A 20-row page itself takes ~3 ms. None of these is seconds, so they stay as they are.
 
 One wire contract for the estate: an unknown row id answers **404**, an action
 on a row not in the state it needs (cancel/unpark a relayed row, unpark a row
@@ -520,9 +783,49 @@ The library is self-contained for consumer testing — no test-jar needed:
   ```
 - **Conformance**: the library carries one IT per real consumer profile
   (`Profile681HubIT`, `ProfileFlowHttpSideEffectIT`,
-  `ProfileAdapterKafkaOrderIT`) plus the crash-window, SKIP LOCKED contention
-  and onboarding ITs — the contracts above are pinned there, so a consumer gap
+  `ProfileAdapterKafkaOrderIT`) plus the crash-window, SKIP LOCKED contention,
+  lease, lane, backlog and onboarding ITs — the contracts above are pinned there, so a consumer gap
   is a red library build, not a discovery after the cut.
+
+### Upgrading to 1.3.0
+
+1. Take the version. Changeset `004-outbox-claim-lease` adds three nullable
+   columns (`claimed_until`, `lane`, `ordering_key`) and three partial indexes
+   (`if not exists`, so it applies to a library-created table and to an
+   onboarded pre-library one alike). Rows pending at the upgrade have no lane
+   and ride ORDERED once, including any pending HTTP backlog, which drains on
+   the relay thread as it would have under 1.2.x.
+   **What the first start costs on a large table.** Changesets `004` and `005`
+   build eight indexes `CONCURRENTLY`, so the appends of pods still running are
+   never blocked. Each build still reads the whole table once. Measured: 0.7–1.8 s
+   per build, about 7.2 s for all eight, on 3,100,000 rows / 2.5 GB, i.e. roughly
+   2.3 s per million rows; a busier database takes about twice that. Liquibase
+   runs before the service is ready, so the consumer's **startup probe must allow
+   for it** (say 5 s per million outbox rows, plus its usual start).
+2. **Rolling deploys are safe for sends.** A 1.3.0 claim moves
+   `next_attempt_on` to the lease end, so a 1.2.x pod still running sees a
+   leased row as not due and never sends it twice. While old and new pods
+   overlap, **per-key order is not guaranteed**: an old pod knows no ordering
+   key.
+3. **A publisher that writes to the database inside `publish`** moves that
+   write into `onBooked(event, booking)`. This is the one stated contract that
+   changes: `publish` runs in no transaction now.
+4. **Order changes for HTTP rows.** The library HTTP publisher is CONCURRENT:
+   an HTTP row no longer keeps `id` order against Kafka (ORDERED) rows, nor
+   against HTTP rows to other receivers. Rows to one receiver still go in
+   order on the happy path. A flow that relied on "the Kafka row before the
+   HTTP row" through the relay must get that order elsewhere, or ride its own
+   ORDERED publisher.
+5. A consumer's own publisher stays ORDERED unless it says otherwise. Moving it
+   to CONCURRENT means declaring `lane`, usually an `orderingKey`, and a
+   `lease` longer than its longest call. Rows it appended before the change
+   keep the lane they were stamped with.
+6. Ops: a cancel of a row in flight succeeds at once (it used to wait for the
+   send and then refuse). Watch the new `opentmf.outbox.in-flight` gauge and
+   the `inFlight` / `claimedUntil` fields on the row view. A crash after a send
+   redelivers once the lease lapses, not on the next pass.
+
+Kafka-only consumers change nothing but the version.
 
 ### Migrating from a hand-written outbox
 
@@ -552,6 +855,31 @@ Quality gates on this repo:
   execution merged; generated Querydsl classes excluded from the denominator.
 - SonarQube (`mvn -Psonar clean verify` against a local server on
   `localhost:9000`, token via `SONAR_TOKEN`): zero open findings is the bar.
+- **Prerequisite: a JDK 21+ Maven toolchain.** The ITs run twice over the
+  lane: on the build JDK (17, platform threads), and `OutboxHttpLaneVirtualIT`
+  in failsafe's `virtual-threads-it` execution, forked on a JDK 21+ toolchain
+  for virtual threads. Without a matching entry in `~/.m2/toolchains.xml`, the
+  build **fails** there instead of quietly testing one executor. A minimal
+  file (paths are examples):
+
+  ```xml
+  <toolchains>
+    <toolchain>
+      <type>jdk</type>
+      <provides><version>17</version></provides>
+      <configuration><jdkHome>/usr/lib/jvm/openjdk-17</jdkHome></configuration>
+    </toolchain>
+    <toolchain>
+      <type>jdk</type>
+      <provides><version>25</version></provides>
+      <configuration><jdkHome>/usr/lib/jvm/openjdk-25</jdkHome></configuration>
+    </toolchain>
+  </toolchains>
+  ```
+- **CI runs no build.** The repository has no CI workflows; the SonarCloud
+  check on a pull request is SonarCloud's automatic analysis, which compiles
+  and tests nothing. The gate above (unit tests, both IT executions, JaCoCo,
+  local SonarQube) is run locally before every merge and cut.
 - PIT (`mvn -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage`)
   on the pinned 1.19.6 hold with incremental history (1.20+ moved free
   `withHistory` behind the commercial arcmutate plugin). No mutation threshold:
@@ -564,15 +892,22 @@ Accepted survivors, each reviewed:
 
 | Where | Mutant | Verdict |
 |---|---|---|
-| `OutboxMaintenanceService.prune` | `relayed + cancelled > 0` boundary/negation | Log-only guard; row deletion is unaffected |
-| `OutboxRelayWorker.exhaust` | log-level legs | Log-only; the PARK/DROP outcome itself is asserted by the worker tests |
+| `OutboxMaintenanceService.pruneExpired` / `unpark` (by filter) | the "anything to log" guard and the "more remain" message ternary (negations, boundaries) | Log-only; the counts and `moreTo…` flags are asserted by the unit tests and the ITs |
+| `OutboxMaintenanceService.pruneExpired` / `unpark` (by filter) | `nanoTime() < deadline` boundary | Equivalent: `<` vs `<=` on a nanosecond clock |
 | `OutboxRelayWorker.truncate` | `<=` vs `<` boundary | Equivalent mutant at exactly 4000 chars |
-| `OutboxRelay.stop` | awaitTermination conditional | Shutdown-timing leg; a kill needs a 5s hanging-task test for no insight |
+| `OutboxRelayWorker.relayBatch` | negated `!lane.submit(...)` | Log-only: the refused send's permit and lease are handled inside `submit` |
+| `OutboxRelayWorker.bookRelayed` / `bookFailure` | removed `logLapsed`; negated cancelled check before the WARN | Log-only; the lapse and sent-but-cancelled outcomes are asserted by the worker tests and `OutboxLeaseIT` |
+| `OutboxLaneStamper.stamp` | removed `setOrderingKey(null)` in the failure path | Equivalent: the key is never set before the throw it recovers from |
+| `OutboxConcurrentLane` | removed `setVirtualThreads`; `isVirtual` → false | Equivalent on the JDK 17 unit-test run; `OutboxHttpLaneVirtualIT` (JDK 21+) asserts the virtual threads, and PIT runs unit tests only |
+| `OutboxRelay.stop` | awaitTermination conditional | Shutdown-timing leg; a kill needs a grace-long hanging-task test for no insight |
+| `OutboxRelay.poke` | removed `passQueued.set(false)` after a rejection | Reachable only after shutdown, when no further pass can run anyway |
 | `OutboxRelay` thread factory | removed `setDaemon` | Asserted by `OutboxRelayTests` in every normal run; PIT's per-line selection misses the factory-lambda mapping |
+| `OutboxMetrics` thread factory | removed `setDaemon` | Asserted by `OutboxMetricsTests` (the refresher thread is a daemon); same factory-lambda mapping miss |
 
-`NO_COVERAGE` entries (auto-configuration bean methods, ops controller) are
+`NO_COVERAGE` entries (the Kafka publisher bean method, ops controller) are
 exercised by the Testcontainers ITs, which the posture deliberately keeps out
-of PIT (unit tests only).
+of PIT (unit tests only); the other auto-configuration bean methods are
+covered by `KafkaLessStartupTests` since 1.2.1.
 
 ## Version History
 

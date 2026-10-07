@@ -2,6 +2,8 @@ package org.opentmf.outbox;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
@@ -13,13 +15,16 @@ import org.hibernate.annotations.DynamicInsert;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.annotations.DynamicUpdate;
 import org.hibernate.type.SqlTypes;
+import org.opentmf.outbox.OutboxPublisher.Lane;
 
 /**
  * One outbox row — an effect frozen at commit time, delivered at-least-once by the relay.
  * State is DERIVED, no status column: pending = {@code relayedOn == null && cancelledOn == null};
  * parked = pending AND {@code parkedOn != null}; relayed = {@code relayedOn != null};
  * cancelled = {@code cancelledOn != null}. A pending row whose {@code releaseAt} lies in the
- * future is HELD - not claimable until then.
+ * future is HELD - not claimable until then; a pending row whose {@code claimedUntil} lies in the
+ * future is IN FLIGHT - a relay holds its lease (1.3.0). Relayed and cancelled overlap only for a
+ * row cancelled while its send was in flight and then delivered (sent-but-cancelled).
  *
  * <p>Part of the library's public seam (with {@link OutboxWriter} and
  * {@link OutboxMaintenanceService}); it is also the Querydsl root of the ops list endpoint —
@@ -27,7 +32,7 @@ import org.hibernate.type.SqlTypes;
  *
  * <p>Deliberately standalone (no audit superclass): the outbox table shape has no
  * {@code created_by}/{@code update_count} columns, and an optimistic {@code @Version} would
- * fight the relay's pessimistic {@code FOR UPDATE SKIP LOCKED} claim.
+ * fight the relay's pessimistic claim and its lease-guarded bookings.
  */
 @Getter
 @Setter
@@ -124,10 +129,36 @@ public class OutboxEvent {
 
   /**
    * Cancellation time of an UNRELEASED effect - the other terminal state; null = not cancelled.
-   * Set only through {@link OutboxMaintenanceService#cancel(long)}, which refuses relayed rows,
-   * so relayed and cancelled never overlap.
+   * Set only through {@link OutboxMaintenanceService#cancel(long)}, which refuses relayed rows.
+   * A row cancelled while its send was in flight and then delivered carries both stamps
+   * (sent-but-cancelled) - the only overlap.
    */
   private OffsetDateTime cancelledOn;
+
+  /**
+   * The relay's LEASE on the row (1.3.0): stamped {@code now + lease} by the claim, cleared by
+   * the booking. While it lies in the future the row is in flight and not claimable; once it
+   * lapses unbooked (a crash, a call longer than the lease) any relay may claim the row again,
+   * and the late holder's booking - guarded on the value it stamped - books nothing.
+   */
+  private OffsetDateTime claimedUntil;
+
+  /**
+   * The relay lane the row's publisher named at APPEND (1.3.0), frozen - the stamped lane wins
+   * at claim even if the publisher would now say otherwise. Null = written before 1.3.0 or not
+   * through {@link OutboxWriter}: the row rides ORDERED.
+   */
+  @Enumerated(EnumType.STRING)
+  @Column(updatable = false, length = 16)
+  private Lane lane;
+
+  /**
+   * CONCURRENT lane (1.3.0): rows sharing this key are never in flight together, within a pod and
+   * across pods, and are taken in {@code id} order on the happy path; null = independent.
+   * Frozen at append; a key over 255 characters is stored as {@code sha256:<hex>}.
+   */
+  @Column(updatable = false)
+  private String orderingKey;
 
   /** Last delivery failure, truncated — ops forensics for parked rows. */
   private String lastError;

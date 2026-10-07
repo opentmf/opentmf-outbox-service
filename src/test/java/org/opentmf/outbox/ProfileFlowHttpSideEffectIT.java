@@ -28,12 +28,13 @@ import org.springframework.web.servlet.function.ServerResponse;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 /**
- * CONSUMER CONFORMANCE - the dnms-flow profile (H.6): a consumer publisher for the
- * {@code adapter:} scheme, ordered ahead of the defaults, WRITES a consumer row inside the
- * claim transaction (flow's {@code markRecorded}) - it commits together with
- * {@code relayed_on}; HTTP side effects go through the library's HTTP publisher; and at ONE
- * replica the relay delivers in id order - the party interaction before the bounce that was
- * appended after it in the same business transaction.
+ * CONSUMER CONFORMANCE - the dnms-flow profile (H.6, re-stated for 1.3.0): a consumer publisher
+ * for the {@code adapter:} scheme, ordered ahead of the defaults, sends in NO transaction and
+ * WRITES its consumer row (flow's {@code markRecorded}, carrying the id the send returned) in
+ * its BOOKING HOOK - it commits together with {@code relayed_on}; HTTP side effects go through
+ * the library's HTTP publisher, now on the CONCURRENT lane. Both are delivered exactly once; the
+ * 1.2.x "PI before bounce" id order between them is GONE by design - a CONCURRENT row keeps no
+ * order against ORDERED rows (flow's own ordering does not rest on the relay).
  */
 @Testcontainers
 @SpringBootTest(
@@ -77,7 +78,7 @@ class ProfileFlowHttpSideEffectIT {
           .build();
     }
 
-    /** flow's adapter publisher: delivers in-process and marks the record INSIDE the claim tx. */
+    /** flow's adapter publisher: delivers in-process, marks the record in the BOOKING hook. */
     @Bean
     @Order(Ordered.HIGHEST_PRECEDENCE)
     OutboxPublisher adapterPublisher(JdbcTemplate jdbc) {
@@ -89,12 +90,25 @@ class ProfileFlowHttpSideEffectIT {
 
         @Override
         public void publish(OutboxEvent event) {
-          assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isTrue();
-          jdbc.update(
-              "insert into side_effect (outbox_id, recorded_on) values (?, ?)",
-              event.getId(),
-              OffsetDateTime.now());
+          deliver(event);
+        }
+
+        @Override
+        public Object deliver(OutboxEvent event) {
+          assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
           DELIVERIES.add("adapter:" + OutboxHeaders.idempotencyKey("dnms-flow", event.getId()));
+          return OffsetDateTime.now(); // what the receiver answered - the booking records it
+        }
+
+        @Override
+        public void onBooked(OutboxEvent event, OutboxBooking booking) {
+          assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isTrue();
+          if (booking.outcome() == OutboxBooking.Outcome.RELAYED) {
+            jdbc.update(
+                "insert into side_effect (outbox_id, recorded_on) values (?, ?)",
+                event.getId(),
+                booking.result());
+          }
         }
       };
     }
@@ -107,7 +121,7 @@ class ProfileFlowHttpSideEffectIT {
   @LocalServerPort private int port;
 
   @Test
-  void adapterPublisherWritesInTheClaimTx_andPiPrecedesBounce_atOneReplica() {
+  void adapterPublisherWritesInItsBookingHook_andBothRowsDeliverExactlyOnce() {
     String callback = "http://localhost:" + port + "/flow/cb";
     // ONE business transaction appends the PI (adapter) and then the bounce (HTTP)
     List<OutboxEvent> appended =
@@ -122,18 +136,20 @@ class ProfileFlowHttpSideEffectIT {
     await()
         .atMost(Duration.ofSeconds(20))
         .untilAsserted(
-            () -> assertThat(maintenance.inspect(bounce.getId()).relayedOn()).isNotNull());
+            () -> {
+              assertThat(maintenance.inspect(bounce.getId()).relayedOn()).isNotNull();
+              assertThat(maintenance.inspect(pi.getId()).relayedOn()).isNotNull();
+            });
 
-    // the side effect committed with relayed_on - one transaction, both facts or neither
-    assertThat(maintenance.inspect(pi.getId()).relayedOn()).isNotNull();
+    // the side effect committed with relayed_on - one booking transaction, both facts or neither
     assertThat(
             jdbc.queryForObject(
                 "select count(*) from side_effect where outbox_id = ?", Long.class, pi.getId()))
         .isEqualTo(1L);
 
-    // id order at one replica: PI before bounce, exactly once each
+    // exactly once each - in either order: the bounce rides the CONCURRENT lane
     assertThat(DELIVERIES)
-        .containsExactly(
+        .containsExactlyInAnyOrder(
             "adapter:dnms-flow:outbox:" + pi.getId(),
             "http:dnms-flow:outbox:" + bounce.getId());
   }
