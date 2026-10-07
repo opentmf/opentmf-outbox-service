@@ -438,7 +438,7 @@ class OutboxTwoRelaysIT {
           .during(Duration.ofSeconds(1))
           .atMost(Duration.ofSeconds(2))
           .until(() -> KEYED_MAX.get() == 1);
-      assertThat(KEYED_SENT).doesNotContain(ids[0]);
+      assertThat(ids[0]).isNotIn(KEYED_SENT); // row 1 was never sent beside row 2
     } finally {
       KEYED_GATE.countDown();
       pods.shutdownNow();

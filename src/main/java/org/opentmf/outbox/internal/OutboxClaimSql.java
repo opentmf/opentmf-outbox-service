@@ -150,9 +150,7 @@ final class OutboxClaimSql {
    * are committed and visible. Two keys hashing alike only share a lock: one of them waits a
    * pass, nothing is ever wrong.
    */
-  static final String KEY_LOCK =
-      """
-      select pg_try_advisory_xact_lock(:namespace, hashtext(:key))""";
+  static final String KEY_LOCK = "select pg_try_advisory_xact_lock(:namespace, hashtext(:key))";
 
   /**
    * The re-check, in a NEW snapshot taken after the key locks: of the keyed candidates (given as
