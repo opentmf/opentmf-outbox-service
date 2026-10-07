@@ -168,9 +168,13 @@ sequenceDiagram
   one row twice. A row another pod is claiming is skipped, and once that claim
   commits the row carries a live lease. Pods still interleave ORDERED rows, so
   strict order across pods is not promised. Rows of one ordering key are
-  **never in flight together within a pod**. Across pods the one exception is
-  a backed-off row that comes due during another pod's claim of a later row of
-  its key; order for that key was already given up when the row failed.
+  **never in flight together, within a pod and across pods**. Each keyed
+  candidate is claimed only after its key's transaction-scoped **PostgreSQL
+  advisory lock** (`pg_try_advisory_xact_lock`, tried, never waited for) is
+  taken and a re-check in a fresh snapshot still finds it the key's head with
+  nothing of its key in flight. A pod that loses the lock skips the key for
+  one pass and sees the other pod's committed lease on the next. The claim
+  transactions run READ COMMITTED whatever the application's default.
 - **At-least-once, consumer-dedupable.** A crash between delivery and booking
   means redelivery once the row's lease lapses (seconds on the ORDERED lane,
   up to the lease on the CONCURRENT lane); `x-idempotency-key = <spring.application.name>:outbox:<id>`
@@ -294,7 +298,9 @@ sequenceDiagram
 - Java 17+ (Java 21+ with `spring.threads.virtual.enabled=true` puts the
   CONCURRENT lane on virtual threads; platform threads otherwise)
 - Spring Boot 4.1+
-- A JPA datasource (PostgreSQL is the shipped DDL dialect) and Liquibase
+- A JPA datasource and Liquibase. **PostgreSQL** is the shipped DDL dialect (the
+  changelog's precondition probes for it), and the CONCURRENT claim relies on
+  PostgreSQL advisory locks and `hashtext` for its cross-pod ordering-key guard
 - Kafka destinations: `spring-kafka` + `spring-boot-kafka` (both optional here)
 - HTTP destinations: `spring-web` on the classpath (the HTTP publisher rides
   `RestClient`; without spring-web an `http(s)://` row is unroutable and parks)

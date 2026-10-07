@@ -57,10 +57,12 @@ the batch's row locks were held across every backend call.
   8, per pod). The Kafka publisher stays ORDERED and the HTTP publisher is
   CONCURRENT.
 - **Ordering key** for the CONCURRENT lane: `OutboxPublisher.orderingKey(event)`.
-  Rows sharing a non-null key are never in flight together within a pod and
-  are taken in `id` order on the happy path. Across pods the one exception is
-  a backed-off row that comes due during another pod's claim of a later row of
-  its key. A key over 255 characters is stored as `sha256:<hex>`.
+  Rows sharing a non-null key are never in flight together, within a pod and
+  across pods, and are taken in `id` order on the happy path. Across pods, a
+  keyed candidate is claimed only after its key's transaction-scoped PostgreSQL
+  advisory lock is taken (`pg_try_advisory_xact_lock`, never waited for) and a
+  re-check in a fresh snapshot confirms it; the claim transactions run READ
+  COMMITTED. A key over 255 characters is stored as `sha256:<hex>`.
 - **Claim by lease.** New nullable column `claimed_until`. A short claim
   transaction stamps `now + lease` and commits, the send runs in no
   transaction and holds no database connection, and a short booking

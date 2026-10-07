@@ -6,10 +6,13 @@ import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.opentmf.outbox.OutboxBooking;
@@ -167,7 +170,7 @@ class OutboxRelayWorker {
       lastKey = wrappedLast != null ? wrappedLast : lastKey;
       rows.addAll(wrapped);
     }
-    for (OutboxEvent row : rows) {
+    for (OutboxEvent row : acrossPods(rows, now)) {
       OutboxPublisher publisher = route(row);
       if (publisher != null && lane.tryAcquire()) {
         concurrent.add(stamp(row, publisher, Lane.CONCURRENT, now));
@@ -176,6 +179,45 @@ class OutboxRelayWorker {
     if (lastKey != null) {
       keyCursor = lastKey;
     }
+  }
+
+  /**
+   * The cross-pod guard of the keyed candidates (PostgreSQL advisory locks, by ruling): each key's
+   * transaction-scoped lock is TRIED - a key another pod is claiming right now is skipped this
+   * pass, never waited for - and the locked candidates are re-checked in a NEW snapshot, which
+   * sees every lease committed before the lock was released. Unkeyed candidates pass as they are.
+   * Rows of one key are thus never in flight together, within a pod and across pods.
+   */
+  private List<OutboxEvent> acrossPods(List<OutboxEvent> candidates, OffsetDateTime now) {
+    List<OutboxEvent> keyed = new ArrayList<>();
+    Set<String> lockedKeys = new HashSet<>();
+    Set<String> refusedKeys = new HashSet<>();
+    for (OutboxEvent row : candidates) {
+      String key = row.getOrderingKey();
+      if (key == null || refusedKeys.contains(key)) {
+        continue;
+      }
+      if (lockedKeys.contains(key)
+          || repository.tryLockKey(OutboxClaimSql.KEY_LOCK_NAMESPACE, key)) {
+        lockedKeys.add(key);
+        keyed.add(row);
+      } else {
+        refusedKeys.add(key);
+      }
+    }
+    Set<Long> stillHeads =
+        keyed.isEmpty()
+            ? Set.of()
+            : new HashSet<>(repository.recheckKeyedHeads(now, arrayLiteral(keyed)));
+    return candidates.stream()
+        .filter(row -> row.getOrderingKey() == null || stillHeads.contains(row.getId()))
+        .toList();
+  }
+
+  private static String arrayLiteral(List<OutboxEvent> rows) {
+    return rows.stream()
+        .map(row -> String.valueOf(row.getId()))
+        .collect(Collectors.joining(",", "{", "}"));
   }
 
   /**

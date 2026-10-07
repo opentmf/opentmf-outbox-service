@@ -137,5 +137,51 @@ final class OutboxClaimSql {
           """
           + LOCK;
 
+  /**
+   * The advisory-lock namespace of the CONCURRENT claim's key locks ({@code 'outx'} as an int4):
+   * the two-int form keeps the library's locks apart from a consumer's single-bigint locks.
+   */
+  static final int KEY_LOCK_NAMESPACE = 0x6f757478;
+
+  /**
+   * Takes - never waits for - the transaction-scoped advisory lock of one ordering key, hashed by
+   * the DATABASE ({@code hashtext}), so every pod computes the same lock id whatever library
+   * version it runs. Held until the claim transaction commits, by which time the claim's leases
+   * are committed and visible. Two keys hashing alike only share a lock: one of them waits a
+   * pass, nothing is ever wrong.
+   */
+  static final String KEY_LOCK =
+      """
+      select pg_try_advisory_xact_lock(:namespace, hashtext(:key))""";
+
+  /**
+   * The re-check, in a NEW snapshot taken after the key locks: of the keyed candidates (given as
+   * an array literal), those still their key's first due row with no row of their key in flight.
+   * Run after the locks, it sees every lease another pod committed before releasing the key's
+   * lock - which the first statement's snapshot could not. {@code id = any(...)} reads by primary
+   * key; the in-flight probe reads {@code ix_outbox_claimed_until} (a live lease holds its key
+   * even on a cancelled row); the lower-due probe reads {@code ix_outbox_concurrent_keyed}.
+   */
+  static final String RECHECK =
+      """
+      select r.id from outbox r
+      where r.id = any (cast(:ids as bigint[]))
+        and r.relayed_on is null and r.cancelled_on is null and r.parked_on is null
+        and (r.release_at is null or r.release_at <= :now)
+        and r.next_attempt_on <= :now
+        and (r.claimed_until is null or r.claimed_until <= :now)
+        and not exists (
+          select 1 from outbox f
+          where f.claimed_until is not null and f.relayed_on is null
+            and f.claimed_until > :now
+            and f.lane = 'CONCURRENT' and f.ordering_key = r.ordering_key)
+        and not exists (
+          select 1 from outbox o
+          where o.lane = 'CONCURRENT' and o.ordering_key = r.ordering_key and o.id < r.id
+            and o.relayed_on is null and o.cancelled_on is null and o.parked_on is null
+            and (o.release_at is null or o.release_at <= :now)
+            and o.next_attempt_on <= :now
+            and (o.claimed_until is null or o.claimed_until <= :now))""";
+
   private OutboxClaimSql() {}
 }

@@ -1,6 +1,7 @@
 package org.opentmf.outbox.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 import jakarta.persistence.EntityManager;
 import java.time.Duration;
@@ -16,6 +17,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxProperties;
@@ -32,6 +34,9 @@ import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.data.domain.Limit;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.TransactionCallback;
+import org.springframework.transaction.support.TransactionOperations;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
@@ -58,6 +63,12 @@ class OutboxTwoRelaysIT {
 
   static final Map<Long, AtomicInteger> DELIVERED = new ConcurrentHashMap<>();
   static final Map<Long, AtomicInteger> BOOKED = new ConcurrentHashMap<>();
+
+  /** "keyed:" rows of one ordering key in flight right now, and the most ever at once. */
+  static final AtomicInteger KEYED_NOW = new AtomicInteger();
+  static final AtomicInteger KEYED_MAX = new AtomicInteger();
+  static final Set<Long> KEYED_SENT = ConcurrentHashMap.newKeySet();
+  static final CountDownLatch KEYED_GATE = new CountDownLatch(1);
 
   /** The threads ORDERED rows were sent on - one per "pod" driver. */
   static final Set<String> ORDERED_SENDERS = ConcurrentHashMap.newKeySet();
@@ -91,6 +102,41 @@ class OutboxTwoRelaysIT {
             assertThat(new CountDownLatch(1).await(20, TimeUnit.MILLISECONDS)).isFalse();
           } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
+          }
+        }
+      };
+    }
+
+    /** "keyed:" rows: CONCURRENT, keyed by destination; every send waits at the test's gate. */
+    @Bean
+    @Order(Ordered.HIGHEST_PRECEDENCE)
+    OutboxPublisher keyedPublisher() {
+      return new OutboxPublisher() {
+        @Override
+        public boolean supports(OutboxEvent event) {
+          return event.getDestination().startsWith("keyed:");
+        }
+
+        @Override
+        public Lane lane(OutboxEvent event) {
+          return Lane.CONCURRENT;
+        }
+
+        @Override
+        public String orderingKey(OutboxEvent event) {
+          return event.getDestination();
+        }
+
+        @Override
+        public void publish(OutboxEvent event) {
+          KEYED_SENT.add(event.getId());
+          KEYED_MAX.accumulateAndGet(KEYED_NOW.incrementAndGet(), Math::max);
+          try {
+            assertThat(KEYED_GATE.await(60, TimeUnit.SECONDS)).isTrue();
+          } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+          } finally {
+            KEYED_NOW.decrementAndGet();
           }
         }
       };
@@ -300,5 +346,124 @@ class OutboxTwoRelaysIT {
       Thread.currentThread().interrupt();
       throw new IllegalStateException(ex);
     }
+  }
+
+  /**
+   * A transaction runner whose CONCURRENT claim (the one {@code executeWithoutResult} call of a
+   * pass) can be held open just before its commit - so another relay claims while this one's
+   * stamps are not yet committed.
+   */
+  static final class PausableClaim implements TransactionOperations {
+    private final TransactionTemplate template;
+    private final EntityManager entityManager;
+    volatile boolean armed;
+    final CountDownLatch paused = new CountDownLatch(1);
+    final CountDownLatch resume = new CountDownLatch(1);
+
+    PausableClaim(TransactionTemplate template, EntityManager entityManager) {
+      this.template = template;
+      this.entityManager = entityManager;
+    }
+
+    @Override
+    public <T> T execute(TransactionCallback<T> action) {
+      return template.execute(action);
+    }
+
+    @Override
+    public void executeWithoutResult(Consumer<TransactionStatus> action) {
+      template.executeWithoutResult(
+          status -> {
+            action.accept(status);
+            if (armed) {
+              armed = false;
+              entityManager.flush(); // the stamps are written, NOT committed
+              paused.countDown();
+              awaitLatch(resume);
+            }
+          });
+    }
+  }
+
+  /**
+   * THE cross-pod window, closed (Gokhan's ruling of 2026-10-06): row 1 of a key failed and is in
+   * backoff; relay A claims row 2 of the key - and its claim is held open, the lease stamped but
+   * not committed; row 1 comes due meanwhile; relay B claims. Row 1 must NOT go into flight
+   * beside row 2: B finds the key's advisory lock taken (A's claim holds it until its commit) and
+   * skips the key this pass; on its next pass the lease is committed and the key is in flight.
+   */
+  @Test
+  void aBackedOffRowComingDueDuringAnotherPodsClaim_isNotSentBesideItsKey() throws Exception {
+    String key = "keyed:receiver-" + System.nanoTime();
+    long[] ids =
+        new TransactionTemplate(txManager)
+            .execute(
+                status -> {
+                  OutboxEvent first = keyedRow(key, OffsetDateTime.now().plusSeconds(2), 1);
+                  OutboxEvent second = keyedRow(key, OffsetDateTime.now().minusSeconds(1), 0);
+                  return new long[] {first.getId(), second.getId()};
+                });
+    PausableClaim podATx = new PausableClaim(new TransactionTemplate(txManager), entityManager);
+    OutboxConcurrentLane laneA = new OutboxConcurrentLane(4, false, Duration.ofSeconds(5));
+    OutboxConcurrentLane laneB = new OutboxConcurrentLane(4, false, Duration.ofSeconds(5));
+    OutboxRelayWorker podA =
+        new OutboxRelayWorker(
+            repository, router, backoff, metrics, properties, listeners, podATx, laneA);
+    OutboxRelayWorker podB =
+        new OutboxRelayWorker(
+            repository,
+            router,
+            backoff,
+            metrics,
+            properties,
+            listeners,
+            new TransactionTemplate(txManager),
+            laneB);
+    ExecutorService pods = Executors.newSingleThreadExecutor();
+    try {
+      podATx.armed = true;
+      Future<Integer> claimA = pods.submit(podA::relayBatch); // claims row 2, held open
+      awaitLatch(podATx.paused);
+      await() // row 1's backoff passes while A's claim is still open
+          .atMost(Duration.ofSeconds(5))
+          .until(() -> OffsetDateTime.now().isAfter(nextAttempt(ids[0]).plusNanos(200_000_000)));
+
+      podB.relayBatch(); // the window: must not take row 1 now
+
+      podATx.resume.countDown(); // A commits its lease on row 2
+      claimA.get(20, TimeUnit.SECONDS);
+      await().atMost(Duration.ofSeconds(5)).until(() -> KEYED_SENT.contains(ids[1]));
+      podB.relayBatch(); // B's next pass: the key is in flight - row 1 still waits
+      await()
+          .during(Duration.ofSeconds(1))
+          .atMost(Duration.ofSeconds(2))
+          .until(() -> KEYED_MAX.get() == 1);
+      assertThat(KEYED_SENT).doesNotContain(ids[0]);
+    } finally {
+      KEYED_GATE.countDown();
+      pods.shutdownNow();
+      laneA.close();
+      laneB.close();
+    }
+  }
+
+  private OutboxEvent keyedRow(String key, OffsetDateTime nextAttempt, int attempts) {
+    OutboxEvent row = new OutboxEvent();
+    row.setAggregateType("t");
+    row.setAggregateId("a");
+    row.setEventType("e.v1");
+    row.setDestination(key);
+    row.setPayload("{}");
+    row.setCreatedOn(OffsetDateTime.now());
+    row.setNextAttemptOn(nextAttempt);
+    row.setAttempts(attempts);
+    row.setLane(Lane.CONCURRENT);
+    row.setOrderingKey(key);
+    entityManager.persist(row);
+    return row;
+  }
+
+  private OffsetDateTime nextAttempt(long id) {
+    return repository.findById(id).orElseThrow().getNextAttemptOn();
   }
 }

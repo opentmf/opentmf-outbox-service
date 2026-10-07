@@ -153,9 +153,9 @@ public class OutboxEvent {
   private Lane lane;
 
   /**
-   * CONCURRENT lane (1.3.0): rows sharing this key are never in flight together within a pod
-   * and are taken in {@code id} order on the happy path; null = independent. Frozen at append;
-   * a key over 255 characters is stored as {@code sha256:<hex>}.
+   * CONCURRENT lane (1.3.0): rows sharing this key are never in flight together, within a pod and
+   * across pods, and are taken in {@code id} order on the happy path; null = independent.
+   * Frozen at append; a key over 255 characters is stored as {@code sha256:<hex>}.
    */
   @Column(updatable = false)
   private String orderingKey;
