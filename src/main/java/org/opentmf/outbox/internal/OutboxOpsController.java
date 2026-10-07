@@ -1,13 +1,16 @@
 package org.opentmf.outbox.internal;
 
 import com.querydsl.core.types.Predicate;
+import java.time.OffsetDateTime;
 import java.util.Map;
 import java.util.function.Supplier;
 import lombok.RequiredArgsConstructor;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxMaintenanceService;
+import org.opentmf.outbox.OutboxPruneResult;
 import org.opentmf.outbox.OutboxRowView;
 import org.opentmf.outbox.OutboxStateFilter;
+import org.opentmf.outbox.OutboxUnparkResult;
 import org.opentmf.query.tmf630.annotation.Tmf630Response;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -17,6 +20,7 @@ import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
@@ -42,12 +46,14 @@ public class OutboxOpsController {
   private final OutboxMaintenanceService maintenance;
 
   /**
-   * One retention-pruning pass over terminal (relayed + cancelled) rows. Returns
-   * {@code {"outboxRowsPruned": n}}.
+   * One BOUNDED retention-pruning call over terminal (relayed + cancelled) rows. Returns
+   * {@code {"outboxRowsPruned": n, "moreToPrune": bool}} - when more remain (the call's time
+   * budget is spent), the caller calls again.
    */
   @PostMapping(path = "/outbox/maintenance/prune", produces = MediaType.APPLICATION_JSON_VALUE)
-  public Map<String, Long> prune() {
-    return Map.of("outboxRowsPruned", maintenance.prune());
+  public Map<String, Object> prune() {
+    OutboxPruneResult result = maintenance.pruneExpired();
+    return Map.of("outboxRowsPruned", result.pruned(), "moreToPrune", result.moreToPrune());
   }
 
   /** Unparks one parked row - parked_on cleared, attempts reset, due now, relay nudged. */
@@ -59,6 +65,39 @@ public class OutboxOpsController {
           return null;
         });
     return Map.of("action", "unparked", "id", id);
+  }
+
+  /**
+   * The filter of an unpark by filter: {@code destination} required, the rest optional.
+   *
+   * @param destination the receiver whose parked rows return to delivery - REQUIRED
+   * @param parkedFrom inclusive lower bound of {@code parked_on}
+   * @param parkedTo exclusive upper bound of {@code parked_on}
+   * @param reference only rows of this private correlation
+   */
+  public record UnparkFilter(
+      String destination, OffsetDateTime parkedFrom, OffsetDateTime parkedTo, String reference) {}
+
+  /**
+   * Unparks by FILTER - every parked row of one destination (optionally within a parked-on range,
+   * optionally of one reference), BOUNDED: answers {@code {"outboxRowsUnparked": n,
+   * "moreToUnpark": bool}}; call again while more remain. A missing destination is a 400. Gate it
+   * like the single unpark.
+   */
+  @PostMapping(
+      path = "/outbox/unpark",
+      consumes = MediaType.APPLICATION_JSON_VALUE,
+      produces = MediaType.APPLICATION_JSON_VALUE)
+  public Map<String, Object> unparkByFilter(@RequestBody UnparkFilter filter) {
+    OutboxUnparkResult result;
+    try {
+      result =
+          maintenance.unpark(
+              filter.destination(), filter.parkedFrom(), filter.parkedTo(), filter.reference());
+    } catch (IllegalArgumentException ex) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ex.getMessage(), ex);
+    }
+    return Map.of("outboxRowsUnparked", result.unparked(), "moreToUnpark", result.moreToUnpark());
   }
 
   /** Cancels one unreleased row - never relayed from now on, retained for audit. */

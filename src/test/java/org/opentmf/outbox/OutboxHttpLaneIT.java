@@ -24,6 +24,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.SpringBootTest.WebEnvironment;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -56,7 +57,10 @@ import org.testcontainers.kafka.KafkaContainer;
       "spring.jpa.hibernate.ddl-auto=validate",
       "spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer",
       "spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer",
-      "opentmf.outbox.sweep-interval=1h"
+      "opentmf.outbox.sweep-interval=1h",
+      // no scheduled refresh after the one at start: the tests refresh where they read a gauge,
+      // so the refresher never takes a connection while the pool is sampled for zero
+      "opentmf.outbox.metrics-refresh=1h"
     })
 class OutboxHttpLaneIT {
 
@@ -174,6 +178,7 @@ class OutboxHttpLaneIT {
   @Autowired private TransactionTemplate tx;
   @Autowired private DataSource dataSource;
   @Autowired private MeterRegistry registry;
+  @Autowired private ApplicationContext context;
   @LocalServerPort private int port;
 
   private String url(String path) {
@@ -188,7 +193,9 @@ class OutboxHttpLaneIT {
     return dataSource.unwrap(HikariDataSource.class).getHikariPoolMXBean().getActiveConnections();
   }
 
+  /** Refreshes the snapshot NOW, then reads the gauge. */
   private double inFlightGauge() {
+    GaugeRefresh.now(context);
     return registry.get("opentmf.outbox.in-flight").gauge().value();
   }
 

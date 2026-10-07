@@ -8,6 +8,46 @@ by **lease**. Until now the relay was one thread that published up to
 subscriber delayed every Kafka row behind it, and a database connection plus
 the batch's row locks were held across every backend call.
 
+### Fixed
+
+- **The metrics gauges read the whole table on every scrape.** `pending`, `parked` and
+  `relay-lag` ran unindexed queries over every row, relayed history included. On
+  3.5–4.8 M-row tables that took 7–20 s per query and about 3 PostgreSQL cores with no
+  traffic. Scrapes outlasted their 10 s timeout, so flow and 681 read `up=0` exactly
+  under load (load test 2026-10-06, F-2).
+  - The gauges now read a snapshot that a daemon thread refreshes every
+    `opentmf.outbox.metrics-refresh` (default 15 s), so a scrape never touches the
+    database. Before the first refresh, and after a failed one, they read NaN.
+  - Each refresh query has a 5 s query timeout, so a database that does not answer
+    becomes a failed refresh, not a hung refresher with stale values standing. A new
+    gauge `opentmf.outbox.metrics-age` gives the seconds since the last successful
+    refresh; alert on it beside `parked`.
+  - Each refresh query is served by a partial index over the OPEN rows only
+    (`ix_outbox_pending`, `ix_outbox_parked`, `ix_outbox_open_since`,
+    `ix_outbox_claimed_until`). Pinned in `OutboxClaimPlanIT` over 1,000,000 relayed
+    rows, under both plan-cache modes.
+- **The retention prune could not prune a large table.** `prune()` ran one transaction
+  around Spring Data derived deletes. It loaded every expired row as an entity, found
+  them by a full scan (`relayed_on` had no index), and removed them one by one. The
+  nightly job ran dnms-681 and dnms-flow out of CPU and memory, failed liveness twice
+  each, and pruned nothing (load test 2026-10-06, F-1).
+  - The prune now deletes set-based in batches (`opentmf.outbox.maintenance.batch-size`,
+    default 5,000), oldest first. Each batch is its own short transaction
+    (`REQUIRES_NEW`, so a caller already in a transaction neither holds the batches in
+    it nor undoes them with its rollback), driven by
+    `ix_outbox_relayed_on` / `ix_outbox_cancelled_on`, with no entity loaded.
+  - A call is bounded by `opentmf.outbox.maintenance.time-budget` (default 10 s). The
+    endpoint answers `{"outboxRowsPruned": n, "moreToPrune": bool}`: the 1.0.0 key is
+    unchanged, `moreToPrune` is new, and the caller calls again while it is true.
+  - `OutboxMaintenanceService.pruneExpired()` returns an `OutboxPruneResult`.
+    `prune()` / `pruneRelayed()` still return the count but are no longer one
+    transaction, and a call may leave expired rows for the next one.
+- Changeset `005-outbox-gauge-and-prune-indexes` adds the four indexes. They are built
+  `CONCURRENTLY` (the changeset runs outside a transaction), so a deploy onto a large
+  table does not block the appends of the pods still running. Each build is preceded by
+  `drop index concurrently if exists`, so a failed build's INVALID index is rebuilt,
+  not skipped. `ix_outbox_relayed_on` is about 107 MB on 5,000,000 relayed rows.
+
 ### Changed (behaviour - read before upgrading)
 
 - **A publisher's own database write moves from `publish` to the booking
@@ -51,6 +91,17 @@ the batch's row locks were held across every backend call.
 
 ### Added
 
+- **Unpark by filter** (OUTBOX-BULK-UNPARK-1). `POST /ops/outbox/unpark` (JSON body)
+  and `OutboxMaintenanceService.unpark(destination, parkedFrom, parkedTo, reference)`
+  return every parked row of ONE destination to delivery. The destination is required;
+  a `parked_on` range and a `reference` are optional.
+  - Each row ends as the single unpark leaves it, under the same waiting-lock guard.
+  - Set-based and bounded like the prune (`opentmf.outbox.maintenance.batch-size` /
+    `time-budget`). The answer is `{"outboxRowsUnparked": n, "moreToUnpark": bool}`
+    (`OutboxUnparkResult`).
+  - The resend stays bounded by the lanes. A parked row is never leased, so no
+    unparked row carries a lease.
+  - Served by `ix_outbox_parked (destination, parked_on, id)` in changeset 005.
 - **Two lanes, chosen by the publisher:** `OutboxPublisher.lane(event)` is
   `ORDERED` (the default: the single relay thread, `id` order) or `CONCURRENT`
   (parallel sends, at most `opentmf.outbox.concurrent.max-in-flight`, default
@@ -94,8 +145,9 @@ the batch's row locks were held across every backend call.
   1.2.1 changelog). Its four indexes are built `CONCURRENTLY` (the changeset
   runs outside a transaction), each preceded by `drop index concurrently if
   exists`, so a deploy does not block the appends of the pods still running and
-  a failed build's INVALID index is rebuilt, not skipped. About 1.1 s per
-  million rows for the four; the startup probe must allow for it.
+  a failed build's INVALID index is rebuilt, not skipped. With 005's four, the
+  eight builds take about 2.3 s per million rows (7.2 s on 3.1 M rows / 2.5 GB);
+  the consumer's startup probe must allow for the first start.
 
 ### Dependencies
 

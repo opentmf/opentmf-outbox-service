@@ -24,6 +24,7 @@ import org.opentmf.outbox.OutboxBooking.Outcome;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
@@ -49,7 +50,9 @@ import org.springframework.transaction.support.TransactionTemplate;
       "spring.datasource.driver-class-name=org.testcontainers.jdbc.ContainerDatabaseDriver",
       "spring.liquibase.change-log=classpath:db/test-changelog-lease.xml",
       "spring.jpa.hibernate.ddl-auto=validate",
-      "opentmf.outbox.sweep-interval=1s"
+      "opentmf.outbox.sweep-interval=1s",
+      // no scheduled refresh after the one at start: the tests refresh where they read a gauge
+      "opentmf.outbox.metrics-refresh=1h"
     })
 class OutboxLeaseIT {
 
@@ -229,6 +232,7 @@ class OutboxLeaseIT {
   @Autowired private TransactionTemplate tx;
   @Autowired private JdbcTemplate jdbc;
   @Autowired private MeterRegistry registry;
+  @Autowired private ApplicationContext context;
 
   private OutboxEvent append(String destination) {
     return tx.execute(s -> writer.append("lease", "a", "lease.v1", destination, Map.of()));
@@ -245,7 +249,11 @@ class OutboxLeaseIT {
   void quiet() {
     await()
         .atMost(Duration.ofSeconds(30))
-        .until(() -> registry.get("opentmf.outbox.in-flight").gauge().value() == 0d);
+        .until(
+            () -> {
+              GaugeRefresh.now(context);
+              return registry.get("opentmf.outbox.in-flight").gauge().value() == 0d;
+            });
   }
 
   @Test

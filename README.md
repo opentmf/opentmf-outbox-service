@@ -323,6 +323,10 @@ opentmf:
     send-timeout: 10s        # broker-acknowledgement wait per publish
     lease: 2m                # CONCURRENT lane default lease (> the longest call)
     shutdown-grace: 10s      # how long a stopping relay lets sends in flight finish
+    metrics-refresh: 15s     # how often the gauges are re-read (a scrape never queries)
+    maintenance:             # the bounded bulk operations: prune, unpark by filter
+      batch-size: 5000       # rows per batch - each its own short transaction
+      time-budget: 10s       # one call stops after this and says more remain
     ordered:
       lease: 15s             # ORDERED lane default lease - short, > send-timeout
     concurrent:
@@ -345,6 +349,9 @@ opentmf:
 | `ordered.lease`  | `Duration` | `15s`   | Lease of an ORDERED row when its publisher declares none. Short on purpose: after a pod stop the row waits this long. Must exceed `send-timeout` (validated at boot). |
 | `concurrent.max-in-flight` | `int` | `8` | CONCURRENT sends in flight per pod; the claim takes no more rows than free slots. |
 | `shutdown-grace` | `Duration` | `10s`   | On stop: the relay thread's and the in-flight sends' time to finish; the rest lapse by lease. |
+| `metrics-refresh` | `Duration` | `15s`  | How often the gauges are re-read from the database; a scrape reads the last values. |
+| `maintenance.batch-size` | `int`    | `5000`  | Rows per batch of a bulk operation (prune, unpark by filter); each batch is its own transaction, no entity loaded. |
+| `maintenance.time-budget` | `Duration` | `10s` | One bulk call stops after this; the answer says `moreToPrune` / `moreToUnpark` and the caller calls again. |
 | `ops-endpoints`  | `boolean`  | `true`  | `false` removes the library's `/ops` controller entirely. A `@ConditionalOnProperty` key read at boot, not a bound field. |
 
 ## Metrics
@@ -354,11 +361,29 @@ distinguished by the registry's common tags / scrape identity, never by a
 per-service metric prefix. Without a `MeterRegistry` bean the relay still works
 (a local simple registry, no exporter).
 
+**A scrape never touches the database (1.3.0).** The gauges read the last values that a
+daemon thread (`opentmf-outbox-metrics`) refreshes every `metrics-refresh` (default
+15 s, first refresh at start). Each refresh runs four queries, each served by its own
+partial index over the OPEN rows; none reads the relayed history.
+- **A database that does not answer cannot hang the refresher**: each refresh query has a
+  5 s query timeout, so it becomes a failed refresh. `metrics-age` (seconds since the last
+  successful refresh) keeps growing meanwhile; alert on it beside `parked`.
+- **Before the first refresh, and after a failed one**, the gauges read NaN: no value,
+  never a misleading zero.
+- `relay-lag` is computed at read time from the oldest open row's instant, so it keeps
+  growing between refreshes.
+- **Measured** with 1,000,000 relayed rows: idle, each query 0.1–0.7 ms. With 100,000
+  rows pending, the pending count reads its index in about 7 ms (it grows with the
+  OPEN rows only); the other three stay under 1 ms.
+- Up to 1.2.1 every scrape ran these queries over the whole table: 7–20 s each on
+  3.5–4.8 M-row tables, which put the scrape past its timeout.
+
 | Metric                     | Type    | Meaning                                            |
 |----------------------------|---------|----------------------------------------------------|
 | `opentmf.outbox.pending`   | gauge   | Rows not yet relayed nor cancelled (held, parked and in-flight included) |
 | `opentmf.outbox.in-flight` | gauge   | Pending rows under a live lease, across pods — claimed, send not booked yet (1.3.0) |
 | `opentmf.outbox.parked`    | gauge   | Rows with `parked_on` stamped — **alert when > 0** |
+| `opentmf.outbox.metrics-age` | gauge | Seconds since the gauges were last refreshed successfully — **alert when above a few refresh periods** (e.g. > 60 s with the default 15 s): the values above are stale or NaN |
 | `opentmf.outbox.relay-lag` | gauge   | Seconds the oldest *released* pending row has been deliverable (a held row is not lagging) |
 | `opentmf.outbox.relayed`   | counter | Successful relays, tagged by `destination`         |
 | `opentmf.outbox.dropped`   | counter | Rows given up by a publisher's DROP policy, tagged by `destination` (never counted as relayed) |
@@ -594,13 +619,72 @@ surface):
 
 | Method | Path                          | What                                                                  |
 |--------|-------------------------------|-----------------------------------------------------------------------|
-| POST   | `/ops/outbox/maintenance/prune` | Deletes relayed + cancelled rows past retention; wire to a CronJob kicker |
+| POST   | `/ops/outbox/maintenance/prune` | Deletes relayed + cancelled rows past retention, BOUNDED: answers `{"outboxRowsPruned": n, "moreToPrune": bool}`; wire to a CronJob that calls again while `moreToPrune` |
 | POST   | `/ops/outbox/{id}/unpark`     | Break-glass after the root cause is fixed: `parked_on` cleared, attempts reset, due now |
+| POST   | `/ops/outbox/unpark`          | Unpark by FILTER (JSON body `{"destination": …, "parkedFrom": …, "parkedTo": …, "reference": …}`, destination required), BOUNDED: answers `{"outboxRowsUnparked": n, "moreToUnpark": bool}`. Gate it like the single unpark |
 | POST   | `/ops/outbox/{id}/cancel`     | Withdraws an unreleased effect: never relayed, retained for audit     |
 | GET    | `/ops/outbox`                 | TMF630 triage list (attribute filtering + paging), payloads omitted   |
 | GET    | `/ops/outbox/state/{state}`   | The list narrowed to one derived-state leg (`pending`, `parked`, `relayed`, `cancelled`; unknown → 400), same filtering + paging on top |
 | GET    | `/ops/outbox/parked`          | Runbook alias of `/ops/outbox/state/parked`                           |
 | GET    | `/ops/outbox/{id}`            | One row in full — payload + `last_error`, the pre-unpark forensic read (behind the consumer's admin role, by ruling) |
+
+**The prune at scale (1.3.0).**
+- **How it deletes.** Batches of `maintenance.batch-size` terminal rows, oldest first, found
+  through `ix_outbox_relayed_on` / `ix_outbox_cancelled_on` and deleted by id in one
+  set-based statement per batch, each its own short transaction. No entity is loaded.
+  Parked rows are never pruned.
+- **Independent of the caller.** Each batch runs in its OWN transaction
+  (`REQUIRES_NEW`), even when the caller is inside one: a consumer calling `prune()` from
+  its own `@Transactional` service does not hold every batch in one long transaction,
+  and its rollback does not undo them. While a batch runs, the caller's connection
+  stays checked out beside the batch's, so the pool needs one connection to spare. The
+  same holds for the unpark by filter.
+- **Bounded.** A call stops after `maintenance.time-budget` and answers `moreToPrune: true`.
+  The CronJob loops while it is true, and a request thread never works through the
+  whole backlog.
+- **Measured.** 305,000 expired rows in one 479 ms call in the IT. A 5,000-row batch on
+  a 5,000,000-row table takes about 70 ms.
+- **What it costs.** `ix_outbox_relayed_on` is about as large as the primary key:
+  107 MB on 5,000,000 relayed rows.
+- **Why a B-tree on `relayed_on`.** It is exact and ordered: each batch starts at the
+  oldest expired row and never walks retained, parked or pending rows. A BRIN index
+  relies on physical order, which updates and vacuum reuse destroy. An id-ordered walk
+  would step over every parked and retained row on each call.
+- **Up to 1.2.1** the prune loaded every expired row as an entity in one transaction.
+  On 3.5–4.8 M-row tables it ran the pods out of CPU and memory and pruned nothing.
+- **The CronJob side** (`concurrencyPolicy: Forbid`, `backoffLimit: 0`) is the
+  deployment's.
+
+**Unpark by filter (1.3.0)**, for after a receiver's outage that outlasted its
+publisher's budget. With the defaults (10 attempts, 5 s doubling to 10 min) every row
+older than about 31 minutes is then parked. Use it **once the receiver is back**:
+`POST /ops/outbox/unpark` (or `OutboxMaintenanceService.unpark(destination, from, to,
+reference)` from your own ops code).
+- **What it unparks.** Every parked row of that destination, optionally within a
+  `parked_on` range and of one `reference`. The destination is required: there is no
+  "unpark everything".
+- **What each row looks like after.** Exactly as the single unpark leaves it: parked
+  stamp cleared, attempts reset, due now, `last_error` kept. It runs under the same
+  guard: a row an ops action holds is waited for and re-checked.
+- **Bounded.** It works in batches of `maintenance.batch-size` within
+  `maintenance.time-budget`. Call again while `moreToUnpark`.
+- **The resend stays bounded by the lanes.** At most `concurrent.max-in-flight`
+  CONCURRENT sends at a time, at most `batch-size` ORDERED rows per pass.
+- **A row parked by a `TerminalOutboxException`** (a refused body, say) comes back
+  parked on its first attempt unless the cause was fixed.
+
+**The list's total count on a large table.** The TMF630 list pages with a total count
+over its filter. Measured on 5,000,000 rows (120,000 open):
+
+| List | Count |
+|---|---|
+| `/ops/outbox` without a filter | ~90 ms |
+| `/state/relayed` | ~95–100 ms |
+| `/state/pending` | ~8 ms |
+| `/ops/outbox/parked` | ~165 ms (a scan: the state filter is broader than `ix_outbox_parked`) |
+| `/state/cancelled` | ~2 ms |
+
+A 20-row page itself takes ~3 ms. None of these is seconds, so they stay as they are.
 
 One wire contract for the estate: an unknown row id answers **404**, an action
 on a row not in the state it needs (cancel/unpark a relayed row, unpark a row
@@ -686,12 +770,13 @@ The library is self-contained for consumer testing — no test-jar needed:
    onboarded pre-library one alike). Rows pending at the upgrade have no lane
    and ride ORDERED once, including any pending HTTP backlog, which drains on
    the relay thread as it would have under 1.2.x.
-   **What the first start costs on a large table.** `004` builds its four
-   indexes `CONCURRENTLY`, so the appends of pods still running are never
-   blocked. Each build still reads the whole table once. Measured: about 3.3 s
-   in total on 3,100,000 rows / 2.5 GB, roughly 1.1 s per million rows; a busier
-   database takes about twice that. Liquibase runs before the service is ready,
-   so the consumer's **startup probe must allow for it**.
+   **What the first start costs on a large table.** Changesets `004` and `005`
+   build eight indexes `CONCURRENTLY`, so the appends of pods still running are
+   never blocked. Each build still reads the whole table once. Measured: 0.7–1.8 s
+   per build, about 7.2 s for all eight, on 3,100,000 rows / 2.5 GB, i.e. roughly
+   2.3 s per million rows; a busier database takes about twice that. Liquibase
+   runs before the service is ready, so the consumer's **startup probe must allow
+   for it** (say 5 s per million outbox rows, plus its usual start).
 2. **Rolling deploys are safe for sends.** A 1.3.0 claim moves
    `next_attempt_on` to the lease end, so a 1.2.x pod still running sees a
    leased row as not due and never sends it twice. While old and new pods
@@ -782,7 +867,8 @@ Accepted survivors, each reviewed:
 
 | Where | Mutant | Verdict |
 |---|---|---|
-| `OutboxMaintenanceService.prune` | `relayed + cancelled > 0` boundary/negation/subtraction | Log-only guard; row deletion is unaffected |
+| `OutboxMaintenanceService.pruneExpired` / `unpark` (by filter) | the "anything to log" guard and the "more remain" message ternary (negations, boundaries) | Log-only; the counts and `moreTo…` flags are asserted by the unit tests and the ITs |
+| `OutboxMaintenanceService.pruneExpired` / `unpark` (by filter) | `nanoTime() < deadline` boundary | Equivalent: `<` vs `<=` on a nanosecond clock |
 | `OutboxRelayWorker.truncate` | `<=` vs `<` boundary | Equivalent mutant at exactly 4000 chars |
 | `OutboxRelayWorker.relayBatch` | negated `!lane.submit(...)` | Log-only: the refused send's permit and lease are handled inside `submit` |
 | `OutboxRelayWorker.bookRelayed` / `bookFailure` | removed `logLapsed`; negated cancelled check before the WARN | Log-only; the lapse and sent-but-cancelled outcomes are asserted by the worker tests and `OutboxLeaseIT` |
@@ -791,6 +877,7 @@ Accepted survivors, each reviewed:
 | `OutboxRelay.stop` | awaitTermination conditional | Shutdown-timing leg; a kill needs a grace-long hanging-task test for no insight |
 | `OutboxRelay.poke` | removed `passQueued.set(false)` after a rejection | Reachable only after shutdown, when no further pass can run anyway |
 | `OutboxRelay` thread factory | removed `setDaemon` | Asserted by `OutboxRelayTests` in every normal run; PIT's per-line selection misses the factory-lambda mapping |
+| `OutboxMetrics` thread factory | removed `setDaemon` | Asserted by `OutboxMetricsTests` (the refresher thread is a daemon); same factory-lambda mapping miss |
 
 `NO_COVERAGE` entries (the Kafka publisher bean method, ops controller) are
 exercised by the Testcontainers ITs, which the posture deliberately keeps out

@@ -154,3 +154,36 @@ comment on index ix_outbox_concurrent_unkeyed is 'The CONCURRENT lane''s claim, 
 --rollback alter table outbox drop column if exists ordering_key;
 --rollback alter table outbox drop column if exists lane;
 --rollback alter table outbox drop column if exists claimed_until;
+
+--changeset opentmf-outbox:005-outbox-gauge-and-prune-indexes runInTransaction:false
+-- 1.3.0, ADDITIVE: four partial indexes so that neither the metrics gauges nor the retention
+-- prune ever reads the whole table (load test 2026-10-06, findings F-1 and F-2 - on 3.5-4.8 M
+-- row tables the gauges took 7-20 s per scrape and the prune never finished).
+-- ix_outbox_open_since - every open row (not relayed, not cancelled) by the instant it became
+--   deliverable, greatest(created_on, release_at): the pending count reads it index-only, the
+--   relay-lag gauge reads its first entry.
+-- ix_outbox_parked - the parked rows only, by destination and parked_on: the parked gauge
+--   (index-only count) and the unpark by filter (one destination, a parked-on range).
+-- ix_outbox_relayed_on / ix_outbox_cancelled_on - the terminal rows by their stamp: the prune
+--   deletes the oldest expired rows in bounded batches without a full scan.
+-- Built CONCURRENTLY (hence runInTransaction:false) so a deploy onto a large table does not block
+-- the appends of the pods still running. Each build is preceded by a DROP ... IF EXISTS: if a
+-- concurrent build fails it leaves an INVALID index behind and this changeset unmarked, and the
+-- next run must rebuild it rather than skip it.
+drop index concurrently if exists ix_outbox_open_since;
+create index concurrently ix_outbox_open_since on outbox ((greatest(created_on, coalesce(release_at, created_on)))) where relayed_on is null and cancelled_on is null;
+drop index concurrently if exists ix_outbox_parked;
+create index concurrently ix_outbox_parked on outbox (destination, parked_on, id) where parked_on is not null and relayed_on is null and cancelled_on is null;
+drop index concurrently if exists ix_outbox_relayed_on;
+create index concurrently ix_outbox_relayed_on on outbox (relayed_on) where relayed_on is not null;
+drop index concurrently if exists ix_outbox_cancelled_on;
+create index concurrently ix_outbox_cancelled_on on outbox (cancelled_on) where cancelled_on is not null;
+
+comment on index ix_outbox_open_since is 'Open rows (not relayed, not cancelled) by the instant they became deliverable - the pending count (index-only) and the relay-lag gauge (first entry).';
+comment on index ix_outbox_parked is 'Parked rows only, by destination and parked_on - the parked gauge and the unpark by filter.';
+comment on index ix_outbox_relayed_on is 'Relayed rows by relayed_on - the retention prune deletes the oldest expired in bounded batches.';
+comment on index ix_outbox_cancelled_on is 'Cancelled rows by cancelled_on - the retention prune of the other terminal state.';
+--rollback drop index concurrently if exists ix_outbox_cancelled_on;
+--rollback drop index concurrently if exists ix_outbox_relayed_on;
+--rollback drop index concurrently if exists ix_outbox_parked;
+--rollback drop index concurrently if exists ix_outbox_open_since;

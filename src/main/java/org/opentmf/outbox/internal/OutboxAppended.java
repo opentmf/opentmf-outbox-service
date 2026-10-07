@@ -7,7 +7,7 @@ import org.opentmf.outbox.OutboxEvent;
  * transaction. {@code OutboxRelayTrigger} receives it AFTER COMMIT and pokes the relay - the
  * normal-path latency is milliseconds; the sweep remains the safety net.
  *
- * @param outboxId the appended {@link OutboxEvent} id (tracing only - the relay always claims
- *     from the table, never from this event)
+ * @param outboxId the appended {@link OutboxEvent} id, or {@code 0} for an unpark by filter
+ *     (tracing only - the relay always claims from the table, never from this event)
  */
 public record OutboxAppended(long outboxId) {}
