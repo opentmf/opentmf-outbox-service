@@ -707,6 +707,33 @@ documented absence — never a silently degraded endpoint). A toolkit-less
 consumer keeps the full `OutboxMaintenanceService` API and can wire its own
 endpoints.
 
+### OAS fragment (1.3.0)
+
+The ops surface is documented ONCE, in the jar:
+`META-INF/openapi/opentmf-outbox-ops.oas.yaml` (`OutboxOpsOpenApi.fragment()` returns its
+text). It carries the eight routes above — the unpark by filter included, with the bounded
+prune's and unpark's `moreTo…` flags and the row view's `inFlight` / `claimedUntil` — with
+the TMF630 paging the toolkit really answers —
+200 / 206 / 416, `X-Total-Count`, `X-Result-Count`, a 1-based `Content-Range`, `Link`, the
+clamp of `limit` at `max-limit`, and the toolkit's own error object on 400/416 (which does
+NOT pass through the consumer's problem-detail mapper). Consumers paste its `paths` and
+`components` into their own OAS under their own server URL and security, keep the component
+names, and pin themselves with a drift test:
+
+```java
+@Test
+void theOpsSubtreeMatchesTheLibraryFragment() {
+  Map<String, Object> mine = new Yaml().load(myOasText());
+  Map<String, Object> theirs = new Yaml().load(OutboxOpsOpenApi.fragment());
+  assertThat(opsSubtree(mine)).isEqualTo(opsSubtree(theirs)); // paths starting /ops/outbox
+}
+```
+
+The library's own guard (`OutboxOpsOpenApiTests`) keeps the fragment equal to the
+controller's mappings and its `OutboxRow` schema equal to `OutboxRowView`'s fields, and `OutboxRoundTripIT` pins the paging behaviour against the real
+toolkit — a toolkit bump that changes it turns THIS build red, not four consumers' OAS files
+silently wrong.
+
 ### Seal rule (ArchUnit)
 
 The public contract is the `org.opentmf.outbox` package: `OutboxWriter` +
