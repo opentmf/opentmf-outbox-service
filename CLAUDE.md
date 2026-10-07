@@ -20,6 +20,15 @@ library never imports that BOM (direct property pins in the pom).
   `display-plugin-updates` online with `-Pmutation,sonar,release` and the estate
   ignore string (the pom's own `<maven.version.ignore>`), Sonar 0 open, tree clean.
   No container image, so no image scan. pitest 1.19.6 is the one deliberate hold.
+  A release bumps EVERY version that has a newer release (parent check too).
+- **The gate is local only** (no CI workflow; the SonarCloud check builds nothing).
+  The `virtual-threads-it` failsafe execution needs a JDK 21+ entry in
+  `~/.m2/toolchains.xml`. Failsafe MERGES into an existing summary file: a loop of
+  runs without `clean` must delete `target/failsafe-reports/failsafe-summary*.xml`.
+- **Claim / gauge / prune / unpark SQL is native and plan-pinned** (`OutboxClaimSql`,
+  `OutboxGaugeSql`, `OutboxPruneSql`, `OutboxUnparkSql`; `OutboxClaimPlanIT` runs every
+  statement PREPAREd under `force_custom_plan` AND `force_generic_plan`). Fix plans by
+  index and query SHAPE only - no hints, no `plan_cache_mode` in the library.
 - **Merge convention:** PR to `develop`, merged as a merge commit, branch deleted.
   Identity `gokhanus`; no AI attribution lines in this repo.
 - **Reviews carry a plan-conformance checklist:** every enumerable plan surface is
@@ -36,12 +45,17 @@ library never imports that BOM (direct property pins in the pom).
   `OutboxAutoConfiguration`; `KafkaLessStartupTests` pins the shape with a
   child-first classloader (Boot's `FilteredClassLoader` cannot reproduce the
   reflective failure).
+- **1.3.0 (2026-10-07)** — OUTBOX-HTTP-LANE-1 (#6): ORDERED / CONCURRENT lanes stamped at
+  append, claim by LEASE (`claimed_until`), booking hook for every outcome, ordering keys
+  never in flight together within a pod or across pods (PostgreSQL advisory lock +
+  re-check in a new snapshot; relay tx READ COMMITTED). OUTBOX-GAUGES-AND-PRUNE-AT-SCALE-1
+  (#7, load-test F-1/F-2): gauges from a refreshed snapshot (`metrics-age`), set-based
+  bounded prune (`REQUIRES_NEW` batches), unpark by filter. The ops OAS fragment (#4).
+  Changesets 004/005 build their indexes CONCURRENTLY.
 
 ## Open
 
-- PR #4 (`feat/ops-oas-fragment`): the /ops/outbox OAS fragment shipped in the
-  jar — open proposal, awaiting review; not stale.
 - `?state=` on `GET /ops/outbox` needs a tmf630-toolkit pass-through allowance;
   the ruled path form `/ops/outbox/state/{state}` ships since 1.2.0.
-- Develop is `1.2.2-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
-  heading `## 1.2.2 - <date>`.
+- Develop is `1.3.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
+  heading `## 1.3.1 - <date>`.
