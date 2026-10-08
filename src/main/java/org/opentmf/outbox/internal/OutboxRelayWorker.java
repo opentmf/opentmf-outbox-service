@@ -380,7 +380,7 @@ class OutboxRelayWorker {
     row.setNextAttemptOn(row.getRelayedOn()); // no longer the lease end
     if (row.getCancelledOn() != null) {
       log.warn(
-          "Outbox row {} to {} was cancelled while its send was in flight and the send"
+          "Outbox row {} to {} was cancelled after its lease lapsed mid-send and the send"
               + " succeeded - booked SENT-BUT-CANCELLED (both stamps)",
           row.getId(),
           row.getDestination());

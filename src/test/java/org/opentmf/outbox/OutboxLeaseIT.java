@@ -1,6 +1,7 @@
 package org.opentmf.outbox;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
 import com.zaxxer.hikari.HikariDataSource;
@@ -28,7 +29,6 @@ import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
-import org.springframework.data.domain.PageRequest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -324,49 +324,60 @@ class OutboxLeaseIT {
   }
 
   /**
-   * Cancel against a live lease: it does not wait for the send (no lock is held across it), and
-   * the booking honours it - a delivered row is booked SENT-BUT-CANCELLED (listed under both
-   * relayed and cancelled), a failed one retires cancelled, never retried, never parked.
+   * Cancel against a live lease (1.3.1, OUTBOX-CANCEL-REFUSES-LIVE-LEASE-1): a row IN FLIGHT is
+   * REFUSED - at once, by name ({@link OutboxRowInFlightException}, a 409) - because its send may
+   * be delivering right now; the delivered row stays delivered, never "cancelled". Once a send is
+   * booked and the row is back to pending (a failed send in backoff), the cancel succeeds and the
+   * row is never sent again.
    */
   @Test
-  void aCancelDuringASend_returnsAtOnce_andTheBookingHonoursIt() throws Exception {
+  void aCancelDuringASend_isRefusedByName_andSucceedsOnceTheSendIsBooked() throws Exception {
     OutboxEvent delivered = append("gate-concurrent:x");
     OutboxEvent failed = append("gatefail-concurrent:x");
     assertThat(GATE_REACHED.await(20, TimeUnit.SECONDS)).isTrue();
     assertThat(maintenance.inspect(delivered.getId()).inFlight()).isTrue();
 
+    long deliveredId = delivered.getId();
+    long failedId = failed.getId();
     CompletableFuture<Void> cancels =
         CompletableFuture.runAsync(
             () -> {
-              maintenance.cancel(delivered.getId());
-              maintenance.cancel(failed.getId());
+              assertThatThrownBy(() -> maintenance.cancel(deliveredId))
+                  .isInstanceOf(OutboxRowInFlightException.class);
+              assertThatThrownBy(() -> maintenance.cancel(failedId))
+                  .isInstanceOf(OutboxRowInFlightException.class);
             });
-    cancels.get(5, TimeUnit.SECONDS); // returns while both sends still wait at the gate
+    cancels.get(5, TimeUnit.SECONDS); // refused at once - nothing waits for the sends
     GATE.countDown();
 
-    OutboxRowView both = awaitRelayed(delivered);
-    assertThat(both.cancelledOn()).isNotNull();
-    assertThat(both.inFlight()).isFalse();
-    assertThat(maintenance.list(null, OutboxStateFilter.RELAYED, PageRequest.of(0, 500)))
-        .extracting(OutboxRowView::id)
-        .contains(delivered.getId());
-    assertThat(maintenance.list(null, OutboxStateFilter.CANCELLED, PageRequest.of(0, 500)))
-        .extracting(OutboxRowView::id)
-        .contains(delivered.getId(), failed.getId());
+    OutboxRowView sent = awaitRelayed(delivered);
+    assertThat(sent.cancelledOn()).isNull(); // delivered, and nobody was told otherwise
+    assertThat(sent.inFlight()).isFalse();
 
+    // the failed send is booked (RETRY) - between its attempts the row is cancellable again
     await()
         .atMost(Duration.ofSeconds(10))
-        .untilAsserted(
-            () -> assertThat(HOOKED.get(failed.getId())).containsExactly(Outcome.CANCELLED));
+        .untilAsserted(() -> assertThat(HOOKED.get(failed.getId())).contains(Outcome.RETRY));
+    await()
+        .atMost(Duration.ofSeconds(10))
+        .until(
+            () -> {
+              try {
+                maintenance.cancel(failed.getId());
+                return true;
+              } catch (OutboxRowInFlightException retryInFlight) {
+                return false; // caught mid-retry: try again once that send is booked
+              }
+            });
     OutboxRowView retired = maintenance.inspect(failed.getId());
+    assertThat(retired.cancelledOn()).isNotNull();
     assertThat(retired.relayedOn()).isNull();
     assertThat(retired.parked()).isFalse();
-    assertThat(retired.claimedUntil()).isNull();
-    assertThat(retired.attempts()).isEqualTo(1);
+    int sends = DELIVERED.get(failed.getId()).size();
     await() // a sweep or two: a cancelled row is never claimed again
         .during(Duration.ofMillis(1500))
         .atMost(Duration.ofSeconds(3))
-        .until(() -> DELIVERED.get(failed.getId()).size() == 1);
+        .until(() -> DELIVERED.get(failed.getId()).size() == sends);
   }
 
   /**

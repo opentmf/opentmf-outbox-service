@@ -22,12 +22,12 @@ import org.springframework.transaction.annotation.Transactional;
  * <p>The row-mutating actions read their row under a WAITING {@code for update} lock, so they
  * serialize against the relay's short claim and booking transactions: an action sees the row as
  * the relay LEFT it (and refuses a now-relayed row) - never a stale snapshot, never a silent
- * no-op. Since 1.3.0 no lock is held across a send, so an action on an IN-FLIGHT row (a live
- * lease) does not wait for the send: a cancel succeeds at once, and the send's booking then
- * honours it - a failed send retires cancelled (no retry), a successful one is booked
- * SENT-BUT-CANCELLED (both stamps, visible on /ops), and an ORDERED row cancelled before its
- * turn is released unsent. An unpark never meets a live lease: only a booking parks a row, and
- * the booking clears the lease.
+ * no-op. Since 1.3.0 no lock is held across a send; since 1.3.1 a cancel REFUSES a row that is
+ * IN FLIGHT (a live lease) with {@link OutboxRowInFlightException} (409) - its publisher may be
+ * delivering right now - and succeeds on an unclaimed row or one whose lease has lapsed. The
+ * booking still honours a cancel that slipped in on a lapsed lease (a late sender): a failed
+ * send retires cancelled, a successful one is booked SENT-BUT-CANCELLED (both stamps). An unpark
+ * never meets a live lease: only a booking parks a row, and the booking clears the lease.
  */
 @Slf4j
 @RequiredArgsConstructor
@@ -108,9 +108,12 @@ public class OutboxMaintenanceService {
   /**
    * Cancels one UNRELEASED effect: the row is stamped {@code cancelled_on}, becomes
    * unclaimable for good, and is retained for audit until the retention prunes it. Only a row
-   * that is not yet relayed and not already cancelled is cancellable - the guard is by name:
+   * that is not yet relayed, not already cancelled and not in flight is cancellable - the guard
+   * is by name:
    *
    * @throws IllegalArgumentException when no row has the given id
+   * @throws OutboxRowInFlightException when a relay holds a live lease on the row - its send may
+   *     be delivering now (1.3.1); cancel again once it is booked
    * @throws IllegalStateException when the row is already relayed (the effect has left - a
    *     cancel cannot recall it) or already cancelled
    */
@@ -123,7 +126,12 @@ public class OutboxMaintenanceService {
     if (event.getCancelledOn() != null) {
       throw new IllegalStateException("Outbox row %d is already cancelled".formatted(outboxId));
     }
-    event.setCancelledOn(OffsetDateTime.now(ZoneOffset.UTC));
+    OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+    if (event.getClaimedUntil() != null && event.getClaimedUntil().isAfter(now)) {
+      // a LIVE lease: the publisher may be delivering right now - "cancelled" would be a lie
+      throw new OutboxRowInFlightException(outboxId, event.getClaimedUntil());
+    }
+    event.setCancelledOn(now);
     log.info("Outbox row {} cancelled - it will never be relayed", outboxId);
   }
 

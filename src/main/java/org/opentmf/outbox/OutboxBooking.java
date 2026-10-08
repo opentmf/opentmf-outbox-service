@@ -30,8 +30,8 @@ public record OutboxBooking(
      */
     EXHAUSTED,
     /**
-     * Failed, and the row was cancelled while the send was in flight: it retires cancelled -
-     * no retry, no park.
+     * Failed, and the row was cancelled while the send still ran (after its lease lapsed - a live
+     * lease refuses the cancel): it retires cancelled - no retry, no park.
      */
     CANCELLED
   }

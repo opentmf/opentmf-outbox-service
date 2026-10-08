@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.3.1 - 2026-10-08
+
+### Fixed
+
+- **`cancel` accepted a row whose send was in flight** (OUTBOX-CANCEL-REFUSES-LIVE-LEASE-1).
+  Since 1.3.0 the relay holds no lock across a send, so a cancel under a live lease
+  returned success at once, and a send that then succeeded was booked
+  sent-but-cancelled. A caller that took the success as "it will not go out" (dnms-681's
+  subscription DELETE did, as it had under 1.2.x, where the cancel waited for the send
+  and then refused) was told the effect was withdrawn while it was being delivered.
+  - `OutboxMaintenanceService.cancel(id)` now refuses a row under a live lease, on both
+    lanes, with the new `OutboxRowInFlightException`. It is an `IllegalStateException`,
+    so `POST /ops/outbox/{id}/cancel` answers **409** like the other wrong-state
+    refusals; `claimedUntil()` names the lease end. Nothing waits: the refusal is
+    immediate.
+  - Cancel again once the send is booked: a failed send in backoff is cancellable, a
+    delivered one refuses "already relayed".
+  - Unclaimed rows and rows whose lease has lapsed stay cancellable. Should a lapsed
+    lease's send still book, the booking honours the cancel as before (retires a failed
+    send cancelled; books a delivered one sent-but-cancelled), so that state remains,
+    narrowed to the lapsed-lease case.
+
 ## 1.3.0 - 2026-10-07
 
 OUTBOX-HTTP-LANE-1: HTTP rows leave the ordered relay, and every row is claimed

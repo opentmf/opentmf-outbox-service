@@ -24,7 +24,7 @@ import org.opentmf.outbox.OutboxPublisher.Lane;
  * cancelled = {@code cancelledOn != null}. A pending row whose {@code releaseAt} lies in the
  * future is HELD - not claimable until then; a pending row whose {@code claimedUntil} lies in the
  * future is IN FLIGHT - a relay holds its lease (1.3.0). Relayed and cancelled overlap only for a
- * row cancelled while its send was in flight and then delivered (sent-but-cancelled).
+ * row cancelled after its lease lapsed mid-send, and then delivered (sent-but-cancelled).
  *
  * <p>Part of the library's public seam (with {@link OutboxWriter} and
  * {@link OutboxMaintenanceService}); it is also the Querydsl root of the ops list endpoint —
@@ -129,9 +129,9 @@ public class OutboxEvent {
 
   /**
    * Cancellation time of an UNRELEASED effect - the other terminal state; null = not cancelled.
-   * Set only through {@link OutboxMaintenanceService#cancel(long)}, which refuses relayed rows.
-   * A row cancelled while its send was in flight and then delivered carries both stamps
-   * (sent-but-cancelled) - the only overlap.
+   * Set only through {@link OutboxMaintenanceService#cancel(long)}, which refuses relayed rows
+   * and rows under a live lease. A row cancelled after its lease lapsed mid-send, and then
+   * delivered, carries both stamps (sent-but-cancelled) - the only overlap.
    */
   private OffsetDateTime cancelledOn;
 
