@@ -8,27 +8,37 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.Locale;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import lombok.extern.slf4j.Slf4j;
+import org.opentmf.outbox.OutboxPublisher.Lane;
+import org.opentmf.outbox.internal.OutboxEventRepository.LaneCounts;
+import org.opentmf.outbox.internal.OutboxEventRepository.LaneSince;
 
 /**
  * The outbox meter family under the LIBRARY-STABLE names ({@code opentmf.outbox.*}
  * - one name across every consumer; the emitting service is distinguished by the registry's
  * common tags / scrape identity, never by a per-service metric prefix):
  *
+ * <p>The four row gauges carry a {@code lane} tag (1.4.0), {@code ordered} or {@code concurrent} -
+ * the lane the row was stamped with at append, a row stamped before 1.3.0 counting as ordered.
+ * Each gauge is two series; {@code sum without (lane)} is the 1.3.0 value.
+ *
  * <ul>
- *   <li>{@code opentmf.outbox.pending} - gauge, rows not yet relayed nor cancelled (held, parked
- *       and in-flight rows included)
- *   <li>{@code opentmf.outbox.in-flight} - gauge, pending rows under a live lease: claimed by a
- *       relay (any pod) whose send has not been booked yet (1.3.0)
- *   <li>{@code opentmf.outbox.parked} - gauge, alert when above 0
- *   <li>{@code opentmf.outbox.relay-lag} - gauge, how long the oldest RELEASED pending row has
- *       been deliverable (seconds) - a held row is not lagging until its hold passes
+ *   <li>{@code opentmf.outbox.pending} - gauge by {@code lane}, rows not yet relayed nor
+ *       cancelled (held, parked and in-flight rows included)
+ *   <li>{@code opentmf.outbox.in-flight} - gauge by {@code lane}, pending rows under a live
+ *       lease: claimed by a relay (any pod) whose send has not been booked yet (1.3.0)
+ *   <li>{@code opentmf.outbox.parked} - gauge by {@code lane}, alert when above 0
+ *   <li>{@code opentmf.outbox.relay-lag} - gauge by {@code lane}, how long the lane's oldest
+ *       RELEASED pending row has been deliverable (seconds) - a held row is not lagging until
+ *       its hold passes
  *   <li>{@code opentmf.outbox.metrics-age} - gauge, seconds since the last SUCCESSFUL refresh of
- *       the gauges above (NaN before the first) - alert when it exceeds a few refresh periods
+ *       the gauges above (NaN before the first) - alert when it exceeds a few refresh periods;
+ *       one series, no lane
  *   <li>{@code opentmf.outbox.relayed} - counter by {@code destination} (closed tag set)
  *   <li>{@code opentmf.outbox.dropped} - counter by {@code destination}: rows given up by a
  *       publisher's DROP policy (never delivered, forensics kept)
@@ -55,15 +65,25 @@ class OutboxMetrics {
   static final String DROPPED = "opentmf.outbox.dropped";
   static final String ATTEMPTS = "opentmf.outbox.attempts";
   static final String TAG_DESTINATION = "destination";
+  static final String TAG_LANE = "lane";
+
+  /** One lane's last values; {@code null} instant = no open row in the lane. */
+  record LaneValues(double pending, double parked, double inFlight, Instant openSince) {
+
+    static final LaneValues UNKNOWN = new LaneValues(Double.NaN, Double.NaN, Double.NaN, null);
+  }
 
   /**
-   * The last values read from the database; {@code null} instant = no open row; {@code known}
-   * false = no successful refresh yet (or the last one failed): every gauge reads NaN.
+   * The last values read from the database, per lane; {@code known} false = no successful
+   * refresh yet (or the last one failed): every gauge reads NaN.
    */
-  record Snapshot(
-      boolean known, double pending, double parked, double inFlight, Instant openSince) {
+  record Snapshot(boolean known, LaneValues ordered, LaneValues concurrent) {
 
-    static final Snapshot NONE = new Snapshot(false, Double.NaN, Double.NaN, Double.NaN, null);
+    static final Snapshot NONE = new Snapshot(false, LaneValues.UNKNOWN, LaneValues.UNKNOWN);
+
+    LaneValues of(Lane lane) {
+      return lane == Lane.CONCURRENT ? concurrent : ordered;
+    }
   }
 
   private final MeterRegistry registry;
@@ -77,19 +97,26 @@ class OutboxMetrics {
     this.registry = registry;
     this.repository = repository;
     this.refreshEvery = refreshEvery;
-    Gauge.builder(PENDING, this, m -> m.snapshot.get().pending())
-        .description("Outbox rows not yet relayed nor cancelled (pending, in-flight included)")
-        .register(registry);
-    Gauge.builder(PARKED, this, m -> m.snapshot.get().parked())
-        .description("Outbox rows parked (delivery budget exhausted) - alert when > 0")
-        .register(registry);
-    Gauge.builder(IN_FLIGHT, this, m -> m.snapshot.get().inFlight())
-        .description("Outbox rows claimed by a live lease whose send is not booked yet")
-        .register(registry);
-    Gauge.builder(RELAY_LAG, this, OutboxMetrics::relayLagSeconds)
-        .baseUnit("seconds")
-        .description("How long the oldest released pending outbox row has been deliverable")
-        .register(registry);
+    for (Lane lane : Lane.values()) {
+      String tag = laneTag(lane);
+      Gauge.builder(PENDING, this, m -> m.snapshot.get().of(lane).pending())
+          .tag(TAG_LANE, tag)
+          .description("Outbox rows not yet relayed nor cancelled (pending, in-flight included)")
+          .register(registry);
+      Gauge.builder(PARKED, this, m -> m.snapshot.get().of(lane).parked())
+          .tag(TAG_LANE, tag)
+          .description("Outbox rows parked (delivery budget exhausted) - alert when > 0")
+          .register(registry);
+      Gauge.builder(IN_FLIGHT, this, m -> m.snapshot.get().of(lane).inFlight())
+          .tag(TAG_LANE, tag)
+          .description("Outbox rows claimed by a live lease whose send is not booked yet")
+          .register(registry);
+      Gauge.builder(RELAY_LAG, this, m -> m.relayLagSeconds(lane))
+          .tag(TAG_LANE, tag)
+          .baseUnit("seconds")
+          .description("How long the lane's oldest released pending row has been deliverable")
+          .register(registry);
+    }
     Gauge.builder(METRICS_AGE, this, OutboxMetrics::metricsAgeSeconds)
         .baseUnit("seconds")
         .description("Seconds since the outbox gauges were last refreshed successfully")
@@ -119,18 +146,31 @@ class OutboxMetrics {
   }
 
   /**
-   * Re-reads the gauge values - four indexed queries over the OPEN rows only, each with a 5 s
+   * Re-reads the gauge values - four indexed queries over the OPEN rows only, each answering
+   * both lanes in one statement and each with a 5 s
    * query timeout, so a database that does not answer becomes a FAILED refresh rather than a
    * stuck one. A failure leaves NaN (no value) until the next refresh succeeds, never reaches a
    * scrape, and lets {@code metrics-age} keep growing.
    */
   void refresh() {
     try {
-      long parked = repository.countParked();
-      long pending = repository.countOpenNotParked() + parked;
-      long inFlight = repository.countInFlight(OffsetDateTime.now(ZoneOffset.UTC));
-      Instant openSince = repository.findOldestOpenSince().orElse(null);
-      snapshot.set(new Snapshot(true, pending, parked, inFlight, openSince));
+      LaneCounts parked = repository.countParked();
+      LaneCounts openNotParked = repository.countOpenNotParked();
+      LaneCounts inFlight = repository.countInFlight(OffsetDateTime.now(ZoneOffset.UTC));
+      LaneSince openSince = repository.findOldestOpenSince();
+      snapshot.set(
+          new Snapshot(
+              true,
+              new LaneValues(
+                  (double) openNotParked.getOrdered() + parked.getOrdered(),
+                  parked.getOrdered(),
+                  inFlight.getOrdered(),
+                  openSince.getOrdered()),
+              new LaneValues(
+                  (double) openNotParked.getConcurrent() + parked.getConcurrent(),
+                  parked.getConcurrent(),
+                  inFlight.getConcurrent(),
+                  openSince.getConcurrent())));
       lastRefreshed.set(Instant.now());
     } catch (RuntimeException ex) {
       snapshot.set(Snapshot.NONE);
@@ -155,16 +195,21 @@ class OutboxMetrics {
     return last == null ? Double.NaN : Duration.between(last, Instant.now()).toMillis() / 1000d;
   }
 
+  /** The {@code lane} tag value: {@code ordered} / {@code concurrent}. */
+  static String laneTag(Lane lane) {
+    return lane.name().toLowerCase(Locale.ROOT);
+  }
+
   /**
-   * Seconds since the oldest open row became deliverable, as of NOW (no database read); 0 when
-   * no open row is deliverable yet; NaN before the first refresh.
+   * Seconds since the lane's oldest open row became deliverable, as of NOW (no database read); 0
+   * when no open row of the lane is deliverable yet; NaN before the first refresh.
    */
-  double relayLagSeconds() {
+  double relayLagSeconds(Lane lane) {
     Snapshot last = snapshot.get();
     if (!last.known()) {
       return Double.NaN;
     }
-    Instant since = last.openSince();
+    Instant since = last.of(lane).openSince();
     if (since == null) {
       return 0d;
     }

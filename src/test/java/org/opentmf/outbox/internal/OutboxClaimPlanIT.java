@@ -323,19 +323,42 @@ class OutboxClaimPlanIT {
     return figures.toString();
   }
 
-  /** Each gauge statement may read exactly ITS partial index over the open rows - no other. */
+  /**
+   * Each gauge statement - both lanes in one (1.4.0) - reads exactly ITS partial indexes over the
+   * open rows, EVERY one of them (each lane by its own index, never by a scan of the other's),
+   * and no other.
+   */
   private static void assertGaugesIndexedOnly(String state) throws Exception {
     Map<String, String> now = Map.of("now", "now()");
-    assertIndexedOnly(
+    assertIndexedByExactly(
         state + " open-not-parked",
         OutboxGaugeSql.OPEN_NOT_PARKED,
         now,
-        List.of("ix_outbox_pending"));
-    assertIndexedOnly(state + " parked", OutboxGaugeSql.PARKED, now, List.of("ix_outbox_parked"));
-    assertIndexedOnly(
-        state + " open-since", OutboxGaugeSql.OPEN_SINCE, now, List.of("ix_outbox_open_since"));
-    assertIndexedOnly(
+        List.of(
+            "ix_outbox_ordered_claim", "ix_outbox_concurrent_keyed", "ix_outbox_concurrent_unkeyed"));
+    assertIndexedByExactly(
+        state + " parked", OutboxGaugeSql.PARKED, now, List.of("ix_outbox_parked_lane"));
+    assertIndexedByExactly(
+        state + " open-since",
+        OutboxGaugeSql.OPEN_SINCE,
+        now,
+        List.of("ix_outbox_open_since_ordered", "ix_outbox_open_since_concurrent"));
+    assertIndexedByExactly(
         state + " in-flight", OutboxGaugeSql.IN_FLIGHT, now, List.of("ix_outbox_claimed_until"));
+  }
+
+  /** {@link #assertIndexedOnly}, and every one of {@code indexes} is read, under both modes. */
+  private static void assertIndexedByExactly(
+      String what, String statement, Map<String, String> args, List<String> indexes)
+      throws Exception {
+    assertIndexedOnly(what, statement, args, indexes);
+    for (String mode : PLAN_MODES) {
+      assertThat(nodes(explain(statement, mode, args).get("Plan"), new ArrayList<>()))
+          .as("%s, %s: indexes read", what, mode)
+          .filteredOn(n -> n.has("Index Name"))
+          .extracting(n -> n.get("Index Name").asString())
+          .containsAll(indexes);
+    }
   }
 
   /** The gauges over a million relayed rows and nothing open: none reads the relayed history. */
@@ -352,8 +375,27 @@ class OutboxClaimPlanIT {
   @Test
   @Order(3)
   void theGauges_withA100kPendingBacklog_readOnlyTheOpenRows() throws Exception {
-    // the data of the case before: 100,000 pending rows of one key, its head in flight
-    assertGaugesIndexedOnly("100k-pending");
+    // the data of the case before: 100,000 pending rows of one key, its head in flight - plus,
+    // for this case only, open rows on BOTH lanes (1.4.0): 50,000 ORDERED pending (half of them
+    // lane-less, as written before 1.3.0) and 10,000 parked rows per lane
+    execute(
+        """
+        insert into outbox (aggregate_type, aggregate_id, event_type, destination, payload,
+          created_on, attempts, next_attempt_on, parked_on, lane, ordering_key)
+        select 'gauge', 'a', 'e', 'topic', '{}', now(), 0, now() + interval '1 hour', null,
+          case when g % 2 = 0 then 'ORDERED' end, null
+        from generate_series(1, 50000) g""",
+        """
+        insert into outbox (aggregate_type, aggregate_id, event_type, destination, payload,
+          created_on, attempts, next_attempt_on, parked_on, lane, ordering_key)
+        select 'gauge', 'a', 'e', 'hub:p', '{}', now(), 5, now(), now(),
+          case when g % 2 = 0 then 'CONCURRENT' else 'ORDERED' end, null
+        from generate_series(1, 20000) g""");
+    try {
+      assertGaugesIndexedOnly("100k-pending");
+    } finally {
+      execute("delete from outbox where aggregate_type = 'gauge'");
+    }
   }
 
   /**

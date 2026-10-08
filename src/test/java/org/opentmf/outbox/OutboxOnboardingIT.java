@@ -38,6 +38,7 @@ class OutboxOnboardingIT {
   private static final String LIBRARY_CHANGELOG = "db/changelog/opentmf-outbox.sql";
   private static final String RELEASED_1_1_0_CHANGELOG = "db/changelog-1.1.0/opentmf-outbox.sql";
   private static final String RELEASED_1_2_1_CHANGELOG = "db/changelog-1.2.1/opentmf-outbox.sql";
+  private static final String RELEASED_1_3_0_CHANGELOG = "db/changelog-1.3.0/opentmf-outbox.sql";
   private static final List<String> LIBRARY_COLUMNS =
       List.of(
           "client_profile",
@@ -195,7 +196,7 @@ class OutboxOnboardingIT {
   }
 
   @Test
-  void aFreshSchema_installsAllFourChangesets() throws Exception {
+  void aFreshSchema_installsEveryChangeset() throws Exception {
     String url = freshDatabase("fresh");
 
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
@@ -206,7 +207,8 @@ class OutboxOnboardingIT {
             Map.entry("002-outbox-hold-and-cancel", "EXECUTED"),
             Map.entry("003-outbox-policy-reference-onboarding", "EXECUTED"),
             Map.entry("004-outbox-claim-lease", "EXECUTED"),
-            Map.entry("005-outbox-gauge-and-prune-indexes", "EXECUTED"));
+            Map.entry("005-outbox-gauge-and-prune-indexes", "EXECUTED"),
+            Map.entry("006-outbox-lane-gauge-indexes", "EXECUTED"));
     assertThat(columnNullability(url)).containsKeys(LIBRARY_COLUMNS.toArray(String[]::new));
     assertThat(pendingIndexPredicate(url))
         .contains("relayed_on IS NULL")
@@ -242,7 +244,8 @@ class OutboxOnboardingIT {
             Map.entry("002-outbox-hold-and-cancel", "EXECUTED"),
             Map.entry("003-outbox-policy-reference-onboarding", "EXECUTED"),
             Map.entry("004-outbox-claim-lease", "EXECUTED"),
-            Map.entry("005-outbox-gauge-and-prune-indexes", "EXECUTED"));
+            Map.entry("005-outbox-gauge-and-prune-indexes", "EXECUTED"),
+            Map.entry("006-outbox-lane-gauge-indexes", "EXECUTED"));
     assertThat(columnNullability(url)).containsKeys(LIBRARY_COLUMNS.toArray(String[]::new));
     assertThat(pendingIndexPredicate(url)).contains("parked_on IS NULL");
     assertThat(indexDefinition(url, "ix_outbox_claimed_until")).isNotNull(); // 1.2.0-F + 004
@@ -278,7 +281,8 @@ class OutboxOnboardingIT {
             Map.entry("002-outbox-hold-and-cancel", "MARK_RAN"),
             Map.entry("003-outbox-policy-reference-onboarding", "EXECUTED"),
             Map.entry("004-outbox-claim-lease", "EXECUTED"),
-            Map.entry("005-outbox-gauge-and-prune-indexes", "EXECUTED"));
+            Map.entry("005-outbox-gauge-and-prune-indexes", "EXECUTED"),
+            Map.entry("006-outbox-lane-gauge-indexes", "EXECUTED"));
     Map<String, Boolean> nullability = columnNullability(url);
     assertThat(nullability)
         .containsKeys(LIBRARY_COLUMNS.toArray(String[]::new))
@@ -307,14 +311,53 @@ class OutboxOnboardingIT {
     // the two recorded rows are UNTOUCHED (same filename identity, same checksum, still
     // EXECUTED - not re-run, not re-inserted under another path) and 003 + 004 were added
     List<String> after = rawRows(url);
-    assertThat(after).hasSize(5).startsWith(recordedBy110.toArray(String[]::new));
+    assertThat(after).hasSize(6).startsWith(recordedBy110.toArray(String[]::new));
     assertThat(after.get(2))
         .startsWith("003-outbox-policy-reference-onboarding|")
         .endsWith("|EXECUTED");
     assertThat(columnNullability(url)).containsKeys("parked_on", "reference", "claimed_until");
     // and a second run is a no-op (003/004 are idempotent and recorded)
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
-    assertThat(changelogRows(url)).hasSize(5);
+    assertThat(changelogRows(url)).hasSize(6);
+  }
+
+  /**
+   * 1.4.0 over a database the RELEASED 1.3.0 changelog migrated: 001-005 keep their recorded
+   * checksums (006 is appended, nothing above it edited) and 006 builds the per-lane gauge
+   * indexes CONCURRENTLY and VALID, and drops 005's lane-less open-since index; a second run is a
+   * no-op.
+   */
+  @Test
+  void aDatabaseMigratedByTheReleased130Changelog_gainsTheLaneGaugeIndexes_withItsChecksumsIntact()
+      throws Exception {
+    String url = freshDatabase("from130");
+    liquibaseUpdate(url, LIBRARY_CHANGELOG, releasedChangelogRoot(RELEASED_1_3_0_CHANGELOG));
+    List<String> recordedBy130 = rawRows(url);
+    assertThat(recordedBy130).hasSize(5);
+    assertThat(indexDefinition(url, "ix_outbox_open_since")).isNotNull();
+
+    liquibaseUpdate(url, LIBRARY_CHANGELOG);
+
+    List<String> after = rawRows(url);
+    assertThat(after).hasSize(6).startsWith(recordedBy130.toArray(String[]::new));
+    assertThat(after.get(5)).startsWith("006-outbox-lane-gauge-indexes|").endsWith("|EXECUTED");
+    assertThat(indexDefinition(url, "ix_outbox_parked_lane"))
+        .contains("(lane)")
+        .contains("parked_on IS NOT NULL");
+    assertThat(indexDefinition(url, "ix_outbox_open_since_ordered"))
+        .contains("GREATEST(created_on, COALESCE(release_at, created_on))")
+        .contains("lane IS NULL")
+        .contains("relayed_on IS NULL")
+        .contains("cancelled_on IS NULL");
+    assertThat(indexDefinition(url, "ix_outbox_open_since_concurrent"))
+        .contains("GREATEST(created_on, COALESCE(release_at, created_on))")
+        .contains("'CONCURRENT'")
+        .contains("relayed_on IS NULL")
+        .contains("cancelled_on IS NULL");
+    assertThat(indexDefinition(url, "ix_outbox_open_since")).isNull(); // replaced
+    assertThat(invalidIndexes(url)).isZero();
+    liquibaseUpdate(url, LIBRARY_CHANGELOG);
+    assertThat(changelogRows(url)).hasSize(6);
   }
 
   /**
@@ -334,16 +377,14 @@ class OutboxOnboardingIT {
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
 
     List<String> after = rawRows(url);
-    assertThat(after).hasSize(5).startsWith(recordedBy121.toArray(String[]::new));
+    assertThat(after).hasSize(6).startsWith(recordedBy121.toArray(String[]::new));
     assertThat(after.get(3)).startsWith("004-outbox-claim-lease|").endsWith("|EXECUTED");
     assertThat(after.get(4))
         .startsWith("005-outbox-gauge-and-prune-indexes|")
         .endsWith("|EXECUTED");
-    // the gauge and prune indexes, built CONCURRENTLY and VALID
-    assertThat(indexDefinition(url, "ix_outbox_open_since"))
-        .contains("GREATEST(created_on, COALESCE(release_at, created_on))")
-        .contains("relayed_on IS NULL")
-        .contains("cancelled_on IS NULL");
+    // the gauge and prune indexes, built CONCURRENTLY and VALID (005's open-since index is
+    // replaced by 006's per-lane pair)
+    assertThat(indexDefinition(url, "ix_outbox_open_since")).isNull();
     assertThat(indexDefinition(url, "ix_outbox_parked")).contains("parked_on IS NOT NULL");
     assertThat(indexDefinition(url, "ix_outbox_relayed_on")).contains("(relayed_on)");
     assertThat(indexDefinition(url, "ix_outbox_cancelled_on")).contains("(cancelled_on)");
@@ -367,6 +408,6 @@ class OutboxOnboardingIT {
     assertThat(indexDefinition(url, "ix_outbox_claimed_until")).doesNotContain("cancelled_on");
     assertThat(invalidIndexes(url)).isZero(); // the concurrent builds all completed
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
-    assertThat(changelogRows(url)).hasSize(5);
+    assertThat(changelogRows(url)).hasSize(6);
   }
 }

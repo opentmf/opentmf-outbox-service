@@ -369,8 +369,15 @@ per-service metric prefix. Without a `MeterRegistry` bean the relay still works
 
 **A scrape never touches the database (1.3.0).** The gauges read the last values that a
 daemon thread (`opentmf-outbox-metrics`) refreshes every `metrics-refresh` (default
-15 s, first refresh at start). Each refresh runs four queries, each served by its own
-partial index over the OPEN rows; none reads the relayed history.
+15 s, first refresh at start). Each refresh runs four queries, each answering both lanes
+in one statement and each lane served by its own partial index over the OPEN rows; none
+reads the relayed history.
+- **Per lane (1.4.0).** `pending`, `in-flight`, `parked` and `relay-lag` carry a `lane`
+  tag, `ordered` or `concurrent`: the lane the row was stamped with at append, a row
+  written before 1.3.0 counting as `ordered`. Each is two series, so a slow HTTP
+  subscriber's backlog no longer hides inside, or behind, the Kafka lane's numbers.
+  `sum without (lane) (opentmf_outbox_pending)` is the 1.3.0 value (for `relay-lag`,
+  `max without (lane)`). `metrics-age` stays one series.
 - **A database that does not answer cannot hang the refresher**: each refresh query has a
   5 s query timeout, so it becomes a failed refresh. `metrics-age` (seconds since the last
   successful refresh) keeps growing meanwhile; alert on it beside `parked`.
@@ -378,19 +385,21 @@ partial index over the OPEN rows; none reads the relayed history.
   never a misleading zero.
 - `relay-lag` is computed at read time from the oldest open row's instant, so it keeps
   growing between refreshes.
-- **Measured** with 1,000,000 relayed rows: idle, each query 0.1–0.7 ms. With 100,000
+- **Measured** with 1,000,000 relayed rows: idle, each query 0.1–0.9 ms. With 100,000
   rows pending, the pending count reads its index in about 7 ms (it grows with the
-  OPEN rows only); the other three stay under 1 ms.
+  OPEN rows only); the other three stay under 1 ms. Those were the 1.3.0 figures; the
+  per-lane statements of 1.4.0 read the same number of open rows, split over the lanes'
+  indexes (`OutboxClaimPlanIT` pins every one of them, under custom and generic plans).
 - Up to 1.2.1 every scrape ran these queries over the whole table: 7–20 s each on
   3.5–4.8 M-row tables, which put the scrape past its timeout.
 
 | Metric                     | Type    | Meaning                                            |
 |----------------------------|---------|----------------------------------------------------|
-| `opentmf.outbox.pending`   | gauge   | Rows not yet relayed nor cancelled (held, parked and in-flight included) |
-| `opentmf.outbox.in-flight` | gauge   | Pending rows under a live lease, across pods — claimed, send not booked yet (1.3.0) |
-| `opentmf.outbox.parked`    | gauge   | Rows with `parked_on` stamped — **alert when > 0** |
+| `opentmf.outbox.pending`   | gauge by `lane` | Rows not yet relayed nor cancelled (held, parked and in-flight included) |
+| `opentmf.outbox.in-flight` | gauge by `lane` | Pending rows under a live lease, across pods — claimed, send not booked yet (1.3.0) |
+| `opentmf.outbox.parked`    | gauge by `lane` | Rows with `parked_on` stamped — **alert when > 0** |
 | `opentmf.outbox.metrics-age` | gauge | Seconds since the gauges were last refreshed successfully — **alert when above a few refresh periods** (e.g. > 60 s with the default 15 s): the values above are stale or NaN |
-| `opentmf.outbox.relay-lag` | gauge   | Seconds the oldest *released* pending row has been deliverable (a held row is not lagging) |
+| `opentmf.outbox.relay-lag` | gauge by `lane` | Seconds the lane's oldest *released* pending row has been deliverable (a held row is not lagging) |
 | `opentmf.outbox.relayed`   | counter | Successful relays, tagged by `destination`         |
 | `opentmf.outbox.dropped`   | counter | Rows given up by a publisher's DROP policy, tagged by `destination` (never counted as relayed) |
 | `opentmf.outbox.attempts`  | summary | Delivery attempts a relayed row took               |
@@ -433,7 +442,11 @@ From your master changelog — by reference, never copied:
 The changelog is ONE clean create (changeset `001-outbox`) plus additive
 evolution: `002-outbox-hold-and-cancel` (1.1.0: `release_at`, `cancelled_on`)
 and `003-outbox-policy-reference-onboarding` (1.2.0: `parked_on`, `reference`,
-the onboarding adds below, the index recreated to the 1.2.0 predicate).
+the onboarding adds below, the index recreated to the 1.2.0 predicate),
+`004-outbox-claim-lease` (1.3.0: `claimed_until`, `lane`, `ordering_key` and the
+lanes' claim indexes), `005-outbox-gauge-and-prune-indexes` (1.3.0) and
+`006-outbox-lane-gauge-indexes` (1.4.0: the per-lane gauge indexes). 004–006
+build their indexes `CONCURRENTLY`.
 
 **Upgrading** needs no consumer change at any step: the included changelog
 applies the missing changesets on the next start (nullable columns only, no
@@ -797,6 +810,27 @@ The library is self-contained for consumer testing — no test-jar needed:
   `ProfileAdapterKafkaOrderIT`) plus the crash-window, SKIP LOCKED contention,
   lease, lane, backlog and onboarding ITs — the contracts above are pinned there, so a consumer gap
   is a red library build, not a discovery after the cut.
+
+### Upgrading to 1.4.0
+
+1. **The outbox gauges are per lane.** `opentmf.outbox.pending`, `in-flight`,
+   `parked` and `relay-lag` each become two series, tagged `lane="ordered"` and
+   `lane="concurrent"`. Re-point what reads them:
+   - a total: `sum without (lane) (opentmf_outbox_pending)`, and
+     `max without (lane) (opentmf_outbox_relay_lag_seconds)` for the lag;
+   - an alert per lane needs nothing: `opentmf_outbox_parked > 0` now fires once
+     per lane that has parked rows, naming it.
+   A dashboard that plots the bare name now draws two lines. `metrics-age` and the
+   counters are unchanged.
+2. Changeset `006-outbox-lane-gauge-indexes` builds three partial indexes
+   `CONCURRENTLY` and drops 005's `ix_outbox_open_since`, which only the lane-less
+   relay-lag gauge read. Each build reads the table once, as in 1.3.0: allow about
+   1 s per million outbox rows per index in the startup probe.
+3. **A cancel of a row in flight is refused** with `OutboxRowInFlightException`
+   (409 on `/ops`), instead of being accepted and possibly booked sent-but-cancelled.
+   A caller that cancels and treats success as "it will not go out" gets that
+   guarantee back; a caller that must retire the row retries once the send is booked.
+4. `GET /ops/outbox?state=` is additive; the path form stays.
 
 ### Upgrading to 1.3.0
 

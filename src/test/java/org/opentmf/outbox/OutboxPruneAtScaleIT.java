@@ -124,20 +124,40 @@ class OutboxPruneAtScaleIT {
 
   /**
    * The gauges against the REAL database, beside 305,000 terminal rows: refreshed off the scrape
-   * path, they read the open rows exactly - 100 pending + 100 parked, the oldest open for ~30 days
-   * - never NaN once a refresh has run.
+   * path, they read the open rows exactly - never NaN once a refresh has run - and per LANE
+   * (1.4.0): the seeded rows carry no lane (written before 1.3.0) and count as ORDERED - 100
+   * pending + 100 parked, the oldest open for ~30 days - while 7 pending + 3 parked CONCURRENT
+   * rows, open for ~2 days, are counted and aged on their own series.
    */
   @Test
-  void theGauges_readTheOpenRowsExactly_fromTheRefreshedSnapshot() {
+  void theGauges_readTheOpenRowsExactly_perLane_fromTheRefreshedSnapshot() {
+    String concurrent =
+        "insert into outbox (aggregate_type, aggregate_id, event_type, destination, payload,"
+            + " created_on, attempts, next_attempt_on, parked_on, lane, ordering_key)"
+            + " select 't', 'a', 'e', 'hub', '{}', now() - interval '2 days', 0,"
+            + " now() + interval '1 hour', %s, 'CONCURRENT', %s from generate_series(1, %d)";
+    jdbc.execute(concurrent.formatted("null", "'hub:k'", 4)); // keyed, in backoff
+    jdbc.execute(concurrent.formatted("null", "null", 3)); // unkeyed, in backoff
+    jdbc.execute(concurrent.formatted("now()", "null", 3)); // parked
+
     await()
         .atMost(Duration.ofSeconds(10))
         .untilAsserted(
             () -> {
-              assertThat(registry.get("opentmf.outbox.pending").gauge().value()).isEqualTo(200d);
-              assertThat(registry.get("opentmf.outbox.parked").gauge().value()).isEqualTo(100d);
-              assertThat(registry.get("opentmf.outbox.in-flight").gauge().value()).isZero();
-              assertThat(registry.get("opentmf.outbox.relay-lag").gauge().value())
+              GaugeRefresh.now(context);
+              assertThat(GaugeRefresh.lane(registry, "opentmf.outbox.pending", "ordered"))
+                  .isEqualTo(200d);
+              assertThat(GaugeRefresh.lane(registry, "opentmf.outbox.parked", "ordered"))
+                  .isEqualTo(100d);
+              assertThat(GaugeRefresh.lane(registry, "opentmf.outbox.relay-lag", "ordered"))
                   .isBetween(29.9 * 86_400, 30.1 * 86_400);
+              assertThat(GaugeRefresh.lane(registry, "opentmf.outbox.pending", "concurrent"))
+                  .isEqualTo(10d);
+              assertThat(GaugeRefresh.lane(registry, "opentmf.outbox.parked", "concurrent"))
+                  .isEqualTo(3d);
+              assertThat(GaugeRefresh.lane(registry, "opentmf.outbox.relay-lag", "concurrent"))
+                  .isBetween(1.9 * 86_400, 2.1 * 86_400);
+              assertThat(GaugeRefresh.total(registry, "opentmf.outbox.in-flight")).isZero();
             });
   }
 
@@ -195,7 +215,8 @@ class OutboxPruneAtScaleIT {
 
       long millis = (System.nanoTime() - started) / 1_000_000;
       assertThat(millis).isBetween(4_000L, 9_000L);
-      assertThat(registry.get("opentmf.outbox.pending").gauge().value()).isNaN();
+      assertThat(GaugeRefresh.lane(registry, "opentmf.outbox.pending", "ordered")).isNaN();
+      assertThat(GaugeRefresh.lane(registry, "opentmf.outbox.pending", "concurrent")).isNaN();
       assertThat(registry.get("opentmf.outbox.metrics-age").gauge().value())
           .isGreaterThanOrEqualTo(4d);
     } finally {

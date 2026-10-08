@@ -2,8 +2,33 @@
 
 ## 1.4.0 - 2026-10-08
 
-A cancel no longer accepts a row whose send is in flight, and the ops list takes
-`?state=`.
+A cancel no longer accepts a row whose send is in flight, the ops list takes `?state=`,
+and the outbox gauges carry a `lane` label.
+
+### Changed
+
+- **The outbox gauges are per lane** (OUTBOX-LANE-GAUGES-1). This changes the METRIC
+  SHAPE: re-point dashboards and alerts that read these gauges.
+  - `opentmf.outbox.pending`, `in-flight`, `parked` and `relay-lag` each carry a `lane`
+    tag, `ordered` or `concurrent`: the lane stamped on the row at append, a row written
+    before 1.3.0 counting as `ordered`. Each gauge is now two series instead of one, so
+    an alert can name the lane and a slow HTTP subscriber's backlog no longer hides in
+    the Kafka lane's numbers (or behind them).
+  - The 1.3.0 value is `sum without (lane) (...)`, or `max without (lane) (...)` for
+    `relay-lag`. A bare-name query or panel now returns two series; a threshold alert
+    such as `opentmf_outbox_parked > 0` keeps working and fires per lane.
+  - `metrics-age` and the counters are unchanged.
+  - Each refresh still runs four queries; each now answers both lanes in one statement,
+    so the two series of a gauge come from one snapshot. Each lane is read through its
+    own partial index over the open rows. `OutboxClaimPlanIT` pins every index under
+    custom and generic plans, and a case with open rows on both lanes was added.
+  - Changeset `006-outbox-lane-gauge-indexes` builds `ix_outbox_parked_lane`,
+    `ix_outbox_open_since_ordered` and `ix_outbox_open_since_concurrent` CONCURRENTLY,
+    each after a drop-if-exists as in 004/005. It drops `ix_outbox_open_since` (005),
+    whose only reader was the lane-less relay-lag gauge. Pending and in-flight need
+    nothing new: pending counts the three claim indexes of 004, whose predicates split
+    the open rows by lane. An IT proves a database migrated by the released 1.3.0
+    changelog upgrades with its checksums intact.
 
 ### Added
 

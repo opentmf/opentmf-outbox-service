@@ -32,8 +32,9 @@ info:
     Paste-in contract for the outbox ops surface served by opentmf-outbox-service.
     Not a standalone API document — a fragment the consumer's OAS absorbs. The library's
     meters are not part of this REST surface: opentmf.outbox.pending, parked, in-flight,
-    relay-lag and metrics-age (gauges), relayed, dropped and attempts (README "Metrics") —
-    alert on parked > 0 and on metrics-age above a few refresh periods.
+    relay-lag (gauges by lane, since 1.4.0) and metrics-age (gauge), relayed, dropped and
+    attempts (README "Metrics") — alert on parked > 0 and on metrics-age above a few refresh
+    periods.
 
 paths:
   /ops/outbox:
