@@ -14,6 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -261,10 +262,11 @@ class Profile681HubIT {
     assertThat(maintenance.inspect(delivered.getId()).reference())
         .isEqualTo("subscription-secret-2");
 
-    // 4) cancel vs a send in flight, THE RACE (1.3.0): the relay leased the slow row and is
-    //    inside publish() - holding no lock and no transaction. The cancel does NOT wait: it
-    //    succeeds at once. The send then succeeds and the booking honours the cancel - the row is
-    //    booked SENT-BUT-CANCELLED, both stamps, the truth on /ops.
+    // 4) cancel vs a send in flight (1.3.1): the relay leased the slow row and is inside
+    //    publish() - holding no lock and no transaction. The cancel does NOT wait: it is REFUSED
+    //    at once, by name (OutboxRowInFlightException; 409 on /ops) - the send may be delivering
+    //    right now, so "cancelled" would be a lie. The send then succeeds and the row is relayed,
+    //    never stamped cancelled.
     OutboxEvent slow =
         tx.execute(
             s ->
@@ -274,15 +276,24 @@ class Profile681HubIT {
     awaitLatch(SLOW_IN_FLIGHT); // in flight: OutboxLeaseIT pins the inFlight view itself
     CompletableFuture<Void> cancelOutcome =
         CompletableFuture.runAsync(() -> maintenance.cancel(slow.getId()));
-    assertThat(cancelOutcome).succeedsWithin(Duration.ofSeconds(2)); // nothing to wait behind
-    SLOW_GATE.countDown(); // the send finishes; the booking sees the cancel
-    await() // booked SENT-BUT-CANCELLED: both stamps, no longer in flight
+    assertThat(cancelOutcome) // nothing to wait behind - refused at once
+        .failsWithin(Duration.ofSeconds(2))
+        .withThrowableOfType(ExecutionException.class)
+        .withCauseInstanceOf(OutboxRowInFlightException.class);
+    assertThat(
+            status(
+                RestClient.create("http://localhost:" + port),
+                "/ops/outbox/" + slow.getId() + "/cancel"))
+        .isEqualTo(HttpStatusCode.valueOf(409)); // the same refusal on the wire
+    SLOW_GATE.countDown(); // the send finishes and is booked SENT
+    await()
         .atMost(Duration.ofSeconds(20))
         .until(
             () -> {
               OutboxRowView view = maintenance.inspect(slow.getId());
-              return view.relayedOn() != null && view.cancelledOn() != null && !view.inFlight();
+              return view.relayedOn() != null && !view.inFlight();
             });
+    assertThat(maintenance.inspect(slow.getId()).cancelledOn()).isNull();
     // and a plainly relayed row refuses the same way
     assertThatIllegalStateException()
         .isThrownBy(() -> maintenance.cancel(delivered.getId()))

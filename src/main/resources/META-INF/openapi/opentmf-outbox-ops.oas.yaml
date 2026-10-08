@@ -27,7 +27,7 @@
 openapi: 3.1.0
 info:
   title: opentmf-outbox-service /ops/outbox fragment
-  version: 1.3.0
+  version: 1.3.1
   description: >-
     Paste-in contract for the outbox ops surface served by opentmf-outbox-service.
     Not a standalone API document — a fragment the consumer's OAS absorbs. The library's
@@ -63,7 +63,7 @@ paths:
       description: >-
         `pending` (not relayed, not cancelled — parked, held and in-flight rows included),
         `parked`, `relayed`, `cancelled` — the closed set; an unknown value is a 400. A row
-        cancelled while its send was in flight and then delivered (sent-but-cancelled) is
+        cancelled after its lease lapsed mid-send and then delivered (sent-but-cancelled) is
         listed under both `relayed` and `cancelled`. The same TMF630 filters and paging apply
         on top. The state rides the PATH because tmf630-toolkit rejects any
         non-reserved query parameter before a handler runs.
@@ -168,8 +168,10 @@ paths:
       operationId: cancelOutboxRow
       summary: Withdraw one unreleased row — never relayed from now on, retained for audit
       description: >-
-        A row whose send is IN FLIGHT (a live lease) is cancellable at once: if that send
-        then fails the row retires cancelled; if it succeeds the row is booked
+        A row whose send is IN FLIGHT (a live lease) is refused at once with a 409 — the
+        send may be delivering now; cancel again once it is booked (a failed send in backoff
+        is cancellable, a delivered one is relayed). A row whose lease has lapsed is
+        cancellable; should its stale send still succeed, the row is booked
         sent-but-cancelled (both `relayedOn` and `cancelledOn` stamped).
       parameters:
         - $ref: '#/components/parameters/outboxRowId'
@@ -182,7 +184,9 @@ paths:
         '404':
           description: No row with this id
         '409':
-          description: The row is already relayed or already cancelled
+          description: >-
+            The row is already relayed, already cancelled, or its send is in flight (a live
+            lease; retry once it is booked)
 
   /ops/outbox/maintenance/prune:
     post:

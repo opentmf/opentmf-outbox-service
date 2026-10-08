@@ -86,10 +86,10 @@ over its own partial indexes: `ix_outbox_ordered_claim` for the ORDERED lane;
 and `ix_outbox_concurrent_unkeyed` for the CONCURRENT lane, whose claim reads
 neither relayed rows nor more than one row per key.
 
-`relayed` and `cancelled` overlap in exactly one case: a row cancelled while
-its send was in flight, whose send then succeeded — booked
-**sent-but-cancelled**, both stamps set, listed under both states (see the
-lease below).
+`relayed` and `cancelled` overlap in exactly one case: a row cancelled after
+its lease LAPSED while its send was still running, whose send then succeeded —
+booked **sent-but-cancelled**, both stamps set, listed under both states (see
+the lease below). Under a live lease the cancel is refused (1.3.1).
 
 ## How It Works
 
@@ -255,13 +255,19 @@ sequenceDiagram
 - **Ops actions against a row in flight.** `cancel` and `unpark` read their row
   under a waiting `FOR UPDATE`. Since 1.3.0 that serialises only against the
   short claim and booking transactions, never against a send (the claims skip
-  a row an ops action holds). A **cancel of a
-  row in flight succeeds at once**, and the booking honours it. A send that
-  then fails retires the row cancelled (no retry, no park; the booking hook
-  sees `CANCELLED`). A send that succeeds is booked **sent-but-cancelled**:
-  both stamps, listed under relayed and cancelled, the relayed listeners fire
-  because the effect did leave, and a WARN names it. An ORDERED row cancelled
-  before its turn is released unsent. An `unpark` never meets a live lease:
+  a row an ops action holds). Since 1.3.1 a **cancel of a row in flight is
+  refused at once**, on both lanes, with `OutboxRowInFlightException` (an
+  `IllegalStateException`; 409 on `/ops`, its `claimedUntil()` names the
+  lease end): the send may be delivering right now, so "cancelled" would be a
+  promise the library cannot keep. Cancel again once the send is booked — a
+  failed send in backoff is cancellable, a delivered one refuses "already
+  relayed". A row whose lease has LAPSED is cancellable; should its stale send
+  still book, the booking honours the cancel: a send that fails retires the
+  row cancelled (no retry, no park; the booking hook sees `CANCELLED`), a send
+  that succeeds is booked **sent-but-cancelled** — both stamps, listed under
+  relayed and cancelled, the relayed listeners fire because the effect did
+  leave, and a WARN names it. An ORDERED row cancelled before its turn is
+  released unsent. An `unpark` never meets a live lease:
   only a booking parks a row, and that booking clears the lease.
 - **Shutdown.** The relay stops claiming, gives the sends in flight
   `shutdown-grace` (default 10 s) to finish and book, and abandons the rest:
@@ -497,7 +503,8 @@ The hold is frozen at write time and has no reschedule API — to move a
 scheduled send, cancel the row (`OutboxMaintenanceService.cancel(id)` or the
 `/ops` endpoint) and append a new one. Cancelling is possible only while the
 effect has not left: a relayed row refuses with an `IllegalStateException`
-("already relayed"), as does an already-cancelled one.
+("already relayed"), as does an already-cancelled one, and a row whose send
+is in flight refuses with `OutboxRowInFlightException` (1.3.1).
 
 Pass the payload as a fact object — it is serialized at write time. Extra
 **wire** headers frozen at write time ride the `Map<String,String>` overload or
@@ -822,8 +829,9 @@ The library is self-contained for consumer testing — no test-jar needed:
    to CONCURRENT means declaring `lane`, usually an `orderingKey`, and a
    `lease` longer than its longest call. Rows it appended before the change
    keep the lane they were stamped with.
-6. Ops: a cancel of a row in flight succeeds at once (it used to wait for the
-   send and then refuse). Watch the new `opentmf.outbox.in-flight` gauge and
+6. Ops: a cancel of a row in flight returns at once (it used to wait for the
+   send); since 1.3.1 it is refused with `OutboxRowInFlightException` (409)
+   rather than accepted. Watch the new `opentmf.outbox.in-flight` gauge and
    the `inFlight` / `claimedUntil` fields on the row view. A crash after a send
    redelivers once the lease lapses, not on the next pass.
 

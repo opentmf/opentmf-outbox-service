@@ -3,6 +3,7 @@ package org.opentmf.outbox;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
@@ -108,6 +109,39 @@ class OutboxMaintenanceServiceTests {
     assertThat(held.getCancelledOn()).isNotNull();
     assertThat(held.getRelayedOn()).isNull();
     verifyNoInteractions(events);
+  }
+
+  /**
+   * OUTBOX-CANCEL-REFUSES-LIVE-LEASE-1 (1.3.1): a row IN FLIGHT - claimed under a live lease, on
+   * either lane - is refused: its publisher may be delivering right now, and a caller told
+   * "cancelled" would be lied to (1.2.x refused it by blocking behind the claim's lock).
+   */
+  @Test
+  void cancel_refusesARowUnderALiveLease_onBothLanes() {
+    for (OutboxPublisher.Lane lane : OutboxPublisher.Lane.values()) {
+      OutboxEvent inFlight = row(7L, 0, null);
+      inFlight.setLane(lane);
+      inFlight.setClaimedUntil(OffsetDateTime.now().plusSeconds(30));
+      when(repository.lockById(7L)).thenReturn(Optional.of(inFlight));
+
+      assertThatThrownBy(() -> service.cancel(7L))
+          .as(lane.name())
+          .isInstanceOf(OutboxRowInFlightException.class) // an IllegalStateException: 409
+          .hasMessageContaining("in flight");
+      assertThat(inFlight.getCancelledOn()).as(lane.name()).isNull();
+    }
+  }
+
+  /** A lease that has lapsed holds nothing: the row is cancellable again. */
+  @Test
+  void cancel_succeedsOnARowWhoseLeaseHasLapsed() {
+    OutboxEvent lapsed = row(8L, 1, null);
+    lapsed.setClaimedUntil(OffsetDateTime.now().minusSeconds(1));
+    when(repository.lockById(8L)).thenReturn(Optional.of(lapsed));
+
+    service.cancel(8L);
+
+    assertThat(lapsed.getCancelledOn()).isNotNull();
   }
 
   @Test
