@@ -55,7 +55,7 @@ library never imports that BOM (direct property pins in the pom).
 
 ## Open
 
-- `?state=` on `GET /ops/outbox` needs a tmf630-toolkit pass-through allowance;
-  the ruled path form `/ops/outbox/state/{state}` ships since 1.2.0.
-- Develop is `1.3.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
-  heading `## 1.3.1 - <date>`.
+- `?state=` on `GET /ops/outbox` ships in 1.4.0 (`@Tmf630PassThrough`, toolkit 3.4.0) beside
+  the path form `/ops/outbox/state/{state}` (since 1.2.0).
+- Develop is `1.4.0-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
+  heading `## 1.4.0 - <date>`.

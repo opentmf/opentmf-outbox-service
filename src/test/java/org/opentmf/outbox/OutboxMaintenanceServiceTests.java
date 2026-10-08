@@ -112,7 +112,7 @@ class OutboxMaintenanceServiceTests {
   }
 
   /**
-   * OUTBOX-CANCEL-REFUSES-LIVE-LEASE-1 (1.3.1): a row IN FLIGHT - claimed under a live lease, on
+   * OUTBOX-CANCEL-REFUSES-LIVE-LEASE-1 (1.4.0): a row IN FLIGHT - claimed under a live lease, on
    * either lane - is refused: its publisher may be delivering right now, and a caller told
    * "cancelled" would be lied to (1.2.x refused it by blocking behind the claim's lock).
    */

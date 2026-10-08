@@ -324,7 +324,7 @@ class OutboxLeaseIT {
   }
 
   /**
-   * Cancel against a live lease (1.3.1, OUTBOX-CANCEL-REFUSES-LIVE-LEASE-1): a row IN FLIGHT is
+   * Cancel against a live lease (1.4.0, OUTBOX-CANCEL-REFUSES-LIVE-LEASE-1): a row IN FLIGHT is
    * REFUSED - at once, by name ({@link OutboxRowInFlightException}, a 409) - because its send may
    * be delivering right now; the delivered row stays delivered, never "cancelled". Once a send is
    * booked and the row is back to pending (a failed send in backoff), the cancel succeeds and the

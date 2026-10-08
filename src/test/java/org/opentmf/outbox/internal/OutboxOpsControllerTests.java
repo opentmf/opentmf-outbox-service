@@ -4,12 +4,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.time.OffsetDateTime;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxMaintenanceService;
 import org.opentmf.outbox.OutboxPruneResult;
+import org.opentmf.outbox.OutboxStateFilter;
 import org.opentmf.outbox.OutboxUnparkResult;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
@@ -63,6 +65,20 @@ class OutboxOpsControllerTests {
   void anUnknownStateLeg_isA400ErrorResponse() {
     assertErrorResponse(
         catchThrowable(() -> controller.listByState("dead-lettered", null, PageRequest.of(0, 1))),
+        HttpStatus.BAD_REQUEST);
+  }
+
+  @Test
+  void list_withoutState_isTheWholeList_andWithState_isThatLeg() {
+    PageRequest page = PageRequest.of(0, 1);
+
+    controller.list(null, null, page);
+    controller.list("parked", null, page);
+
+    verify(maintenance).list(null, null, page);
+    verify(maintenance).list(null, OutboxStateFilter.PARKED, page);
+    assertErrorResponse(
+        catchThrowable(() -> controller.list("dead-lettered", null, page)),
         HttpStatus.BAD_REQUEST);
   }
 
