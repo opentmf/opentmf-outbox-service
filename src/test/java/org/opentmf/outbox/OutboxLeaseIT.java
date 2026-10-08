@@ -252,7 +252,7 @@ class OutboxLeaseIT {
         .until(
             () -> {
               GaugeRefresh.now(context);
-              return registry.get("opentmf.outbox.in-flight").gauge().value() == 0d;
+              return GaugeRefresh.total(registry, "opentmf.outbox.in-flight") == 0d;
             });
   }
 

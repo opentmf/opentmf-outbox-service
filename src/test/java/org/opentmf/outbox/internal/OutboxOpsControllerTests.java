@@ -4,15 +4,18 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.time.OffsetDateTime;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxMaintenanceService;
 import org.opentmf.outbox.OutboxPruneResult;
+import org.opentmf.outbox.OutboxRowView;
 import org.opentmf.outbox.OutboxStateFilter;
 import org.opentmf.outbox.OutboxUnparkResult;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.ErrorResponse;
@@ -71,12 +74,15 @@ class OutboxOpsControllerTests {
   @Test
   void list_withoutState_isTheWholeList_andWithState_isThatLeg() {
     PageRequest page = PageRequest.of(0, 1);
+    Page<OutboxRowView> all = new PageImpl<>(List.of());
+    Page<OutboxRowView> parked = new PageImpl<>(List.of());
+    when(maintenance.list(null, null, page)).thenReturn(all);
+    when(maintenance.list(null, OutboxStateFilter.PARKED, page)).thenReturn(parked);
 
-    controller.list(null, null, page);
-    controller.list("parked", null, page);
-
-    verify(maintenance).list(null, null, page);
-    verify(maintenance).list(null, OutboxStateFilter.PARKED, page);
+    assertThat(controller.list(null, null, page)).isSameAs(all);
+    assertThat(controller.list("parked", null, page)).isSameAs(parked);
+    assertThat(controller.listByState("parked", null, page)).isSameAs(parked);
+    assertThat(controller.parked(null, page)).isSameAs(parked);
     assertErrorResponse(
         catchThrowable(() -> controller.list("dead-lettered", null, page)),
         HttpStatus.BAD_REQUEST);

@@ -1,5 +1,7 @@
 package org.opentmf.outbox;
 
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.lang.reflect.Method;
 import org.springframework.context.ApplicationContext;
 
@@ -24,5 +26,15 @@ final class GaugeRefresh {
     } catch (ReflectiveOperationException ex) {
       throw new IllegalStateException(ex);
     }
+  }
+
+  /** One lane's series of a row gauge (1.4.0): {@code ordered} or {@code concurrent}. */
+  static double lane(MeterRegistry registry, String gauge, String lane) {
+    return registry.get(gauge).tag("lane", lane).gauge().value();
+  }
+
+  /** A row gauge over both lanes - what the gauge read before it carried a lane tag. */
+  static double total(MeterRegistry registry, String gauge) {
+    return registry.get(gauge).gauges().stream().mapToDouble(Gauge::value).sum();
   }
 }

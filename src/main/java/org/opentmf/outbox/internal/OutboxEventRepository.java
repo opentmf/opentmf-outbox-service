@@ -125,28 +125,42 @@ public interface OutboxEventRepository
   @Query("select e from OutboxEvent e where e.id = :id")
   Optional<OutboxEvent> lockById(@Param("id") long id);
 
-  /** Open rows that are not parked (pending minus parked) - half of the {@code pending} gauge. */
+  /** A gauge's two lanes, from one statement (1.4.0): a null lane counts as ORDERED. */
+  interface LaneCounts {
+    long getOrdered();
+
+    long getConcurrent();
+  }
+
+  /** The oldest open instant of each lane; {@code null} = no open row in that lane. */
+  interface LaneSince {
+    Instant getOrdered(); // a native timestamptz scalar comes back as Instant
+
+    Instant getConcurrent();
+  }
+
+  /** Open rows that are not parked (pending minus parked), per lane - half of {@code pending}. */
   @QueryHints(@QueryHint(name = GAUGE_TIMEOUT_HINT, value = GAUGE_TIMEOUT_MILLIS))
   @Query(value = OutboxGaugeSql.OPEN_NOT_PARKED, nativeQuery = true)
-  long countOpenNotParked();
+  LaneCounts countOpenNotParked();
 
-  /** Parked rows - the {@code parked} gauge, and the other half of {@code pending}. */
+  /** Parked rows per lane - the {@code parked} gauge, and the other half of {@code pending}. */
   @QueryHints(@QueryHint(name = GAUGE_TIMEOUT_HINT, value = GAUGE_TIMEOUT_MILLIS))
   @Query(value = OutboxGaugeSql.PARKED, nativeQuery = true)
-  long countParked();
+  LaneCounts countParked();
 
   /**
-   * The instant the oldest open row became deliverable - {@code created_on}, or its hold if that
-   * came later; a held row's instant lies in the future - backs the {@code relay-lag} gauge.
+   * Per lane, the instant the oldest open row became deliverable - {@code created_on}, or its
+   * hold if that came later; a held row's instant lies in the future - backs {@code relay-lag}.
    */
   @QueryHints(@QueryHint(name = GAUGE_TIMEOUT_HINT, value = GAUGE_TIMEOUT_MILLIS))
   @Query(value = OutboxGaugeSql.OPEN_SINCE, nativeQuery = true)
-  Optional<Instant> findOldestOpenSince(); // a native timestamptz scalar comes back as Instant
+  LaneSince findOldestOpenSince();
 
-  /** Open rows under a live lease - the {@code in-flight} gauge. */
+  /** Open rows under a live lease, per lane - the {@code in-flight} gauge. */
   @QueryHints(@QueryHint(name = GAUGE_TIMEOUT_HINT, value = GAUGE_TIMEOUT_MILLIS))
   @Query(value = OutboxGaugeSql.IN_FLIGHT, nativeQuery = true)
-  long countInFlight(@Param("now") OffsetDateTime now);
+  LaneCounts countInFlight(@Param("now") OffsetDateTime now);
 
   /**
    * Retention prune, one BATCH of relayed rows older than the cutoff, in its OWN transaction -

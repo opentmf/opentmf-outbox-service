@@ -193,10 +193,10 @@ class OutboxHttpLaneIT {
     return dataSource.unwrap(HikariDataSource.class).getHikariPoolMXBean().getActiveConnections();
   }
 
-  /** Refreshes the snapshot NOW, then reads the gauge. */
+  /** Refreshes the snapshot NOW, then reads the gauge over both lanes. */
   private double inFlightGauge() {
     GaugeRefresh.now(context);
-    return registry.get("opentmf.outbox.in-flight").gauge().value();
+    return GaugeRefresh.total(registry, "opentmf.outbox.in-flight");
   }
 
   /** Each test starts from a quiet lane - no row of an earlier test still in flight. */
@@ -229,7 +229,11 @@ class OutboxHttpLaneIT {
     assertThat(inFlight.inFlight()).isTrue(); // ...and visibly so
     assertThat(inFlight.claimedUntil()).isNotNull();
     assertThat(inFlightGauge()).isEqualTo(1d);
-    assertThat(registry.get("opentmf.outbox.pending").gauge().value()).isGreaterThanOrEqualTo(1d);
+    // on the lane it rides (1.4.0): the HTTP row is CONCURRENT, nothing ORDERED is in flight
+    assertThat(GaugeRefresh.lane(registry, "opentmf.outbox.in-flight", "concurrent")).isEqualTo(1d);
+    assertThat(GaugeRefresh.lane(registry, "opentmf.outbox.in-flight", "ordered")).isZero();
+    assertThat(GaugeRefresh.lane(registry, "opentmf.outbox.pending", "concurrent"))
+        .isGreaterThanOrEqualTo(1d);
 
     // the pool, read through JMX (no connection taken to read it), polled over 3 s of the send
     await()
