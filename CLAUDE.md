@@ -52,10 +52,12 @@ library never imports that BOM (direct property pins in the pom).
   (#7, load-test F-1/F-2): gauges from a refreshed snapshot (`metrics-age`), set-based
   bounded prune (`REQUIRES_NEW` batches), unpark by filter. The ops OAS fragment (#4).
   Changesets 004/005 build their indexes CONCURRENTLY.
+- **1.4.0 (2026-10-08)** — no 1.3.1 (Gökhan's ruling): cancel REFUSES a row under a live
+  lease (`OutboxRowInFlightException`, 409; #8); `GET /ops/outbox?state=` via
+  `@Tmf630PassThrough` beside the path form (#9); the four row gauges tagged by `lane` - a
+  metric-shape change - with changeset 006's per-lane gauge indexes (#10).
 
 ## Open
 
-- `?state=` on `GET /ops/outbox` ships in 1.4.0 (`@Tmf630PassThrough`, toolkit 3.4.0) beside
-  the path form `/ops/outbox/state/{state}` (since 1.2.0).
-- Develop is `1.4.0-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
-  heading `## 1.4.0 - <date>`.
+- Develop is `1.4.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
+  heading `## 1.4.1 - <date>`.
