@@ -12,6 +12,7 @@ import org.opentmf.outbox.OutboxRowView;
 import org.opentmf.outbox.OutboxStateFilter;
 import org.opentmf.outbox.OutboxUnparkResult;
 import org.opentmf.query.tmf630.annotation.Tmf630Response;
+import org.opentmf.query.tmf630.filtering.Tmf630PassThrough;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.querydsl.binding.QuerydslPredicate;
@@ -22,6 +23,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 
@@ -116,21 +118,30 @@ public class OutboxOpsController {
    * destination, reference, createdOn ranges, and relayed/cancelled/parked via
    * {@code relayedOn} / {@code cancelledOn} / {@code parkedOn} null-filtering - all
    * toolkit-native, so its strict unknown-field validation stays intact). Payloads omitted;
-   * use the inspect sibling. The derived-state legs ride the {@code /state/{state}} sibling.
+   * use the inspect sibling.
+   *
+   * <p>{@code ?state=} (1.4.0) narrows it to ONE derived-state leg, exactly as the
+   * {@code /state/{state}} sibling does: the name is passed through the toolkit's filter grammar
+   * ({@link Tmf630PassThrough} - this handler only, the exact name only; every other unknown
+   * name is still a 400), so {@code state.eq=} is still parsed as a filter and rejected.
    */
   @Tmf630Response
+  @Tmf630PassThrough({"state"})
   @GetMapping(path = "/outbox", produces = MediaType.APPLICATION_JSON_VALUE)
   public Page<OutboxRowView> list(
-      @QuerydslPredicate(root = OutboxEvent.class) Predicate predicate, Pageable pageable) {
-    return maintenance.list(predicate, null, pageable);
+      @RequestParam(name = "state", required = false) String state,
+      @QuerydslPredicate(root = OutboxEvent.class) Predicate predicate,
+      Pageable pageable) {
+    return state == null
+        ? maintenance.list(predicate, null, pageable)
+        : listByState(state, predicate, pageable);
   }
 
   /**
    * The list narrowed to ONE derived-state leg ({@link OutboxStateFilter} - pending, parked,
    * relayed, cancelled; an unknown value is a 400), with the same toolkit predicate and paging
-   * on top. The state rides the PATH, not a query parameter, because tmf630-toolkit's
-   * predicate resolver reads the whole parameter map and rejects any non-reserved name
-   * before a handler runs.
+   * on top. The path form predates {@code ?state=} on the plain list (1.4.0) and stays, one
+   * code path behind both.
    *
    * <p>{@code @Tmf630Response} on every list sibling is about RENDERING consistency: without
    * it a {@code Page} serializes as raw {@code PageImpl} JSON ({@code {"content":[...]}})

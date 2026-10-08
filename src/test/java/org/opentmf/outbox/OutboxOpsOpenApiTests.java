@@ -4,12 +4,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.RecordComponent;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.internal.OutboxOpsController;
+import org.opentmf.query.tmf630.filtering.Tmf630PassThrough;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -56,6 +58,33 @@ class OutboxOpsOpenApiTests {
   @DisplayName("the fragment's operations are exactly the controller's mappings")
   void fragmentMatchesTheController() {
     assertThat(fragmentOperations()).containsExactlyElementsOf(controllerOperations());
+  }
+
+  @Test
+  @DisplayName("every name a handler passes through the TMF630 grammar is a documented query parameter")
+  void passedThroughNamesAreDocumented() {
+    String base = OutboxOpsController.class.getAnnotation(RequestMapping.class).value()[0];
+    @SuppressWarnings("unchecked")
+    Map<String, Map<String, Map<String, Object>>> paths =
+        (Map<String, Map<String, Map<String, Object>>>) fragment().get("paths");
+    int checked = 0;
+    for (Method m : OutboxOpsController.class.getDeclaredMethods()) {
+      Tmf630PassThrough passThrough = m.getAnnotation(Tmf630PassThrough.class);
+      if (passThrough == null) {
+        continue;
+      }
+      String path = base + m.getAnnotation(GetMapping.class).path()[0];
+      @SuppressWarnings("unchecked")
+      List<Map<String, Object>> parameters =
+          (List<Map<String, Object>>) paths.get(path).get("get").get("parameters");
+      Set<String> queryNames = new TreeSet<>();
+      parameters.stream()
+          .filter(p -> "query".equals(p.get("in")))
+          .forEach(p -> queryNames.add(p.get("name").toString()));
+      assertThat(queryNames).as(path).contains(passThrough.value());
+      checked++;
+    }
+    assertThat(checked).isPositive(); // ?state= on GET /ops/outbox (1.4.0)
   }
 
   @Test

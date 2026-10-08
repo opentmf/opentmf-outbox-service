@@ -19,7 +19,7 @@ import java.util.Locale;
  *
  * <p>{@code relayed} and {@code cancelled} overlap only for a row cancelled after its lease lapsed
  * while its send still ran, and then delivered (sent-but-cancelled, 1.3.0; a LIVE lease refuses
- * the cancel since 1.3.1) - it is listed under both, truthfully.
+ * the cancel since 1.4.0) - it is listed under both, truthfully.
  */
 public enum OutboxStateFilter {
   PENDING,

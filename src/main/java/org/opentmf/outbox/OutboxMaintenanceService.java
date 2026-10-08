@@ -22,7 +22,7 @@ import org.springframework.transaction.annotation.Transactional;
  * <p>The row-mutating actions read their row under a WAITING {@code for update} lock, so they
  * serialize against the relay's short claim and booking transactions: an action sees the row as
  * the relay LEFT it (and refuses a now-relayed row) - never a stale snapshot, never a silent
- * no-op. Since 1.3.0 no lock is held across a send; since 1.3.1 a cancel REFUSES a row that is
+ * no-op. Since 1.3.0 no lock is held across a send; since 1.4.0 a cancel REFUSES a row that is
  * IN FLIGHT (a live lease) with {@link OutboxRowInFlightException} (409) - its publisher may be
  * delivering right now - and succeeds on an unclaimed row or one whose lease has lapsed. The
  * booking still honours a cancel that slipped in on a lapsed lease (a late sender): a failed
@@ -113,7 +113,7 @@ public class OutboxMaintenanceService {
    *
    * @throws IllegalArgumentException when no row has the given id
    * @throws OutboxRowInFlightException when a relay holds a live lease on the row - its send may
-   *     be delivering now (1.3.1); cancel again once it is booked
+   *     be delivering now (1.4.0); cancel again once it is booked
    * @throws IllegalStateException when the row is already relayed (the effect has left - a
    *     cancel cannot recall it) or already cancelled
    */

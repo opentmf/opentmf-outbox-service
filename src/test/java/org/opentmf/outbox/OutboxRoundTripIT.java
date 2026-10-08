@@ -206,6 +206,23 @@ class OutboxRoundTripIT {
         .andExpect(jsonPath("$[?(@.id == %d)]".formatted(appended.getId())).isEmpty());
     mockMvc.perform(get("/ops/outbox/state/parked")).andExpect(status().isOk());
     mockMvc.perform(get("/ops/outbox/state/dead-lettered")).andExpect(status().isBadRequest());
+
+    // ?state= on the plain list (1.4.0): the same legs, the same predicate on top, passed
+    // through the toolkit grammar for THIS name only - state.eq is still a filter key (400)
+    mockMvc
+        .perform(get("/ops/outbox").param("state", "relayed").param("eventType", "it.event.v1"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$[?(@.id == %d)]".formatted(appended.getId())).isNotEmpty());
+    mockMvc
+        .perform(get("/ops/outbox").param("state", "pending").param("eventType", "it.event.v1"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$[?(@.id == %d)]".formatted(appended.getId())).isEmpty());
+    mockMvc
+        .perform(get("/ops/outbox").param("state", "dead-lettered"))
+        .andExpect(status().isBadRequest());
+    mockMvc
+        .perform(get("/ops/outbox").param("state.eq", "relayed"))
+        .andExpect(status().isBadRequest());
     mockMvc
         .perform(get("/ops/outbox/{id}", appended.getId()))
         .andExpect(status().isOk())

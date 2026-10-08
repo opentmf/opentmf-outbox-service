@@ -89,7 +89,7 @@ neither relayed rows nor more than one row per key.
 `relayed` and `cancelled` overlap in exactly one case: a row cancelled after
 its lease LAPSED while its send was still running, whose send then succeeded —
 booked **sent-but-cancelled**, both stamps set, listed under both states (see
-the lease below). Under a live lease the cancel is refused (1.3.1).
+the lease below). Under a live lease the cancel is refused (1.4.0).
 
 ## How It Works
 
@@ -255,7 +255,7 @@ sequenceDiagram
 - **Ops actions against a row in flight.** `cancel` and `unpark` read their row
   under a waiting `FOR UPDATE`. Since 1.3.0 that serialises only against the
   short claim and booking transactions, never against a send (the claims skip
-  a row an ops action holds). Since 1.3.1 a **cancel of a row in flight is
+  a row an ops action holds). Since 1.4.0 a **cancel of a row in flight is
   refused at once**, on both lanes, with `OutboxRowInFlightException` (an
   `IllegalStateException`; 409 on `/ops`, its `claimedUntil()` names the
   lease end): the send may be delivering right now, so "cancelled" would be a
@@ -504,7 +504,7 @@ scheduled send, cancel the row (`OutboxMaintenanceService.cancel(id)` or the
 `/ops` endpoint) and append a new one. Cancelling is possible only while the
 effect has not left: a relayed row refuses with an `IllegalStateException`
 ("already relayed"), as does an already-cancelled one, and a row whose send
-is in flight refuses with `OutboxRowInFlightException` (1.3.1).
+is in flight refuses with `OutboxRowInFlightException` (1.4.0).
 
 Pass the payload as a fact object — it is serialized at write time. Extra
 **wire** headers frozen at write time ride the `Map<String,String>` overload or
@@ -630,7 +630,7 @@ surface):
 | POST   | `/ops/outbox/{id}/unpark`     | Break-glass after the root cause is fixed: `parked_on` cleared, attempts reset, due now |
 | POST   | `/ops/outbox/unpark`          | Unpark by FILTER (JSON body `{"destination": …, "parkedFrom": …, "parkedTo": …, "reference": …}`, destination required), BOUNDED: answers `{"outboxRowsUnparked": n, "moreToUnpark": bool}`. Gate it like the single unpark |
 | POST   | `/ops/outbox/{id}/cancel`     | Withdraws an unreleased effect: never relayed, retained for audit     |
-| GET    | `/ops/outbox`                 | TMF630 triage list (attribute filtering + paging), payloads omitted   |
+| GET    | `/ops/outbox`                 | TMF630 triage list (attribute filtering + paging), payloads omitted; `?state=` (1.4.0) narrows it to one derived-state leg like the path form below |
 | GET    | `/ops/outbox/state/{state}`   | The list narrowed to one derived-state leg (`pending`, `parked`, `relayed`, `cancelled`; unknown → 400), same filtering + paging on top |
 | GET    | `/ops/outbox/parked`          | Runbook alias of `/ops/outbox/state/parked`                           |
 | GET    | `/ops/outbox/{id}`            | One row in full — payload + `last_error`, the pre-unpark forensic read (behind the consumer's admin role, by ruling) |
@@ -703,10 +703,12 @@ headers); an unknown filter field is a strict 400. The state legs on the list
 are the toolkit's null-filtering over `relayedOn` / `cancelledOn` / `parkedOn`
 (`reference` is filterable too); each row carries `releaseAt`, `parkedOn`,
 `cancelledOn` and `reference`, and `parked` stays the one derived flag. The
-derived-state legs ride the PATH (`/state/{state}`), not a `?state=` query
-parameter: the toolkit's predicate resolver reads the whole parameter map and
-rejects any non-reserved name before a handler runs (a `?state=` form needs a
-toolkit pass-through allowance — backlog).
+derived-state legs ride either the PATH (`/state/{state}`, since 1.2.0) or,
+since 1.4.0, a `?state=` query parameter on the plain list — one code path. The
+toolkit's predicate resolver reads the whole parameter map, so `state` is
+passed through its grammar with `@Tmf630PassThrough` on that one handler: the
+exact name only (`state.eq` is still a filter key, and a 400), and every other
+unknown name is still rejected.
 
 The `tmf630-toolkit-all` dependency is **optional, honestly**: without it on
 the classpath the `/ops` controller is not registered at all (a guarded,
@@ -830,7 +832,7 @@ The library is self-contained for consumer testing — no test-jar needed:
    `lease` longer than its longest call. Rows it appended before the change
    keep the lane they were stamped with.
 6. Ops: a cancel of a row in flight returns at once (it used to wait for the
-   send); since 1.3.1 it is refused with `OutboxRowInFlightException` (409)
+   send); since 1.4.0 it is refused with `OutboxRowInFlightException` (409)
    rather than accepted. Watch the new `opentmf.outbox.in-flight` gauge and
    the `inFlight` / `claimedUntil` fields on the row view. A crash after a send
    redelivers once the lease lapses, not on the next pass.

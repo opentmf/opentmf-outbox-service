@@ -1,6 +1,20 @@
 # Changelog
 
-## 1.3.1 - 2026-10-08
+## 1.4.0 - 2026-10-08
+
+A cancel no longer accepts a row whose send is in flight, and the ops list takes
+`?state=`.
+
+### Added
+
+- **`?state=` on `GET /ops/outbox`** (OUTBOX-STATE-QUERY-1). The plain list now takes
+  the derived-state leg as a query parameter (`pending`, `parked`, `relayed`,
+  `cancelled`; an unknown value is a 400), the same code path as
+  `/ops/outbox/state/{state}`, which stays. The toolkit's filter grammar reads the
+  whole query string, so the handler passes `state` through it with
+  `@Tmf630PassThrough` (tmf630-toolkit 3.4.0): the exact name only, so `state.eq=` is
+  still a filter key (a 400), and every other unknown name is still rejected. The OAS
+  fragment documents the parameter.
 
 ### Fixed
 

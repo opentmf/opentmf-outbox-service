@@ -262,7 +262,7 @@ class Profile681HubIT {
     assertThat(maintenance.inspect(delivered.getId()).reference())
         .isEqualTo("subscription-secret-2");
 
-    // 4) cancel vs a send in flight (1.3.1): the relay leased the slow row and is inside
+    // 4) cancel vs a send in flight (1.4.0): the relay leased the slow row and is inside
     //    publish() - holding no lock and no transaction. The cancel does NOT wait: it is REFUSED
     //    at once, by name (OutboxRowInFlightException; 409 on /ops) - the send may be delivering
     //    right now, so "cancelled" would be a lie. The send then succeeds and the row is relayed,

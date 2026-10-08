@@ -118,7 +118,7 @@ public interface OutboxEventRepository
    * ops actions (cancel, unpark) read through this so they serialize against a relay claim in
    * flight: the action sees the row AS THE RELAY LEFT IT, never a stale pre-claim snapshot.
    * Since 1.3.0 the relay holds no lock across a send - the action serialises against the short
-   * claim and booking transactions only; a row in flight is refused (1.3.1, see cancel). The
+   * claim and booking transactions only; a row in flight is refused (1.4.0, see cancel). The
    * claims skip a row an ops action holds.
    */
   @Lock(LockModeType.PESSIMISTIC_WRITE)
