@@ -56,8 +56,14 @@ library never imports that BOM (direct property pins in the pom).
   lease (`OutboxRowInFlightException`, 409; #8); `GET /ops/outbox?state=` via
   `@Tmf630PassThrough` beside the path form (#9); the four row gauges tagged by `lane` - a
   metric-shape change - with changeset 006's per-lane gauge indexes (#10).
+- **1.5.0 (2026-10-09)** - OUTBOX-KAFKA-PER-KEY-ORDER-1 (#11): `opentmf.outbox.kafka.lane`
+  ORDERED (default) | CONCURRENT, `kafka.ordering-key` AGGREGATE_ID | NONE, `kafka.lease`
+  (> send-timeout); record key stays the raw aggregateId. `OutboxKafkaTwoPodsIT` (two contexts,
+  one DB, one broker) is red on `-Dit.kafka.lane=ORDERED` only with rows contiguous per aggregate
+  and one shared `releaseAt` - keep that shape. Push gate: `sonar-local-zero <branch>
+  opentmf_opentmf-outbox-service-local` must exit 0 on an analysis of HEAD.
 
 ## Open
 
-- Develop is `1.4.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
-  heading `## 1.4.1 - <date>`.
+- Develop is `1.5.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
+  heading `## 1.5.1 - <date>`.
