@@ -8,18 +8,24 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxProperties;
+import org.opentmf.outbox.OutboxProperties.KafkaOrderingKey;
+import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.springframework.kafka.KafkaException;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
 import tools.jackson.databind.ObjectMapper;
 
-/** Relay headers stamped, key = aggregateId, ack awaited, failures unwind to the relay. */
+/**
+ * Relay headers stamped, key = aggregateId, ack awaited, failures unwind to the relay; the lane,
+ * ordering key and lease follow {@code opentmf.outbox.kafka.*} (1.5.0).
+ */
 class KafkaOutboxPublisherTests {
 
   @SuppressWarnings("unchecked")
@@ -38,6 +44,53 @@ class KafkaOutboxPublisherTests {
     event.setHeaders(headers);
     event.setReference("subscription-42"); // private - must never reach the wire
     return event;
+  }
+
+  @Test
+  void byDefault_itRidesOrdered_unkeyed_onTheOrderedLease() {
+    OutboxEvent event = event("topic", null);
+
+    assertThat(publisher.lane(event)).isEqualTo(Lane.ORDERED);
+    assertThat(publisher.orderingKey(event)).isNull();
+    assertThat(publisher.lease(event)).isNull(); // ordered.lease governs
+  }
+
+  @Test
+  void onConcurrent_itIsKeyedByTheAggregate_onTheKafkaLease() {
+    OutboxProperties properties = new OutboxProperties();
+    properties.getKafka().setLane(Lane.CONCURRENT);
+    properties.getKafka().setLease(Duration.ofSeconds(20));
+    KafkaOutboxPublisher concurrent =
+        new KafkaOutboxPublisher(template, properties, new ObjectMapper(), "svc");
+    OutboxEvent event = event("topic", null);
+
+    assertThat(concurrent.lane(event)).isEqualTo(Lane.CONCURRENT);
+    assertThat(concurrent.orderingKey(event)).isEqualTo("agg-1");
+    assertThat(concurrent.lease(event)).isEqualTo(Duration.ofSeconds(20));
+
+    properties.getKafka().setOrderingKey(KafkaOrderingKey.NONE); // every row independent
+    assertThat(concurrent.orderingKey(event)).isNull();
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  void onConcurrent_theRecordKeyStaysTheRawAggregateId() {
+    OutboxProperties properties = new OutboxProperties();
+    properties.getKafka().setLane(Lane.CONCURRENT);
+    KafkaOutboxPublisher concurrent =
+        new KafkaOutboxPublisher(template, properties, new ObjectMapper(), "svc");
+    when(template.isTransactional()).thenReturn(false);
+    when(template.send(any(ProducerRecord.class)))
+        .thenReturn(CompletableFuture.completedFuture(mock(SendResult.class)));
+    OutboxEvent event = event("topic", null);
+    event.setOrderingKey("sha256:stored-form-of-a-long-key"); // never the wire key
+
+    concurrent.publish(event);
+
+    ArgumentCaptor<ProducerRecord<Object, Object>> sent =
+        ArgumentCaptor.forClass(ProducerRecord.class);
+    verify(template).send(sent.capture());
+    assertThat(sent.getValue().key()).isEqualTo("agg-1");
   }
 
   @Test

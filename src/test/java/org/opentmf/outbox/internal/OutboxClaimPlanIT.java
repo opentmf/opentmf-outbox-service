@@ -18,9 +18,9 @@ import org.junit.jupiter.api.MethodOrderer.OrderAnnotation;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
-import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
@@ -40,8 +40,8 @@ import tools.jackson.databind.ObjectMapper;
 class OutboxClaimPlanIT {
 
   @Container
-  static final PostgreSQLContainer<?> postgres =
-      new PostgreSQLContainer<>("postgres:18.1-alpine3.22");
+  static final PostgreSQLContainer postgres =
+      new PostgreSQLContainer("postgres:18.1-alpine3.22");
 
   /** The claim's slot count in every case (the default {@code max-in-flight}). */
   private static final int LIMIT = 8;

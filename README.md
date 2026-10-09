@@ -130,7 +130,8 @@ sequenceDiagram
   this account: a row no publisher supports, or whose publisher throws while
   naming its lane, is stored without one and the relay books it as before.
   The **ORDERED** lane is the single relay thread per pod: rows go one by one
-  in `id` order — the 1.2.x behaviour; the Kafka publisher rides it. The **CONCURRENT** lane sends rows
+  in `id` order — the 1.2.x behaviour; the Kafka publisher rides it by default
+  (`opentmf.outbox.kafka.lane`, 1.5.0, below). The **CONCURRENT** lane sends rows
   in parallel, one per thread, at most `concurrent.max-in-flight` (default 8)
   at a time; the HTTP publisher rides it, so a slow subscriber never delays a
   Kafka row again. CONCURRENT rows keep **no order** against ORDERED rows, nor
@@ -167,7 +168,8 @@ sequenceDiagram
   `FOR UPDATE SKIP LOCKED` plus the lease is the guard: two pods never take
   one row twice. A row another pod is claiming is skipped, and once that claim
   commits the row carries a live lease. Pods still interleave ORDERED rows, so
-  strict order across pods is not promised. Rows of one ordering key are
+  strict order across pods is not promised — for Kafka rows that need it, set
+  `opentmf.outbox.kafka.lane: CONCURRENT` (next item). Rows of one ordering key are
   **never in flight together, within a pod and across pods**. Each keyed
   candidate is claimed only after its key's transaction-scoped **PostgreSQL
   advisory lock** (`pg_try_advisory_xact_lock`, tried, never waited for) is
@@ -175,6 +177,23 @@ sequenceDiagram
   nothing of its key in flight. A pod that loses the lock skips the key for
   one pass and sees the other pod's committed lease on the next. The claim
   transactions run READ COMMITTED whatever the application's default.
+- **Running several relays with Kafka (1.5.0).** With more than one pod, the
+  default Kafka publisher's ORDERED lane can publish one aggregate's rows out
+  of order: pod A sends row 3 while pod B sends row 7 of the same aggregate,
+  and 7 may land first (an adapter's `delivered` ahead of its `accepted`).
+  `opentmf.outbox.kafka.lane: CONCURRENT` moves the default Kafka publisher
+  onto the CONCURRENT lane, keyed by `opentmf.outbox.kafka.ordering-key`
+  (`AGGREGATE_ID`, the default): one aggregate's rows are never in flight
+  together on any pod and go in `id` order, while different aggregates relay
+  in parallel. The record key stays the raw `aggregateId`, so the partitioning
+  does not move and partition order matches. `ordering-key: NONE` drops the
+  order altogether (every row independent). A Kafka row on CONCURRENT holds a
+  `kafka.lease` (default 15 s, > `send-timeout`) and shares the lane's
+  `max-in-flight` slots with HTTP rows; keys are taken round-robin, so a slow
+  subscriber cannot starve it. `OutboxKafkaTwoPodsIT` runs two real pods on one
+  database and one broker: every aggregate's rows arrive in order, every row
+  exactly once. **The lane is stamped at append**: the setting applies to rows
+  written after the restart; rows pending at that moment keep ORDERED.
 - **At-least-once, consumer-dedupable.** A crash between delivery and booking
   means redelivery once the row's lease lapses (seconds on the ORDERED lane,
   up to the lease on the CONCURRENT lane); `x-idempotency-key = <spring.application.name>:outbox:<id>`
@@ -337,6 +356,10 @@ opentmf:
       lease: 15s             # ORDERED lane default lease - short, > send-timeout
     concurrent:
       max-in-flight: 8       # CONCURRENT sends at once per pod (also the thread bound)
+    kafka:                   # the default Kafka publisher (1.5.0)
+      lane: ORDERED          # ORDERED | CONCURRENT - CONCURRENT for per-key order across pods
+      ordering-key: AGGREGATE_ID  # on CONCURRENT: AGGREGATE_ID | NONE
+      lease: 15s             # on CONCURRENT: a Kafka row's lease, > send-timeout
     ops-endpoints: true      # serve the /ops surface (see below) - a conditional switch,
                              # not a field of OutboxProperties
 ```
@@ -354,6 +377,9 @@ opentmf:
 | `lease`          | `Duration` | `2m`    | Lease of a CONCURRENT row when its publisher declares none; must exceed the lane's longest call. |
 | `ordered.lease`  | `Duration` | `15s`   | Lease of an ORDERED row when its publisher declares none. Short on purpose: after a pod stop the row waits this long. Must exceed `send-timeout` (validated at boot). |
 | `concurrent.max-in-flight` | `int` | `8` | CONCURRENT sends in flight per pod; the claim takes no more rows than free slots. |
+| `kafka.lane`     | `ORDERED`/`CONCURRENT` | `ORDERED` | The default Kafka publisher's lane (1.5.0). `CONCURRENT` = per-aggregate order across pods (see "Running several relays with Kafka"). Stamped at append. |
+| `kafka.ordering-key` | `AGGREGATE_ID`/`NONE` | `AGGREGATE_ID` | On `CONCURRENT`: what orders a Kafka row. Ignored on `ORDERED`. The record key is the `aggregateId` either way. |
+| `kafka.lease`    | `Duration` | `15s`   | On `CONCURRENT`: a Kafka row's lease. Must exceed `send-timeout` (validated at boot). Ignored on `ORDERED`. |
 | `shutdown-grace` | `Duration` | `10s`   | On stop: the relay thread's and the in-flight sends' time to finish; the rest lapse by lease. |
 | `metrics-refresh` | `Duration` | `15s`  | How often the gauges are re-read from the database; a scrape reads the last values. |
 | `maintenance.batch-size` | `int`    | `5000`  | Rows per batch of a bulk operation (prune, unpark by filter); each batch is its own transaction, no entity loaded. |

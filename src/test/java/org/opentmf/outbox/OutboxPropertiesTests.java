@@ -5,7 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
 
-/** The one cross-field rule: the ORDERED lease must outlast a Kafka send. */
+/** The cross-field rules: the ORDERED lease and the Kafka lease must outlast a Kafka send. */
 class OutboxPropertiesTests {
 
   @Test
@@ -16,6 +16,26 @@ class OutboxPropertiesTests {
     assertThat(properties.getOrdered().getLease()).isEqualTo(Duration.ofSeconds(15));
     assertThat(properties.getLease()).isEqualTo(Duration.ofMinutes(2));
     assertThat(properties.getConcurrent().getMaxInFlight()).isEqualTo(8);
+    // 1.5.0: the Kafka publisher stays ORDERED unless told otherwise
+    assertThat(properties.isKafkaLeaseLongerThanSendTimeout()).isTrue();
+    assertThat(properties.getKafka().getLane()).isEqualTo(OutboxPublisher.Lane.ORDERED);
+    assertThat(properties.getKafka().getOrderingKey())
+        .isEqualTo(OutboxProperties.KafkaOrderingKey.AGGREGATE_ID);
+    assertThat(properties.getKafka().getLease()).isEqualTo(Duration.ofSeconds(15));
+  }
+
+  @Test
+  void aKafkaLeaseNotLongerThanTheSendTimeout_breaksTheRule() {
+    OutboxProperties properties = new OutboxProperties();
+    properties.getKafka().setLease(Duration.ofSeconds(10)); // == send-timeout
+
+    assertThat(properties.isKafkaLeaseLongerThanSendTimeout()).isFalse();
+
+    properties.getKafka().setLease(null); // left to its own @NotNull
+    assertThat(properties.isKafkaLeaseLongerThanSendTimeout()).isTrue();
+    properties.getKafka().setLease(Duration.ofSeconds(11));
+    properties.setSendTimeout(null);
+    assertThat(properties.isKafkaLeaseLongerThanSendTimeout()).isTrue();
   }
 
   @Test
