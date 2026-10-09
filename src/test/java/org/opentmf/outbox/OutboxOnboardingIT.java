@@ -16,9 +16,9 @@ import liquibase.Scope;
 import liquibase.command.CommandScope;
 import liquibase.resource.DirectoryResourceAccessor;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 
 /**
  * The library changelog against every table shape a consumer can bring (H.5): a fresh schema
@@ -32,8 +32,8 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 class OutboxOnboardingIT {
 
   @Container
-  static final PostgreSQLContainer<?> postgres =
-      new PostgreSQLContainer<>("postgres:18.1-alpine3.22");
+  static final PostgreSQLContainer postgres =
+      new PostgreSQLContainer("postgres:18.1-alpine3.22");
 
   private static final String LIBRARY_CHANGELOG = "db/changelog/opentmf-outbox.sql";
   private static final String RELEASED_1_1_0_CHANGELOG = "db/changelog-1.1.0/opentmf-outbox.sql";

@@ -82,6 +82,9 @@ public class OutboxProperties {
   /** The CONCURRENT lane ({@code opentmf.outbox.concurrent.*}). */
   @Valid private final Concurrent concurrent = new Concurrent();
 
+  /** The library's default Kafka publisher ({@code opentmf.outbox.kafka.*}, 1.5.0). */
+  @Valid private final Kafka kafka = new Kafka();
+
   /**
    * The ORDERED lease must outlast one Kafka send, or a row whose acknowledgement is slow is
    * re-claimed while it is still being sent.
@@ -89,6 +92,15 @@ public class OutboxProperties {
   @AssertTrue(message = "opentmf.outbox.ordered.lease must exceed opentmf.outbox.send-timeout")
   public boolean isOrderedLeaseLongerThanSendTimeout() {
     return ordered.lease == null || sendTimeout == null || ordered.lease.compareTo(sendTimeout) > 0;
+  }
+
+  /**
+   * A Kafka row on the CONCURRENT lane holds its claim for {@code kafka.lease}: it must outlast
+   * one Kafka send, as the ORDERED lease must.
+   */
+  @AssertTrue(message = "opentmf.outbox.kafka.lease must exceed opentmf.outbox.send-timeout")
+  public boolean isKafkaLeaseLongerThanSendTimeout() {
+    return kafka.lease == null || sendTimeout == null || kafka.lease.compareTo(sendTimeout) > 0;
   }
 
   /** The ORDERED lane's settings. */
@@ -118,6 +130,47 @@ public class OutboxProperties {
      * the budget says more remains, and the caller calls again. Default 10s.
      */
     @NotNull private Duration timeBudget = Duration.ofSeconds(10);
+  }
+
+  /**
+   * The default Kafka publisher's settings (1.5.0): which lane its rows ride and, on the
+   * CONCURRENT lane, what orders them. Stamped on each row at APPEND - a change applies to the
+   * rows written after it; rows already pending keep the lane they were stamped with.
+   */
+  @Getter
+  @Setter
+  public static class Kafka {
+
+    /**
+     * {@code ORDERED} (the default, as before 1.5.0): the single relay thread of each pod, in
+     * {@code id} order - two pods never take one row twice, but across pods rows interleave, so
+     * strict order is NOT promised with several relays. {@code CONCURRENT}: rows of one ordering
+     * key are never in flight together, within a pod or across pods, and go in {@code id} order on
+     * the happy path; different keys relay in parallel.
+     */
+    @NotNull private OutboxPublisher.Lane lane = OutboxPublisher.Lane.ORDERED;
+
+    /**
+     * On the CONCURRENT lane, what orders a Kafka row: {@code AGGREGATE_ID} (the default) - one
+     * aggregate's rows in order, whichever pod relays them, the same key the record already
+     * carries; {@code NONE} - no order at all, every row independent. Ignored on ORDERED.
+     */
+    @NotNull private KafkaOrderingKey orderingKey = KafkaOrderingKey.AGGREGATE_ID;
+
+    /**
+     * The lease of a Kafka row on the CONCURRENT lane - short, as the ORDERED lease is: after a
+     * pod stop an unbooked row waits this long before another relay takes it. Must exceed
+     * {@code send-timeout}. Ignored on ORDERED (the {@code ordered.lease} governs). Default 15s.
+     */
+    @NotNull private Duration lease = Duration.ofSeconds(15);
+  }
+
+  /** What orders a Kafka row on the CONCURRENT lane ({@code opentmf.outbox.kafka.ordering-key}). */
+  public enum KafkaOrderingKey {
+    /** The row's {@code aggregateId} - one aggregate's rows in order. */
+    AGGREGATE_ID,
+    /** None - every row independent, no order promised. */
+    NONE
   }
 
   /** The CONCURRENT lane's settings. */

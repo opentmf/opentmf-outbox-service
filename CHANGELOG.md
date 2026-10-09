@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.5.0 - 2026-10-09
+
+Per-aggregate Kafka order across several relays.
+
+### Added
+
+- **`opentmf.outbox.kafka.lane: ORDERED | CONCURRENT`** (OUTBOX-KAFKA-PER-KEY-ORDER-1).
+  The library's default Kafka publisher was fixed to the ORDERED lane. With several pods
+  that lane interleaves: two pods never take one row twice, but one aggregate's rows could
+  reach Kafka out of order. An adapter's `delivered` could then land ahead of its
+  `accepted`, and a consumer reading "no accept, so not sent" recorded a sent message as
+  not sent.
+  - On `CONCURRENT`, a Kafka row is keyed by `opentmf.outbox.kafka.ordering-key`
+    (`AGGREGATE_ID`, the default). One aggregate's rows are never in flight together on
+    any pod and go in `id` order on the happy path, while different aggregates relay in
+    parallel. `NONE` drops the order (every row independent).
+  - The record key stays the raw `aggregateId`, as before, so partitioning does not move
+    and partition order matches. A key over 255 characters is still sent as is; only its
+    stored ordering key is hashed.
+  - `opentmf.outbox.kafka.lease` (default 15 s, validated to exceed `send-timeout`) is the
+    lease of a Kafka row on `CONCURRENT`. It is short, like the ORDERED lease, so a pod
+    stop delays redelivery by seconds.
+  - The header contract (`x-idempotency-key`, `x-event-type`, `x-producer`, `traceparent`)
+    is unchanged.
+  - `OutboxKafkaTwoPodsIT` proves it on two Spring contexts (two relays, two producers)
+    over one PostgreSQL and one broker: 40 aggregates × 3 lifecycle rows, appended
+    alternately from both pods and released at one instant, with every send slowed at
+    random. Every aggregate's rows arrive in order and every row exactly once. On
+    `ORDERED` (`-Dit.kafka.lane=ORDERED`) the same IT fails.
+
+**Compatibility.** Nothing changes until a consumer sets `kafka.lane: CONCURRENT`; the
+default stays `ORDERED`.
+- The lane is stamped at APPEND, so after the switch only rows written from then on ride
+  `CONCURRENT`. Rows pending at the restart keep `ORDERED` and drain as before. While the
+  two overlap, one aggregate's old ORDERED row and new CONCURRENT row are not ordered
+  against each other.
+- During a rolling deploy, rows written by a 1.4.x pod still ride `ORDERED`. A row written
+  by a 1.5.0 pod carries its lane and ordering key, and a 1.4.x relay honours them, since
+  the CONCURRENT claim has read them since 1.3.0. Per-aggregate order is therefore complete
+  once every pod that APPENDS runs 1.5.0 with the setting.
+- On `CONCURRENT`, Kafka rows share the lane's `concurrent.max-in-flight` slots (default
+  8 per pod) with HTTP rows. Keys are taken round-robin, so a slow subscriber cannot
+  starve them, but raise the slot count if a pod relays many Kafka rows and slow HTTP
+  rows at once.
+- The gauges count such rows under `lane="concurrent"`.
+
 ## 1.4.0 - 2026-10-08
 
 A cancel no longer accepts a row whose send is in flight, the ops list takes `?state=`,

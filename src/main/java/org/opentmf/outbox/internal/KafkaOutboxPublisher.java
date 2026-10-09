@@ -1,6 +1,7 @@
 package org.opentmf.outbox.internal;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -10,6 +11,7 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxHeaders;
 import org.opentmf.outbox.OutboxProperties;
+import org.opentmf.outbox.OutboxProperties.KafkaOrderingKey;
 import org.opentmf.outbox.OutboxPublisher;
 import org.springframework.kafka.KafkaException;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -29,8 +31,15 @@ import tools.jackson.databind.ObjectMapper;
  *
  * <p>When the template is transactional the send runs in a Kafka transaction; otherwise the
  * relay awaits the broker acknowledgement synchronously (at most {@code send-timeout}) so a
- * failure is observed before the booking. Lane: ORDERED (the default) - the single relay thread,
- * {@code id} order; the ordered lease must exceed {@code send-timeout}.
+ * failure is observed before the booking.
+ *
+ * <p>Lane ({@code opentmf.outbox.kafka.lane}, 1.5.0): ORDERED by default - the single relay
+ * thread, {@code id} order within a pod, the ordered lease; with several relays rows interleave
+ * across pods. CONCURRENT - ordered by {@code kafka.ordering-key} (the {@code aggregateId} by
+ * default): one aggregate's rows are never in flight together, on any pod, and go in {@code id}
+ * order on the happy path, while different aggregates relay in parallel; the lease is
+ * {@code kafka.lease}. The record key stays the raw {@code aggregateId} on either lane, so the
+ * partitioning never moves.
  */
 class KafkaOutboxPublisher implements OutboxPublisher {
 
@@ -55,6 +64,29 @@ class KafkaOutboxPublisher implements OutboxPublisher {
   public boolean supports(OutboxEvent event) {
     String destination = event.getDestination();
     return !(destination.startsWith("http://") || destination.startsWith("https://"));
+  }
+
+  @Override
+  public Lane lane(OutboxEvent event) {
+    return properties.getKafka().getLane();
+  }
+
+  /** On CONCURRENT: the aggregate (unless {@code ordering-key: NONE}); on ORDERED, none. */
+  @Override
+  public String orderingKey(OutboxEvent event) {
+    OutboxProperties.Kafka kafka = properties.getKafka();
+    return kafka.getLane() == Lane.CONCURRENT
+            && kafka.getOrderingKey() == KafkaOrderingKey.AGGREGATE_ID
+        ? event.getAggregateId()
+        : null;
+  }
+
+  /** On CONCURRENT: {@code kafka.lease}; on ORDERED, the lane's own ({@code ordered.lease}). */
+  @Override
+  public Duration lease(OutboxEvent event) {
+    return properties.getKafka().getLane() == Lane.CONCURRENT
+        ? properties.getKafka().getLease()
+        : null;
   }
 
   @Override
