@@ -63,7 +63,7 @@ library never imports that BOM (direct property pins in the pom).
   and one shared `releaseAt` - keep that shape. Push gate: `sonar-local-zero <branch>
   opentmf_opentmf-outbox-service-local` must exit 0 on an analysis of HEAD.
 
-- **1.6.0 (in preparation, 2026-10-13)** - OUTBOX-RELAY-CLAIM-CADENCE-1: the CONCURRENT
+- **1.6.0 (2026-10-13)** - OUTBOX-RELAY-CLAIM-CADENCE-1 (#12): the CONCURRENT
   claim runs ahead of the slots into a hand-off queue of `batch-size`; one statement each for
   the key locks (`KEY_LOCKS`), the stamp (`STAMP`) and the RELAYED booking (`BOOK_RELAYED`);
   a queued row that waited 1/10 of its lease is renewed before its send; the ORDERED claim
@@ -75,4 +75,8 @@ library never imports that BOM (direct property pins in the pom).
 
 ## Open
 
-- Develop is `1.6.0-SNAPSHOT`; the CHANGELOG section is `## 1.6.0 - <date>`.
+- Develop is `1.6.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
+  heading `## 1.6.1 - <date>` (or the next minor's, if the row is a minor).
+- OUTBOX-UNUSED-INDEX-1 (filed 2026-10-13 by the coordinator, next release): prove
+  `ix_outbox_pending` reads zero scans (`pg_stat_user_indexes`, loaded instance), then drop
+  it in a changeset with rollback.
