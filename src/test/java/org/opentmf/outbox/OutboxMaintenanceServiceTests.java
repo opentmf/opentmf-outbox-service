@@ -71,7 +71,7 @@ class OutboxMaintenanceServiceTests {
     assertThat(parked.getReleaseAt()).isBeforeOrEqualTo(OffsetDateTime.now().minusDays(1));
     // due NOW - without this an unparked row keeps its far-future slot and never redelivers
     assertThat(parked.getNextAttemptOn()).isBeforeOrEqualTo(OffsetDateTime.now());
-    verify(events).publishEvent(new OutboxAppended(7L));
+    verify(events).publishEvent(new OutboxAppended(7L, null)); // the row's lane
   }
 
   @Test
@@ -309,7 +309,7 @@ class OutboxMaintenanceServiceTests {
         .unparkBatch(any(), eq("hub:a"), from.capture(), to.capture(), eq(5_000));
     assertThat(from.getValue()).isBefore(OffsetDateTime.parse("1971-01-01T00:00:00Z"));
     assertThat(to.getValue()).isAfter(OffsetDateTime.parse("9000-01-01T00:00:00Z"));
-    verify(events, times(1)).publishEvent(new OutboxAppended(0));
+    verify(events, times(1)).publishEvent(new OutboxAppended(0, null)); // both lanes
   }
 
   @Test

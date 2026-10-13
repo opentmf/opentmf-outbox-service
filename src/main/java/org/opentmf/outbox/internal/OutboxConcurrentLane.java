@@ -1,34 +1,49 @@
 package org.opentmf.outbox.internal;
 
 import java.time.Duration;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.task.SimpleAsyncTaskExecutor;
 import org.springframework.core.task.TaskRejectedException;
 
 /**
- * The CONCURRENT lane's slots and threads: one send per thread - VIRTUAL when the runtime is 21+
- * and the application enables {@code spring.threads.virtual.enabled}, platform threads
- * otherwise (the library's bytecode stays on Java 17; Spring's executor reaches the virtual
- * threads at runtime). {@code max-in-flight} permits bound the sends.
+ * The CONCURRENT lane (1.6.0): a HAND-OFF QUEUE in front of {@code max-in-flight} slots. The relay
+ * claims rows AHEAD of the slots and hands them over in claim order; the permits bound the SENDS,
+ * never the claim. Each permit is one worker - a thread that takes queued sends one after another
+ * until the queue is empty, then returns its permit. Workers run on VIRTUAL threads when the
+ * runtime is 21+ and the application enables {@code spring.threads.virtual.enabled}, on platform
+ * threads otherwise (the library's bytecode stays on Java 17; Spring's executor reaches the virtual
+ * threads at runtime). {@link SimpleAsyncTaskExecutor} starts one thread per worker and has no
+ * bound of its own, so the permits are the thread bound as well.
  *
- * <p>The permit is taken by the CLAIM, before the row is stamped and long before the task is
- * submitted - never inside the task. That is what makes the platform-thread fallback safe:
- * {@link SimpleAsyncTaskExecutor} starts one thread per task and has no bound of its own, so the
- * permits are the only thing that limits how many threads exist. The task returns its permit when
- * its booking is done, and the release nudges the relay to fill the slot.
+ * <p>The queue holds at most {@code capacity} rows (the relay's {@code batch-size}): the relay
+ * claims only while the queue is at most half full, and then only up to the capacity - so a claim
+ * is never smaller than half a batch while a backlog lasts, and the other half keeps the slots busy
+ * while the claim runs. Crossing that half-way mark on the way down nudges the relay, and so does a
+ * worker running out of work. A queued row's lease runs while it waits: the send renews it first
+ * once it has waited a tenth of it (see {@code OutboxRelayWorker}).
  */
 @Slf4j
 class OutboxConcurrentLane {
 
   private final Semaphore permits;
+  private final int capacity;
+  private final int lowWater;
   private final SimpleAsyncTaskExecutor executor;
   private final boolean virtual;
-  private final AtomicReference<Runnable> onRelease = new AtomicReference<>(() -> {});
+  private final Queue<Runnable> queue = new ConcurrentLinkedQueue<>();
+  private final AtomicInteger queued = new AtomicInteger();
+  private final AtomicReference<Runnable> onRoom = new AtomicReference<>(() -> {});
+  private volatile boolean closed;
 
-  OutboxConcurrentLane(int maxInFlight, boolean virtual, Duration shutdownGrace) {
+  OutboxConcurrentLane(int maxInFlight, int capacity, boolean virtual, Duration shutdownGrace) {
     this.permits = new Semaphore(maxInFlight);
+    this.capacity = capacity;
+    this.lowWater = capacity / 2;
     this.virtual = virtual;
     this.executor = new SimpleAsyncTaskExecutor("opentmf-outbox-send-");
     executor.setDaemon(true);
@@ -41,25 +56,23 @@ class OutboxConcurrentLane {
     return virtual;
   }
 
-  /** Called after every released permit - the relay's nudge. */
-  void onRelease(Runnable callback) {
-    onRelease.set(callback);
+  /** Called when the queue drains to half its capacity or a worker runs out of work. */
+  void onRoom(Runnable callback) {
+    onRoom.set(callback);
   }
 
-  /** Takes one slot if one is free; the claim calls this BEFORE it stamps a CONCURRENT row. */
-  boolean tryAcquire() {
-    return permits.tryAcquire();
+  /**
+   * How many rows the relay may claim now: none while the queue is more than half full, else up to
+   * the capacity.
+   */
+  int room() {
+    int waiting = queued.get();
+    return waiting > lowWater ? 0 : capacity - waiting;
   }
 
-  /** Returns one slot and nudges the relay. */
-  void release() {
-    permits.release();
-    onRelease.get().run();
-  }
-
-  /** Returns slots taken by a claim that did not commit - no nudge, nothing was sent. */
-  void releaseUnused(int count) {
-    permits.release(count);
+  /** Rows claimed and waiting for a slot. */
+  int queued() {
+    return queued.get();
   }
 
   /** Free slots right now. */
@@ -68,27 +81,77 @@ class OutboxConcurrentLane {
   }
 
   /**
-   * Starts a send whose slot the claim already holds. A rejected start (the lane is closing)
-   * returns the slot; the row's lease then lapses and another relay takes it.
+   * Queues one claimed send behind those already waiting and starts a worker if a slot is free. A
+   * closed lane refuses it; the row's lease then lapses and a relay takes it again.
    *
-   * @return whether the send started
+   * @return whether the send was queued
    */
   boolean submit(Runnable send) {
-    try {
-      executor.execute(send);
-      return true;
-    } catch (TaskRejectedException ex) {
-      log.debug("Outbox send not started - the concurrent lane is closing", ex);
-      permits.release();
+    if (closed) {
       return false;
+    }
+    queued.incrementAndGet(); // first: a worker's poll never drives the count below zero
+    queue.add(send);
+    startWorkers();
+    return true;
+  }
+
+  /** One worker per free slot while sends wait. */
+  private void startWorkers() {
+    while (!closed && queued.get() > 0 && permits.tryAcquire()) {
+      try {
+        executor.execute(this::work);
+      } catch (TaskRejectedException ex) {
+        permits.release();
+        log.debug("Outbox send worker not started - the concurrent lane is closing", ex);
+        return;
+      }
     }
   }
 
   /**
-   * Stops taking sends and waits up to the shutdown grace for those in flight to finish and
-   * book; whatever is still running after that books nothing, and its lease lapses.
+   * A worker: sends one queued row after another, then returns its slot. A send queued between its
+   * last empty poll and the release found no free slot - so it looks once more, and starts the
+   * worker that send needs.
+   */
+  private void work() {
+    try {
+      for (Runnable send = poll(); send != null; send = poll()) {
+        send.run(); // never throws - the relay worker catches and logs
+      }
+    } finally {
+      permits.release();
+      startWorkers();
+      onRoom.get().run();
+    }
+  }
+
+  private Runnable poll() {
+    if (closed) {
+      return null;
+    }
+    Runnable send = queue.poll();
+    if (send != null && queued.decrementAndGet() == lowWater) {
+      onRoom.get().run(); // half drained: time for the next claim
+    }
+    return send;
+  }
+
+  /**
+   * Stops taking sends and waits up to the shutdown grace for those in flight to finish and book;
+   * queued rows are dropped unsent, and they - like whatever is still running after the grace - are
+   * redelivered once their leases lapse.
    */
   void close() {
+    closed = true;
+    int dropped = 0;
+    while (queue.poll() != null) {
+      dropped++;
+    }
+    queued.set(0);
+    if (dropped > 0) {
+      log.info("Outbox relay stopping - {} queued rows not sent; their leases lapse", dropped);
+    }
     executor.close();
   }
 }

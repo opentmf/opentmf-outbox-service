@@ -1,10 +1,11 @@
 package org.opentmf.outbox.internal;
 
 /**
- * The CONCURRENT lane's claim, as native SQL - constants, so {@link OutboxEventRepository} and
- * the plan test ({@code OutboxClaimPlanIT}) run the very same text. Two statements, chosen by the
- * caller: {@link #CONCURRENT} (keys above the round-robin cursor, plus rows without a key) and
- * {@link #CONCURRENT_WRAP} (keys up to the cursor). Each carries only plain comparisons on its
+ * The relay's claim and booking statements, as native SQL - constants, so
+ * {@link OutboxEventRepository} and the plan test ({@code OutboxClaimPlanIT}) run the very same
+ * text. The CONCURRENT lane's claim is two statements, chosen by the caller: {@link #CONCURRENT}
+ * (keys above the round-robin cursor, plus rows without a key) and {@link #CONCURRENT_WRAP} (keys
+ * up to the cursor). Each carries only plain comparisons on its
  * key bound - never an {@code OR} on a parameter - so the key range is an index condition under a
  * custom and a generic plan alike; the shape is the caller's, the planner is never relied on.
  *
@@ -144,13 +145,19 @@ final class OutboxClaimSql {
   static final int KEY_LOCK_NAMESPACE = 0x6f757478;
 
   /**
-   * Takes - never waits for - the transaction-scoped advisory lock of one ordering key, hashed by
-   * the DATABASE ({@code hashtext}), so every pod computes the same lock id whatever library
-   * version it runs. Held until the claim transaction commits, by which time the claim's leases
-   * are committed and visible. Two keys hashing alike only share a lock: one of them waits a
-   * pass, nothing is ever wrong.
+   * Tries - never waits for - the transaction-scoped advisory lock of EVERY candidate key in ONE
+   * statement (1.6.0; one statement per key before), and returns the keys it took. The keys come
+   * as an array literal and are unnested, so the statement reads no table at all and the lock is
+   * tried exactly once per key. Each key is hashed by the DATABASE ({@code hashtext}), so every pod
+   * computes the same lock id whatever library version it runs - a 1.5.x pod's single-key lock and
+   * this statement contend for the very same locks. Held until the claim transaction commits, by
+   * which time the claim's leases are committed and visible. Two keys hashing alike only share a
+   * lock: one of them waits a pass, nothing is ever wrong.
    */
-  static final String KEY_LOCK = "select pg_try_advisory_xact_lock(:namespace, hashtext(:key))";
+  static final String KEY_LOCKS =
+      """
+      select k.ordering_key from unnest(cast(:keys as varchar[])) as k (ordering_key)
+      where pg_try_advisory_xact_lock(:namespace, hashtext(k.ordering_key))""";
 
   /**
    * The re-check, in a NEW snapshot taken after the key locks: of the keyed candidates (given as
@@ -180,6 +187,35 @@ final class OutboxClaimSql {
             and (o.release_at is null or o.release_at <= :now)
             and o.next_attempt_on <= :now
             and (o.claimed_until is null or o.claimed_until <= :now))""";
+
+  /**
+   * Writes the lease of every claimed row that shares one lease end, in ONE statement (1.6.0; one
+   * flushed update per row before): {@code claimed_until} and {@code next_attempt_on} - the latter
+   * so a pre-1.3.0 relay sees a leased row as not due. The rows are already locked by the claim
+   * ({@code FOR UPDATE}); {@code id = any(...)} reads by primary key.
+   */
+  static final String STAMP =
+      """
+      update outbox set claimed_until = :stamp, next_attempt_on = :stamp
+      where id = any (cast(:ids as bigint[]))""";
+
+  /**
+   * The RELAYED booking in ONE statement (1.6.0; a locking read plus a flushed update before),
+   * guarded on the lease this holder stamped: it clears the lease and stamps {@code relayed_on} -
+   * and {@code next_attempt_on} with it, no longer the lease end - and returns the row it booked,
+   * or nothing when the lease lapsed and another holder re-stamped the row (or booked it). The
+   * {@code update} locks the row as the locking read did; a data-modifying {@code with} makes the
+   * statement a query, so the booked row comes back as a managed entity for the booking hook and
+   * the relayed listeners. A cancelled row is booked all the same - SENT-BUT-CANCELLED.
+   */
+  static final String BOOK_RELAYED =
+      """
+      with booked as (
+        update outbox set claimed_until = null, relayed_on = :relayedOn,
+          next_attempt_on = :relayedOn
+        where id = :id and claimed_until = :stamp
+        returning *)
+      select * from booked""";
 
   private OutboxClaimSql() {}
 }

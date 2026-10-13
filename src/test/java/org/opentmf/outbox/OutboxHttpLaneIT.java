@@ -286,8 +286,9 @@ class OutboxHttpLaneIT {
 
   /**
    * The cap under a burst: 20 rows to 20 receivers, every receiver holding its request - exactly
-   * {@code max-in-flight} (8) are ever in flight, the gauge says so, the rest are NOT leased
-   * (no lease burns in a queue), and all 20 relay once the receivers answer.
+   * {@code max-in-flight} (8) SENDS are ever in flight. Since 1.6.0 the claim runs ahead of the
+   * slots: the other 12 wait leased in the lane's hand-off queue (the in-flight gauge counts all
+   * 20 leases), and all 20 relay once the receivers answer.
    */
   @Test
   void theCap_holdsUnderABurst() {
@@ -302,10 +303,10 @@ class OutboxHttpLaneIT {
         .during(Duration.ofSeconds(2))
         .atMost(Duration.ofSeconds(5))
         .until(() -> HELD_NOW.get() == 8); // and it stays at the cap
-    assertThat(inFlightGauge()).isEqualTo(8d);
+    assertThat(inFlightGauge()).isEqualTo(20d); // eight sending, twelve queued - all leased
     assertThat(burst)
         .filteredOn(row -> maintenance.inspect(row.getId()).claimedUntil() != null)
-        .hasSize(8);
+        .hasSize(20);
 
     BURST_GATE.countDown();
     await()

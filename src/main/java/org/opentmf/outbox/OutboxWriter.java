@@ -134,7 +134,7 @@ public class OutboxWriter {
       stamper.stamp(event);
     }
     OutboxEvent saved = repository.save(event);
-    eventPublisher.publishEvent(new OutboxAppended(saved.getId()));
+    eventPublisher.publishEvent(new OutboxAppended(saved.getId(), saved.getLane()));
     return saved;
   }
 }

@@ -53,7 +53,7 @@ class OutboxWriterTests {
     assertThat(saved.getCreatedOn()).isNotNull();
     assertThat(saved.getNextAttemptOn()).isNotNull();
     assertThat(saved.getReleaseAt()).isNull(); // no hold = deliverable now
-    verify(events).publishEvent(new OutboxAppended(42L));
+    verify(events).publishEvent(new OutboxAppended(42L, null)); // no lane = ORDERED
   }
 
   @Test
@@ -99,7 +99,7 @@ class OutboxWriterTests {
     // the row is written due-now; eligibility is the claim predicate's job (release_at), so
     // the nudge is harmless - the relay simply finds nothing claimable
     assertThat(saved.getNextAttemptOn()).isBeforeOrEqualTo(OffsetDateTime.now());
-    verify(events).publishEvent(new OutboxAppended(42L));
+    verify(events).publishEvent(new OutboxAppended(42L, null)); // no lane = ORDERED
   }
 
   @Test
@@ -118,6 +118,8 @@ class OutboxWriterTests {
     OutboxEvent saved = stamping.append("agg", "a-1", "e.v1", "https://hub/x", Map.of());
 
     assertThat(saved.getLane()).isEqualTo(OutboxPublisher.Lane.CONCURRENT);
+    // the nudge names the lane: a CONCURRENT row does not arm the ORDERED claim
+    verify(events).publishEvent(new OutboxAppended(42L, OutboxPublisher.Lane.CONCURRENT));
   }
 
   @Test

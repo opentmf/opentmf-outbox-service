@@ -7,7 +7,9 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -39,11 +41,13 @@ import org.springframework.transaction.support.TransactionOperations;
  * consumer's dedup trivial. No database connection is held while a send is in flight.
  *
  * <p>The lane is the one STAMPED on the row at append (null = ORDERED) - it wins even if the
- * publisher would now name another. The CLAIM takes: ORDERED rows up to {@code batch-size};
- * CONCURRENT rows only as many as there are free lane slots (the slot is taken before the row is
- * stamped, so no lease burns in a queue), the query itself keeping a key from going into flight
- * twice. Neither lane's query reads the other lane's rows, so no backlog of one can hide a row of
- * the other.
+ * publisher would now name another. The CLAIM takes: ORDERED rows up to {@code batch-size} (when
+ * the relay says ORDERED rows may be due); CONCURRENT rows up to the lane's ROOM - ahead of its
+ * slots, into its hand-off queue of at most {@code batch-size} rows (1.6.0) - the query itself
+ * keeping a key from going into flight twice. Neither lane's query reads the other lane's rows, so
+ * no backlog of one can hide a row of the other. A claim's cost on the relay thread does not grow
+ * with the rows it takes (1.6.0): ONE statement tries every candidate key's advisory lock, ONE
+ * re-checks the locked candidates, and ONE stamps every lease of the same length.
  *
  * <p>The claim also moves {@code next_attempt_on} to the lease end: a pre-1.3.0 relay (which
  * knows no lease) then sees a leased row as not due during a rolling upgrade, and a lapsed lease
@@ -51,7 +55,9 @@ import org.springframework.transaction.support.TransactionOperations;
  *
  * <p>ORDERED rows are stamped with the SHORT ordered lease, and each row's lease is RENEWED in
  * the booking transaction of the row before it - so every lease covers one send, never the whole
- * batch; a row cancelled before its turn is released unsent.
+ * batch; a row cancelled before its turn is released unsent. A CONCURRENT row that waited in the
+ * hand-off queue for a tenth of its lease or longer is renewed the same way right before its send,
+ * so every send starts with at least nine tenths of its lease.
  *
  * <p>On failure: {@code attempts++}, {@code last_error} recorded, {@code next_attempt_on}
  * pushed out by the publisher's backoff (library exponential backoff by default); at the
@@ -78,145 +84,218 @@ class OutboxRelayWorker {
   private final OutboxMetrics metrics;
   private final OutboxProperties properties;
   private final List<OutboxRelayedListener> relayedListeners;
+  /** The claims and the ORDERED bookings: READ COMMITTED whatever the application's default. */
   private final TransactionOperations tx;
+
+  /**
+   * The CONCURRENT lane's bookings and renewals: the application's default isolation (1.6.0) -
+   * one guarded statement each, so the READ COMMITTED pin bought nothing there but a round trip.
+   */
+  private final TransactionOperations laneTx;
+
   private final OutboxConcurrentLane lane;
 
   /** The CONCURRENT claim's round-robin key cursor - read and moved on the relay thread only. */
   private String keyCursor = "";
 
-  /** One claimed row: its publisher and the lease value this holder stamped. */
+  /** One claimed row: its publisher, the lease value this holder stamped, and when. */
   static final class Leased {
     final OutboxEvent event;
     final OutboxPublisher publisher;
+    OffsetDateTime leasedAt;
     OffsetDateTime stamp;
     boolean lost;
 
-    Leased(OutboxEvent event, OutboxPublisher publisher, OffsetDateTime stamp) {
+    Leased(
+        OutboxEvent event,
+        OutboxPublisher publisher,
+        OffsetDateTime leasedAt,
+        OffsetDateTime stamp) {
       this.event = event;
       this.publisher = publisher;
+      this.leasedAt = leasedAt;
       this.stamp = stamp;
+    }
+
+    /** The committed lease, mirrored on the (now detached) row. */
+    void mirrorStamp() {
+      event.setClaimedUntil(stamp);
+      event.setNextAttemptOn(stamp); // a pre-1.3.0 relay sees the leased row as not due
     }
   }
 
-  private record Claim(List<Leased> ordered, List<Leased> concurrent) {}
+  /** One lane's claim: the rows leased, and whether the query came back full (more may wait). */
+  private record Claimed(List<Leased> rows, boolean full) {
+    static final Claimed NONE = new Claimed(List.of(), false);
+  }
+
+  /**
+   * One batch's outcome: the rows each lane claimed, and whether each lane's claim came back full
+   * - more rows may be due, and the relay claims again at once.
+   */
+  record Batch(int ordered, int concurrent, boolean orderedFull, boolean concurrentFull) {
+
+    /** The rows claimed over both lanes. */
+    int claimed() {
+      return ordered + concurrent;
+    }
+  }
 
   private record Attempt(Object result, RuntimeException failure) {}
 
   /**
-   * Claims one batch, starts its CONCURRENT sends and relays its ORDERED rows.
+   * Claims one batch, hands its CONCURRENT rows to the lane and relays its ORDERED rows.
    *
-   * @return the number of rows claimed - the relay drains while this reaches the batch size
+   * @param withOrdered whether to claim the ORDERED lane - the relay's word that ORDERED rows may
+   *     be due
    */
-  public int relayBatch() {
-    Claim claim = claim();
-    for (Leased row : claim.concurrent()) {
+  public Batch relayBatch(boolean withOrdered) {
+    Claimed ordered = withOrdered ? claimOrdered() : Claimed.NONE;
+    Claimed concurrent = claimConcurrent();
+    for (Leased row : concurrent.rows()) {
       if (!lane.submit(() -> relayConcurrent(row))) {
         log.info(
             "Outbox row {} not sent - the relay is stopping; its lease lapses",
             row.event.getId());
       }
     }
-    relayOrdered(claim.ordered());
-    return claim.ordered().size() + claim.concurrent().size();
+    relayOrdered(ordered.rows());
+    return new Batch(
+        ordered.rows().size(), concurrent.rows().size(), ordered.full(), concurrent.full());
   }
 
   // ---------------------------------------------------------------- claim
 
-  /**
-   * The two claims, each its own short transaction on the relay thread: ORDERED first (its
-   * failure fails the pass), then CONCURRENT - only when a lane slot is free. A failed CONCURRENT
-   * claim returns its slots and lets the ORDERED rows go on.
-   */
-  private Claim claim() {
-    List<Leased> ordered = tx.execute(status -> claimOrdered(now()));
-    List<Leased> concurrent = new ArrayList<>();
-    if (lane.available() > 0) {
-      try {
-        tx.executeWithoutResult(status -> claimConcurrent(now(), concurrent));
-      } catch (RuntimeException ex) {
-        lane.releaseUnused(concurrent.size()); // the stamps never committed
-        concurrent.clear();
-        log.error("Outbox CONCURRENT claim failed; the sweep will retry", ex);
-      }
-    }
-    return new Claim(ordered, concurrent);
+  /** The ORDERED claim, its own short transaction on the relay thread; its failure fails it. */
+  private Claimed claimOrdered() {
+    Claimed claimed = tx.execute(status -> claimOrdered(now()));
+    claimed.rows().forEach(Leased::mirrorStamp);
+    return claimed;
   }
 
-  private List<Leased> claimOrdered(OffsetDateTime now) {
-    List<Leased> ordered = new ArrayList<>();
-    for (OutboxEvent row :
-        repository.claimOrdered(now, Lane.CONCURRENT, Limit.of(properties.getBatchSize()))) {
+  /**
+   * The CONCURRENT claim, its own short transaction on the relay thread - only when the lane has
+   * room, and never more rows than that. A failed claim stamped nothing and lets the ORDERED rows
+   * go on.
+   */
+  private Claimed claimConcurrent() {
+    int room = lane.room();
+    if (room == 0) {
+      return Claimed.NONE;
+    }
+    try {
+      Claimed claimed = tx.execute(status -> claimConcurrent(now(), room));
+      claimed.rows().forEach(Leased::mirrorStamp);
+      return claimed;
+    } catch (RuntimeException ex) {
+      log.error("Outbox CONCURRENT claim failed; the sweep will retry", ex);
+      return Claimed.NONE;
+    }
+  }
+
+  private Claimed claimOrdered(OffsetDateTime now) {
+    int limit = properties.getBatchSize();
+    List<OutboxEvent> rows = repository.claimOrdered(now, Lane.CONCURRENT, Limit.of(limit));
+    List<Leased> leased = new ArrayList<>();
+    for (OutboxEvent row : rows) {
       OutboxPublisher publisher = route(row);
       if (publisher != null) {
-        ordered.add(stamp(row, publisher, Lane.ORDERED, now));
+        leased.add(lease(row, publisher, Lane.ORDERED, now));
       }
     }
-    return ordered;
+    stampAll(leased);
+    return new Claimed(leased, rows.size() >= limit);
   }
 
   /**
-   * Claims as many CONCURRENT rows as there are free slots: keys round-robin from the cursor
-   * (then wrapping round to the cursor), rows without a key in {@code id} order. The cursor
-   * moves to the last key claimed, so every key gets its turn whatever the others' backlogs.
+   * Claims up to {@code limit} CONCURRENT rows: keys round-robin from the cursor (then wrapping
+   * round to the cursor), rows without a key in {@code id} order. The cursor moves to the last
+   * key claimed, so every key gets its turn whatever the others' backlogs.
    */
-  private void claimConcurrent(OffsetDateTime now, List<Leased> concurrent) {
-    int free = lane.available();
-    List<OutboxEvent> rows = new ArrayList<>(repository.claimConcurrent(now, keyCursor, free));
+  private Claimed claimConcurrent(OffsetDateTime now, int limit) {
+    List<OutboxEvent> rows = new ArrayList<>(repository.claimConcurrent(now, keyCursor, limit));
     String lastKey = lastKey(rows);
-    if (rows.size() < free && !keyCursor.isEmpty()) {
+    if (rows.size() < limit && !keyCursor.isEmpty()) {
       List<OutboxEvent> wrapped =
-          repository.claimConcurrentWrap(now, keyCursor, free - rows.size());
+          repository.claimConcurrentWrap(now, keyCursor, limit - rows.size());
       String wrappedLast = lastKey(wrapped);
       lastKey = wrappedLast != null ? wrappedLast : lastKey;
       rows.addAll(wrapped);
     }
+    List<Leased> leased = new ArrayList<>();
     for (OutboxEvent row : acrossPods(rows, now)) {
       OutboxPublisher publisher = route(row);
-      if (publisher != null && lane.tryAcquire()) {
-        concurrent.add(stamp(row, publisher, Lane.CONCURRENT, now));
+      if (publisher != null) {
+        leased.add(lease(row, publisher, Lane.CONCURRENT, now));
       }
     }
+    stampAll(leased);
     if (lastKey != null) {
       keyCursor = lastKey;
     }
+    return new Claimed(leased, rows.size() >= limit);
   }
 
   /**
-   * The cross-pod guard of the keyed candidates (PostgreSQL advisory locks, by ruling): each key's
-   * transaction-scoped lock is TRIED - a key another pod is claiming right now is skipped this
-   * pass, never waited for - and the locked candidates are re-checked in a NEW snapshot, which
-   * sees every lease committed before the lock was released. Unkeyed candidates pass as they are.
-   * Rows of one key are thus never in flight together, within a pod and across pods.
+   * The cross-pod guard of the keyed candidates (PostgreSQL advisory locks, by ruling): ONE
+   * statement TRIES the transaction-scoped lock of every candidate key - a key another pod is
+   * claiming right now is skipped this pass, never waited for - and ONE re-checks the locked
+   * candidates in a NEW snapshot, which sees every lease committed before a lock was released.
+   * Unkeyed candidates pass as they are. Rows of one key are thus never in flight together, within
+   * a pod and across pods.
    */
   private List<OutboxEvent> acrossPods(List<OutboxEvent> candidates, OffsetDateTime now) {
-    List<OutboxEvent> keyed = new ArrayList<>();
-    Set<String> lockedKeys = new HashSet<>();
-    Set<String> refusedKeys = new HashSet<>();
-    for (OutboxEvent row : candidates) {
-      String key = row.getOrderingKey();
-      if (key == null || refusedKeys.contains(key)) {
-        continue;
-      }
-      if (lockedKeys.contains(key)
-          || repository.tryLockKey(OutboxClaimSql.KEY_LOCK_NAMESPACE, key)) {
-        lockedKeys.add(key);
-        keyed.add(row);
-      } else {
-        refusedKeys.add(key);
-      }
+    List<String> keys =
+        candidates.stream()
+            .map(OutboxEvent::getOrderingKey)
+            .filter(Objects::nonNull)
+            .distinct()
+            .toList();
+    if (keys.isEmpty()) {
+      return candidates;
     }
+    Set<String> locked =
+        new HashSet<>(repository.tryLockKeys(OutboxClaimSql.KEY_LOCK_NAMESPACE, keysLiteral(keys)));
+    List<OutboxEvent> keyed =
+        candidates.stream()
+            .filter(row -> row.getOrderingKey() != null && locked.contains(row.getOrderingKey()))
+            .toList();
     Set<Long> stillHeads =
         keyed.isEmpty()
             ? Set.of()
-            : new HashSet<>(repository.recheckKeyedHeads(now, arrayLiteral(keyed)));
+            : new HashSet<>(repository.recheckKeyedHeads(now, idsLiteral(keyed)));
     return candidates.stream()
         .filter(row -> row.getOrderingKey() == null || stillHeads.contains(row.getId()))
         .toList();
   }
 
-  private static String arrayLiteral(List<OutboxEvent> rows) {
+  /**
+   * Writes the leases of one claim: ONE statement per distinct lease end - a claim's rows share
+   * one unless their publishers declare different leases - never one per row. The rows are locked
+   * by the claim; the entities are left untouched here (no per-row flush) and mirror the stamp
+   * once the claim has committed.
+   */
+  private void stampAll(List<Leased> leased) {
+    Map<OffsetDateTime, List<OutboxEvent>> byStamp = new LinkedHashMap<>();
+    for (Leased row : leased) {
+      byStamp.computeIfAbsent(row.stamp, stamp -> new ArrayList<>()).add(row.event);
+    }
+    byStamp.forEach((stamp, rows) -> repository.stampLeases(stamp, idsLiteral(rows)));
+  }
+
+  private static String idsLiteral(List<OutboxEvent> rows) {
     return rows.stream()
         .map(row -> String.valueOf(row.getId()))
+        .collect(Collectors.joining(",", "{", "}"));
+  }
+
+  /**
+   * The keys as a PostgreSQL array literal: every element double-quoted, its backslashes and
+   * double quotes backslash-escaped - so any key (commas, braces, quotes, spaces) is one element.
+   */
+  static String keysLiteral(List<String> keys) {
+    return keys.stream()
+        .map(key -> '"' + key.replace("\\", "\\\\").replace("\"", "\\\"") + '"')
         .collect(Collectors.joining(",", "{", "}"));
   }
 
@@ -243,12 +322,9 @@ class OutboxRelayWorker {
     }
   }
 
-  private Leased stamp(
+  private Leased lease(
       OutboxEvent row, OutboxPublisher publisher, Lane rowLane, OffsetDateTime now) {
-    OffsetDateTime stamp = leaseEnd(row, publisher, rowLane, now);
-    row.setClaimedUntil(stamp);
-    row.setNextAttemptOn(stamp); // a pre-1.3.0 relay sees the leased row as not due
-    return new Leased(row, publisher, stamp);
+    return new Leased(row, publisher, now, leaseEnd(row, publisher, rowLane, now));
   }
 
   /** {@code now + lease}, truncated to the column's microsecond precision so the guard matches. */
@@ -264,18 +340,49 @@ class OutboxRelayWorker {
 
   // ---------------------------------------------------------------- lanes
 
+  /**
+   * One CONCURRENT row, on a lane worker: renewed first if it waited long in the hand-off queue,
+   * then sent and booked.
+   */
   private void relayConcurrent(Leased row) {
     try {
-      book(row, send(row), () -> NOTHING);
+      if (waitedLong(row) && !renewQueued(row)) {
+        return; // taken by another holder meanwhile, or cancelled and released unsent
+      }
+      book(laneTx, row, send(row), () -> NOTHING);
     } catch (RuntimeException ex) {
       log.error(
-          "Outbox row {} to {} - booking failed; the row is redelivered once its lease lapses",
+          "Outbox row {} to {} - renewal or booking failed; the row is redelivered once its"
+              + " lease lapses",
           row.event.getId(),
           row.event.getDestination(),
           ex);
-    } finally {
-      lane.release();
     }
+  }
+
+  /** Whether a queued row has waited a tenth of its lease or longer since it was leased. */
+  private static boolean waitedLong(Leased row) {
+    Duration lease = Duration.between(row.leasedAt, row.stamp);
+    return Duration.between(row.leasedAt, now()).compareTo(lease.dividedBy(10)) >= 0;
+  }
+
+  /**
+   * Renews a queued row's lease in its own short transaction, as the ORDERED lane renews the next
+   * row: guarded on the stamp; a row lost meanwhile is not sent, a cancelled one is released
+   * unsent.
+   *
+   * @return whether the row is still this holder's to send
+   */
+  private boolean renewQueued(Leased row) {
+    commit(
+        laneTx,
+        () -> {
+          List<Runnable> afterCommit = new ArrayList<>();
+          renew(row, Lane.CONCURRENT, afterCommit);
+          return () -> afterCommit.forEach(Runnable::run);
+        },
+        () -> NOTHING);
+    return !row.lost;
   }
 
   private void relayOrdered(List<Leased> ordered) {
@@ -286,7 +393,7 @@ class OutboxRelayWorker {
       }
       int index = i;
       try {
-        book(row, send(row), () -> renewNext(ordered, index));
+        book(tx, row, send(row), () -> renewNext(ordered, index));
       } catch (RuntimeException ex) {
         log.error(
             "Outbox row {} to {} - booking failed; it and the rest of the batch are redelivered"
@@ -309,13 +416,13 @@ class OutboxRelayWorker {
     boolean renewed = false;
     for (int j = index + 1; j < ordered.size() && !renewed; j++) {
       Leased next = ordered.get(j);
-      renewed = !next.lost && renew(next, afterCommit);
+      renewed = !next.lost && renew(next, Lane.ORDERED, afterCommit);
     }
     return () -> afterCommit.forEach(Runnable::run);
   }
 
   /** Renews one row's lease; {@code false} when the row is lost or cancelled (released). */
-  private boolean renew(Leased next, List<Runnable> afterCommit) {
+  private boolean renew(Leased next, Lane rowLane, List<Runnable> afterCommit) {
     Optional<OutboxEvent> held = repository.lockLeased(next.event.getId(), next.stamp);
     if (held.isEmpty()) {
       afterCommit.add(() -> next.lost = true);
@@ -328,10 +435,15 @@ class OutboxRelayWorker {
       log.info("Outbox row {} cancelled before its send - released unsent", row.getId());
       return false;
     }
-    OffsetDateTime renewed = leaseEnd(row, next.publisher, Lane.ORDERED, now());
+    OffsetDateTime now = now();
+    OffsetDateTime renewed = leaseEnd(row, next.publisher, rowLane, now);
     row.setClaimedUntil(renewed);
     row.setNextAttemptOn(renewed);
-    afterCommit.add(() -> next.stamp = renewed);
+    afterCommit.add(
+        () -> {
+          next.leasedAt = now;
+          next.stamp = renewed;
+        });
     return true;
   }
 
@@ -350,34 +462,39 @@ class OutboxRelayWorker {
    * and returns what to apply once it committed. A refused RELAYED booking (a hook or listener
    * threw - its writes roll back with the stamp) is booked as an ordinary failure instead.
    */
-  private void book(Leased row, Attempt attempt, Supplier<Runnable> alsoInTx) {
+  private void book(
+      TransactionOperations via, Leased row, Attempt attempt, Supplier<Runnable> alsoInTx) {
     RuntimeException failure = attempt.failure();
     if (failure == null) {
       try {
-        commit(() -> bookRelayed(row, attempt.result()), alsoInTx);
+        commit(via, () -> bookRelayed(row, attempt.result()), alsoInTx);
         return;
       } catch (RuntimeException refused) {
         failure = refused;
       }
     }
     RuntimeException failed = failure;
-    commit(() -> bookFailure(row, failed), alsoInTx);
+    commit(via, () -> bookFailure(row, failed), alsoInTx);
   }
 
-  private void commit(Supplier<Runnable> booking, Supplier<Runnable> alsoInTx) {
-    tx.execute(status -> List.of(booking.get(), alsoInTx.get())).forEach(Runnable::run);
+  private static void commit(
+      TransactionOperations via, Supplier<Runnable> booking, Supplier<Runnable> alsoInTx) {
+    via.execute(status -> List.of(booking.get(), alsoInTx.get())).forEach(Runnable::run);
   }
 
+  /**
+   * The RELAYED booking: ONE guarded statement (1.6.0) clears the lease and stamps
+   * {@code relayed_on} - {@code next_attempt_on} with it, no longer the lease end - and returns the
+   * row it booked, managed, for the hook and the listeners; an empty result means the lease lapsed.
+   */
   private Runnable bookRelayed(Leased leased, Object result) {
-    Optional<OutboxEvent> held = repository.lockLeased(leased.event.getId(), leased.stamp);
+    Optional<OutboxEvent> held =
+        repository.bookRelayed(leased.event.getId(), leased.stamp, now());
     if (held.isEmpty()) {
       logLapsed(leased);
       return NOTHING;
     }
     OutboxEvent row = held.get();
-    row.setClaimedUntil(null);
-    row.setRelayedOn(now());
-    row.setNextAttemptOn(row.getRelayedOn()); // no longer the lease end
     if (row.getCancelledOn() != null) {
       log.warn(
           "Outbox row {} to {} was cancelled after its lease lapsed mid-send and the send"
