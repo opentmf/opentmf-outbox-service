@@ -13,7 +13,7 @@
 
   <groupId>org.opentmf.util</groupId>
   <artifactId>opentmf-outbox-service</artifactId>
-  <version>1.5.1-SNAPSHOT</version>
+  <version>1.6.0-SNAPSHOT</version>
   <packaging>jar</packaging>
 
   <name>opentmf-outbox-service</name>
@@ -230,6 +230,13 @@
     <dependency>
       <groupId>org.testcontainers</groupId>
       <artifactId>testcontainers-kafka</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- OutboxRelayThroughputIT: a latency toxic on the database link, so the relay's round
+         trips cost what they cost on a loaded production database -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-toxiproxy</artifactId>
       <scope>test</scope>
     </dependency>
     <dependency>

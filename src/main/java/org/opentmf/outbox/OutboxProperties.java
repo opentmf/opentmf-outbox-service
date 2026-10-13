@@ -25,7 +25,11 @@ public class OutboxProperties {
   /** Fixed delay between relay sweep passes - the safety net behind the nudge. Default 5s. */
   @NotNull private Duration sweepInterval = Duration.ofSeconds(5);
 
-  /** Maximum rows claimed per relay batch. */
+  /**
+   * Maximum rows one claim takes per lane - and the CONCURRENT lane's hand-off queue: the relay
+   * claims CONCURRENT rows ahead of the slots, at most this many waiting at once (1.6.0). Default
+   * 100.
+   */
   @Positive private int batchSize = 100;
 
   /**
@@ -179,9 +183,10 @@ public class OutboxProperties {
   public static class Concurrent {
 
     /**
-     * Sends in flight at once, per relay. The claim takes only as many CONCURRENT rows as there
-     * are free slots, so no lease burns in a queue - and on platform threads this is also the
-     * thread bound. Default 8.
+     * Sends in flight at once, per relay - and on platform threads also the thread bound. The
+     * slots bound the SENDS, not the claim (1.6.0): the relay claims ahead into a hand-off queue
+     * of up to {@code batch-size} rows, and a row that waited there a tenth of its lease or longer
+     * is renewed before its send. Default 8.
      */
     @Positive private int maxInFlight = 8;
   }

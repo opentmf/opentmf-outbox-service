@@ -161,7 +161,7 @@ public class OutboxMaintenanceService {
     event.setParkedOn(null);
     event.setAttempts(0);
     event.setNextAttemptOn(OffsetDateTime.now(ZoneOffset.UTC));
-    eventPublisher.publishEvent(new OutboxAppended(outboxId));
+    eventPublisher.publishEvent(new OutboxAppended(outboxId, event.getLane()));
     log.info("Outbox row {} unparked - delivery will be retried", outboxId);
   }
 
@@ -210,7 +210,7 @@ public class OutboxMaintenanceService {
       left = done == batch;
     }
     if (unparked > 0) {
-      eventPublisher.publishEvent(new OutboxAppended(0)); // one nudge for the whole call
+      eventPublisher.publishEvent(new OutboxAppended(0, null)); // one nudge, both lanes
     }
     if (unparked > 0 || left) {
       log.info(

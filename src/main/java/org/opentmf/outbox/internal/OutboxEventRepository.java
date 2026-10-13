@@ -66,13 +66,13 @@ public interface OutboxEventRepository
    * eligibility over rows stamped CONCURRENT, plus the ORDERING-KEY rule - a keyed row is
    * claimable only as its key's first due row and only while no row of its key is in flight, and
    * its rows go in {@code id} order on the happy path; a row in backoff lets later rows of its
-   * key pass, as before. These rows are CANDIDATES: across pods the worker then takes each key's
-   * advisory lock ({@link #tryLockKey}) and re-checks them in a new snapshot
+   * key pass, as before. These rows are CANDIDATES: across pods the worker then tries the keys'
+   * advisory locks ({@link #tryLockKeys}) and re-checks them in a new snapshot
    * ({@link #recheckKeyedHeads}), so a key never has two rows in flight, within a pod or across
    * pods.
    *
    * @param after the round-robin cursor: only keys above it ({@code ""} = from the first key)
-   * @param limit rows to claim at most (the free lane slots)
+   * @param limit rows to claim at most (the lane's room)
    */
   @Query(value = OutboxClaimSql.CONCURRENT, nativeQuery = true)
   List<OutboxEvent> claimConcurrent(
@@ -87,13 +87,14 @@ public interface OutboxEventRepository
       @Param("now") OffsetDateTime now, @Param("until") String until, @Param("limit") int limit);
 
   /**
-   * Takes - never waits for - the claim transaction's advisory lock of one ordering key
-   * ({@link OutboxClaimSql#KEY_LOCK}).
+   * Tries - never waits for - the claim transaction's advisory lock of every candidate key, in ONE
+   * statement ({@link OutboxClaimSql#KEY_LOCKS}).
    *
-   * @return whether the lock was taken; {@code false} = another pod is claiming the key now
+   * @param keys the distinct candidate keys as a PostgreSQL array literal, e.g. {@code {"a","b"}}
+   * @return the keys locked; a key missing = another pod is claiming it now
    */
-  @Query(value = OutboxClaimSql.KEY_LOCK, nativeQuery = true)
-  boolean tryLockKey(@Param("namespace") int namespace, @Param("key") String key);
+  @Query(value = OutboxClaimSql.KEY_LOCKS, nativeQuery = true)
+  List<String> tryLockKeys(@Param("namespace") int namespace, @Param("keys") String keys);
 
   /**
    * Of the keyed candidates, those still claimable as their key's head with nothing of their key
@@ -103,6 +104,27 @@ public interface OutboxEventRepository
    */
   @Query(value = OutboxClaimSql.RECHECK, nativeQuery = true)
   List<Long> recheckKeyedHeads(@Param("now") OffsetDateTime now, @Param("ids") String ids);
+
+  /**
+   * Writes one lease end on every claimed row it names, in ONE statement
+   * ({@link OutboxClaimSql#STAMP}) - inside the claim transaction that locked them.
+   *
+   * @param ids the rows as a PostgreSQL array literal, e.g. {@code {7,12}}
+   */
+  @Modifying
+  @Query(value = OutboxClaimSql.STAMP, nativeQuery = true)
+  int stampLeases(@Param("stamp") OffsetDateTime stamp, @Param("ids") String ids);
+
+  /**
+   * The RELAYED booking in ONE statement ({@link OutboxClaimSql#BOOK_RELAYED}), guarded on the
+   * lease this holder stamped: the booked row, managed - or empty when the lease lapsed and
+   * another holder re-stamped the row (or booked it), and the caller books nothing.
+   */
+  @Query(value = OutboxClaimSql.BOOK_RELAYED, nativeQuery = true)
+  Optional<OutboxEvent> bookRelayed(
+      @Param("id") long id,
+      @Param("stamp") OffsetDateTime stamp,
+      @Param("relayedOn") OffsetDateTime relayedOn);
 
   /**
    * The LEASE GUARD: the row under a waiting {@code for update} lock, but only while it still

@@ -12,6 +12,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import liquibase.command.CommandScope;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer.OrderAnnotation;
@@ -43,11 +45,20 @@ class OutboxClaimPlanIT {
   static final PostgreSQLContainer postgres =
       new PostgreSQLContainer("postgres:18.1-alpine3.22");
 
-  /** The claim's slot count in every case (the default {@code max-in-flight}). */
+  /** The claim's row limit in most cases (1.5.x took as many rows as free slots, default 8). */
   private static final int LIMIT = 8;
 
   /** Measured 2-131 at 5M relayed rows; the 1.3.0 first cut read 508,427. */
   private static final long BUFFER_BOUND = 400;
+
+  /**
+   * A FULL claim since 1.6.0: up to {@code batch-size} (default 100) rows, ahead of the slots -
+   * the lane's hand-off queue.
+   */
+  private static final int FULL_BATCH = 100;
+
+  /** The bound of a full batch's claim: the same shape, more heads - linear in the rows taken. */
+  private static final long FULL_BATCH_BUFFER_BOUND = 2_500;
 
   private static final Pattern NAMED = Pattern.compile("(?<!:):(\\w+)");
 
@@ -64,8 +75,11 @@ class OutboxClaimPlanIT {
           Map.entry("parkedTo", "timestamptz"),
           Map.entry("reference", "varchar"),
           Map.entry("namespace", "int"),
-          Map.entry("key", "varchar"),
-          Map.entry("ids", "varchar"));
+          Map.entry("keys", "varchar"),
+          Map.entry("ids", "varchar"),
+          Map.entry("id", "bigint"),
+          Map.entry("stamp", "timestamptz"),
+          Map.entry("relayedOn", "timestamptz"));
 
   private static final List<String> PLAN_MODES = List.of("force_custom_plan", "force_generic_plan");
 
@@ -143,25 +157,40 @@ class OutboxClaimPlanIT {
   }
 
   private static JsonNode explainClaim(String planMode, String after) throws Exception {
+    return explainClaim(planMode, after, LIMIT);
+  }
+
+  private static JsonNode explainClaim(String planMode, String after, int limit)
+      throws Exception {
     return explain(
         OutboxClaimSql.CONCURRENT,
         planMode,
-        Map.of("now", "now()", "after", "'" + after + "'", "limit", String.valueOf(LIMIT)));
+        Map.of("now", "now()", "after", "'" + after + "'", "limit", String.valueOf(limit)));
   }
 
   private static JsonNode explainWrap(String planMode, String until) throws Exception {
+    return explainWrap(planMode, until, LIMIT);
+  }
+
+  private static JsonNode explainWrap(String planMode, String until, int limit)
+      throws Exception {
     return explain(
         OutboxClaimSql.CONCURRENT_WRAP,
         planMode,
-        Map.of("now", "now()", "until", "'" + until + "'", "limit", String.valueOf(LIMIT)));
+        Map.of("now", "now()", "until", "'" + until + "'", "limit", String.valueOf(limit)));
   }
 
   /** The claim of both statements' cases under both plan modes: rows claimed, per mode. */
   private static List<Long> claimedUnderBothModes(Callable<String, JsonNode> claim)
       throws Exception {
+    return claimedUnderBothModes(claim, LIMIT, BUFFER_BOUND);
+  }
+
+  private static List<Long> claimedUnderBothModes(
+      Callable<String, JsonNode> claim, int limit, long bufferBound) throws Exception {
     List<Long> claimed = new ArrayList<>();
     for (String mode : PLAN_MODES) {
-      claimed.add(assertBoundedClaim(mode, claim.call(mode)));
+      claimed.add(assertBoundedClaim(mode, claim.call(mode), limit, bufferBound));
     }
     return claimed;
   }
@@ -186,7 +215,8 @@ class OutboxClaimPlanIT {
    * The shape every case must keep: no sequential scan of the table, the primary key used only
    * to fetch the rows claimed, and a fixed, small buffer count. Returns the claimed row count.
    */
-  private static long assertBoundedClaim(String planMode, JsonNode explained) {
+  private static long assertBoundedClaim(
+      String planMode, JsonNode explained, int limit, long bufferBound) {
     JsonNode plan = explained.get("Plan");
     List<JsonNode> all = nodes(plan, new ArrayList<>());
     // the key range is an INDEX CONDITION under either plan mode, never a filter over a backlog
@@ -196,7 +226,7 @@ class OutboxClaimPlanIT {
         .allSatisfy(
             n ->
                 assertThat(n.path("Rows Removed by Filter").asLong(0))
-                    .isLessThanOrEqualTo(LIMIT));
+                    .isLessThanOrEqualTo(limit));
     assertThat(all)
         .noneMatch(
             n ->
@@ -206,7 +236,7 @@ class OutboxClaimPlanIT {
         .filteredOn(n -> "outbox_pkey".equals(n.path("Index Name").asString(null)))
         .allSatisfy(
             n -> {
-              assertThat(n.get("Actual Loops").asLong()).isLessThanOrEqualTo(LIMIT);
+              assertThat(n.get("Actual Loops").asLong()).isLessThanOrEqualTo(limit);
               // the locked row is re-checked against the WHOLE eligibility predicate
               assertThat(n.path("Filter").asString(""))
                   .contains("next_attempt_on <=")
@@ -215,9 +245,12 @@ class OutboxClaimPlanIT {
                   .contains("parked_on IS NULL");
             });
     long buffers = plan.get("Shared Hit Blocks").asLong() + plan.get("Shared Read Blocks").asLong();
+    System.out.printf(
+        "PLAN-FIGURES: claim of %d | %s %d buffers %.2f ms%n",
+        limit, planMode, buffers, explained.get("Execution Time").asDouble());
     assertThat(buffers)
         .as("%s: buffers read by one claim", planMode)
-        .isLessThanOrEqualTo(BUFFER_BOUND);
+        .isLessThanOrEqualTo(bufferBound);
     return plan.get("Actual Rows").asLong();
   }
 
@@ -283,6 +316,32 @@ class OutboxClaimPlanIT {
     assertThat(claimedUnderBothModes(mode -> explainClaim(mode, "hub:k5000"))).containsOnly(8L);
     // the wrap: keys up to the cursor (string order - "hub:k1000" would bound it to five keys)
     assertThat(claimedUnderBothModes(mode -> explainWrap(mode, "hub:k5"))).containsOnly(8L);
+  }
+
+  /**
+   * 1.6.0 claims ahead of the slots - a FULL batch of {@value #FULL_BATCH} heads on the same data:
+   * the same shape (key range an index condition, the primary key only for the rows claimed, no
+   * scan), the buffers linear in the rows taken.
+   */
+  @Test
+  @Order(6)
+  void tenThousandKeysOfTenRows_aFullBatch_fromAnyCursor() throws Exception {
+    assertThat(
+            claimedUnderBothModes(
+                mode -> explainClaim(mode, "", FULL_BATCH), FULL_BATCH, FULL_BATCH_BUFFER_BOUND))
+        .containsOnly((long) FULL_BATCH);
+    assertThat(
+            claimedUnderBothModes(
+                mode -> explainClaim(mode, "hub:k5000", FULL_BATCH),
+                FULL_BATCH,
+                FULL_BATCH_BUFFER_BOUND))
+        .containsOnly((long) FULL_BATCH);
+    assertThat(
+            claimedUnderBothModes(
+                mode -> explainWrap(mode, "hub:k5", FULL_BATCH),
+                FULL_BATCH,
+                FULL_BATCH_BUFFER_BOUND))
+        .containsOnly((long) FULL_BATCH);
   }
 
   // ------------------------------------------------------------ gauges and prune (F-1, F-2)
@@ -459,9 +518,9 @@ class OutboxClaimPlanIT {
   /**
    * The cross-pod guard's two extra statements, on the 10,000-key data with one key's head in
    * flight: the RE-CHECK of a full claim's candidates reads the primary key and the two key-side
-   * indexes - never a sequential scan - under both plan modes; the KEY LOCK is a function call
-   * that reads nothing. Their cost per claim is printed (the claim statements themselves are
-   * unchanged, so their pins above stand as they are).
+   * indexes - never a sequential scan - under both plan modes; the KEY LOCKS of a full batch's
+   * keys (one statement, 1.6.0) unnest an array and read no table. Their cost per claim is
+   * printed.
    */
   @Test
   @Order(7)
@@ -488,23 +547,70 @@ class OutboxClaimPlanIT {
         OutboxClaimSql.RECHECK,
         Map.of("now", "now()", "ids", "'" + ids + "'"),
         List.of("outbox_pkey", "ix_outbox_claimed_until", "ix_outbox_concurrent_keyed"));
+    String keys =
+        IntStream.range(0, FULL_BATCH)
+            .mapToObj(k -> "\"hub:k" + k + "\"")
+            .collect(Collectors.joining(",", "{", "}"));
     for (String mode : PLAN_MODES) {
       JsonNode lock =
           explain(
-              OutboxClaimSql.KEY_LOCK,
+              OutboxClaimSql.KEY_LOCKS,
               mode,
               Map.of(
                   "namespace", String.valueOf(OutboxClaimSql.KEY_LOCK_NAMESPACE),
-                  "key", "'hub:k2'"));
+                  "keys", "'" + keys + "'"));
       JsonNode plan = lock.get("Plan");
       assertThat(nodes(plan, new ArrayList<>()))
           .noneMatch(n -> "outbox".equals(n.path("Relation Name").asString(null)));
+      assertThat(plan.get("Actual Rows").asLong()).isEqualTo(FULL_BATCH); // every key, once
       System.out.println(
-          "PLAN-FIGURES: key lock | %s %d buffers %.3f ms"
+          "PLAN-FIGURES: key locks of %d keys | %s %d buffers %.3f ms"
               .formatted(
+                  FULL_BATCH,
                   mode,
                   plan.get("Shared Hit Blocks").asLong() + plan.get("Shared Read Blocks").asLong(),
                   lock.get("Execution Time").asDouble()));
     }
+  }
+
+  /**
+   * The two set-based writes of 1.6.0, under both plan modes: the STAMP of a full batch's leases
+   * and the one-statement RELAYED booking reach their rows by primary key alone - never a scan,
+   * never another index.
+   */
+  @Test
+  @Order(8)
+  void theStampAndTheRelayedBooking_writeByPrimaryKeyOnly() throws Exception {
+    String ids;
+    String oneId;
+    try (Connection c = connect();
+        Statement st = c.createStatement();
+        ResultSet rs =
+            st.executeQuery(
+                "select '{' || string_agg(id::text, ',') || '}', min(id) from (select min(id) id"
+                    + " from outbox where relayed_on is null and lane = 'CONCURRENT'"
+                    + " group by ordering_key order by ordering_key limit "
+                    + FULL_BATCH
+                    + ") h")) {
+      rs.next();
+      ids = rs.getString(1);
+      oneId = rs.getString(2);
+    }
+    execute(
+        "update outbox set claimed_until = timestamptz '2100-01-01 00:00:00+00' where id = "
+            + oneId);
+    assertIndexedOnly(
+        "stamp of a full batch",
+        OutboxClaimSql.STAMP,
+        Map.of("stamp", "now() + interval '15 seconds'", "ids", "'" + ids + "'"),
+        List.of("outbox_pkey"));
+    assertIndexedOnly(
+        "relayed booking",
+        OutboxClaimSql.BOOK_RELAYED,
+        Map.of(
+            "id", oneId,
+            "stamp", "timestamptz '2100-01-01 00:00:00+00'",
+            "relayedOn", "now()"),
+        List.of("outbox_pkey"));
   }
 }

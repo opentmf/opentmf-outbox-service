@@ -1,5 +1,103 @@
 # Changelog
 
+## 1.6.0 - 2026-10-13
+
+The relay's claim cadence: one pod moves an order of magnitude more CONCURRENT rows, and
+`concurrent.max-in-flight` finally governs the lane's throughput.
+
+### Changed (behaviour - read before upgrading)
+
+- **The CONCURRENT claim runs ahead of the slots** (OUTBOX-RELAY-CLAIM-CADENCE-1). On the
+  load box (dnms-flow at 25 req/s, about 400 outbox rows/s produced), one pod relayed about
+  110 rows/s whatever `concurrent.max-in-flight` said: 8 and 64 slots gave the same rate.
+  Kafka answered in 1.5 ms, every statement took under 10 ms, and GC was idle. With intake
+  off the same relay drained at 250 rows/s. The relay thread was the limit. For every row
+  it claimed it paid two statements: a `pg_try_advisory_xact_lock` call per key and a
+  flushed update per stamped row. It also claimed only as many rows as there were free
+  slots. Throughput was therefore about 1 / (2 × statement time).
+  - The relay now claims CONCURRENT rows into the lane's **hand-off queue**. Whenever the
+    queue is at most half full, it tops it back up to `batch-size` rows. `max-in-flight`
+    workers send the rows in claim order, so the slots bound the sends, not the claim.
+  - **One statement per claim**, whatever the row count:
+    - one tries every candidate key's advisory lock (`OutboxClaimSql.KEY_LOCKS`);
+    - one re-checks the locked candidates, as before;
+    - one stamps every lease of the same length (`OutboxClaimSql.STAMP`).
+
+    The lock statement unnests an array and reads no table. It takes the same lock ids
+    as before (`hashtext` of the key, same namespace), so 1.5.x and 1.6.0 pods contend
+    for the same locks during a rolling deploy.
+  - A **RELAYED booking is one guarded statement** (`OutboxClaimSql.BOOK_RELAYED`, an
+    `update … returning` in a data-modifying `with`). Before, it was a locking read plus a
+    flushed update. The booked row still comes back managed, for the booking hook and the
+    relayed listeners, which now also see `relayed_on` in the database inside the booking
+    transaction.
+  - Measured by `OutboxRelayThroughputIT`: 10,000 pending CONCURRENT rows over 5,000
+    keys, a 1 ms publisher, ONE relay, and every statement answered 5 ms late (a Toxiproxy
+    latency toxic on the database link). Every run also checks that no key had two sends
+    overlapping and that each key's rows went in `id` order.
+
+    | `max-in-flight` | 1.5.0 | 1.6.0 |
+    |---|---|---|
+    | 8 (the default) | 49 rows/s (202.8 s) | 562 rows/s (17.8 s) |
+    | 64 | 79 rows/s (127.3 s) | 1,520 rows/s (6.6 s) |
+- **A queued row's lease.** A row waiting in the hand-off queue holds its lease. One that
+  waited **a tenth of its lease or longer is renewed right before its send**, guarded on
+  its stamp like the ORDERED lane's renewal:
+  - a row another relay took meanwhile is not sent;
+  - a cancelled row is released unsent.
+
+  Every CONCURRENT send therefore starts with at least nine tenths of its lease. On the
+  fast path, where the queue drains in milliseconds, nothing extra happens.
+- **The ORDERED claim runs only when ORDERED rows may be due.** That means: after a row of
+  that lane (or of no known lane) was appended or unparked in this pod, after an ORDERED
+  claim that came back full, on the first pass, and on every sweep. A CONCURRENT-only
+  deployment pays one claim per pass instead of two. The sweep picks up what no nudge
+  announces: an ORDERED retry come due, a lapsed ORDERED lease, a row another pod appended
+  and could not relay. Under load these are now picked up within `sweep-interval`
+  (default 5 s) rather than on the next pass. Nudges coalesce as before: any number during
+  a pass make ONE follow-up pass, and `OutboxRelayTests` now pins that.
+- **Isolation: the CONCURRENT lane's bookings and renewals run at the application's
+  default isolation.** The claims and the ORDERED bookings keep the READ COMMITTED pin
+  (coordinator ruling, 2026-10-13):
+  - The pin exists for the claim's re-check, which must see, in a new snapshot, leases
+    another pod committed.
+  - An ORDERED booking renews the next row in the same transaction, so a serialization
+    error there would roll back a delivered row's booking.
+  - The pin cost a `SHOW TRANSACTION ISOLATION LEVEL` round trip per transaction: the
+    driver reads the current level from the server before setting it. That was a third
+    of a CONCURRENT row's booking.
+
+  The default is READ COMMITTED on PostgreSQL. A consumer that runs another default
+  pays a serialization-error path on a lease race (a relay re-taking the row after its
+  lease lapsed), never a wrong booking: the booking falls through to the failure path,
+  which finds the lease gone and books nothing. `OutboxLaneBookingStatementsIT` reads
+  PostgreSQL's statement log and pins both sides:
+  - a CONCURRENT booking is `BEGIN`, one `update … returning`, `COMMIT`;
+  - the claim still opens with the `SHOW`.
+- **The `in-flight` gauge** counts CONCURRENT rows waiting in a hand-off queue (they hold a
+  lease). Under load it reads up to `batch-size` higher per pod than on 1.5.x.
+- **Shutdown** drops the rows still queued unsent. Like any send that outlives the
+  shutdown grace, they are redelivered once their leases lapse.
+
+### Added
+
+- `OutboxRelayThroughputIT` (the figures above), `OutboxLaneBookingStatementsIT`, and pins
+  in `OutboxClaimPlanIT` for:
+  - a full 100-row claim: 7 ms, 1,314 buffers under both plan modes;
+  - the one-statement key locks: 0.5 ms, no table read;
+  - the stamp: 2–3 ms;
+  - the RELAYED booking: 0.4 ms, 15 buffers.
+- Test-scoped `org.testcontainers:testcontainers-toxiproxy` (BOM-managed).
+
+**Compatibility.**
+- No schema change, no new changeset.
+- No property added or renamed:
+  - `batch-size` now also sizes the CONCURRENT hand-off queue;
+  - `concurrent.max-in-flight` is now the lane's throughput lever. Each sending slot holds
+    a connection while it books, so size the connection pool above `max-in-flight` + 2.
+- Mixed 1.5.x / 1.6.0 pods share the lock ids and the lease columns, so per-key order
+  holds across them during a rolling deploy.
+
 ## 1.5.0 - 2026-10-09
 
 Per-aggregate Kafka order across several relays.

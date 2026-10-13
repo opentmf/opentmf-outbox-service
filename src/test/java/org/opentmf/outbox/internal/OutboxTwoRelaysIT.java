@@ -17,7 +17,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxProperties;
@@ -34,7 +33,6 @@ import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.data.domain.Limit;
 import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionCallback;
 import org.springframework.transaction.support.TransactionOperations;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -295,7 +293,7 @@ class OutboxTwoRelaysIT {
     List<Long> rows = new ArrayList<>(seed("conc:race", 30));
     rows.addAll(seed("ord:race", 30));
     OutboxConcurrentLane secondLane =
-        new OutboxConcurrentLane(4, false, Duration.ofSeconds(5));
+        new OutboxConcurrentLane(4, properties.getBatchSize(), false, Duration.ofSeconds(5));
     OutboxRelayWorker secondPod =
         new OutboxRelayWorker(
             repository,
@@ -304,6 +302,7 @@ class OutboxTwoRelaysIT {
             metrics,
             properties,
             listeners,
+            new TransactionTemplate(txManager),
             new TransactionTemplate(txManager),
             secondLane);
     ExecutorService pods = Executors.newFixedThreadPool(2);
@@ -334,7 +333,7 @@ class OutboxTwoRelaysIT {
 
   private void drain(OutboxRelayWorker relay, List<Long> rows, long deadline) {
     while (System.nanoTime() < deadline && !rows.stream().allMatch(BOOKED::containsKey)) {
-      relay.relayBatch();
+      relay.relayBatch(true);
       Thread.onSpinWait();
     }
   }
@@ -367,20 +366,16 @@ class OutboxTwoRelaysIT {
 
     @Override
     public <T> T execute(TransactionCallback<T> action) {
-      return template.execute(action);
-    }
-
-    @Override
-    public void executeWithoutResult(Consumer<TransactionStatus> action) {
-      template.executeWithoutResult(
+      return template.execute(
           status -> {
-            action.accept(status);
+            T result = action.doInTransaction(status);
             if (armed) {
               armed = false;
               entityManager.flush(); // the stamps are written, NOT committed
               paused.countDown();
               awaitLatch(resume);
             }
+            return result;
           });
     }
   }
@@ -404,11 +399,13 @@ class OutboxTwoRelaysIT {
                   return new long[] {first.getId(), second.getId()};
                 });
     PausableClaim podATx = new PausableClaim(new TransactionTemplate(txManager), entityManager);
-    OutboxConcurrentLane laneA = new OutboxConcurrentLane(4, false, Duration.ofSeconds(5));
-    OutboxConcurrentLane laneB = new OutboxConcurrentLane(4, false, Duration.ofSeconds(5));
+    OutboxConcurrentLane laneA =
+        new OutboxConcurrentLane(4, properties.getBatchSize(), false, Duration.ofSeconds(5));
+    OutboxConcurrentLane laneB =
+        new OutboxConcurrentLane(4, properties.getBatchSize(), false, Duration.ofSeconds(5));
     OutboxRelayWorker podA =
         new OutboxRelayWorker(
-            repository, router, backoff, metrics, properties, listeners, podATx, laneA);
+            repository, router, backoff, metrics, properties, listeners, podATx, podATx, laneA);
     OutboxRelayWorker podB =
         new OutboxRelayWorker(
             repository,
@@ -418,22 +415,24 @@ class OutboxTwoRelaysIT {
             properties,
             listeners,
             new TransactionTemplate(txManager),
+            new TransactionTemplate(txManager),
             laneB);
     ExecutorService pods = Executors.newSingleThreadExecutor();
     try {
       podATx.armed = true;
-      Future<Integer> claimA = pods.submit(podA::relayBatch); // claims row 2, held open
+      // A's CONCURRENT claim (no ORDERED one first) takes row 2 and is held open
+      Future<OutboxRelayWorker.Batch> claimA = pods.submit(() -> podA.relayBatch(false));
       awaitLatch(podATx.paused);
       await() // row 1's backoff passes while A's claim is still open
           .atMost(Duration.ofSeconds(5))
           .until(() -> OffsetDateTime.now().isAfter(nextAttempt(ids[0]).plusNanos(200_000_000)));
 
-      podB.relayBatch(); // the window: must not take row 1 now
+      podB.relayBatch(true); // the window: must not take row 1 now
 
       podATx.resume.countDown(); // A commits its lease on row 2
       claimA.get(20, TimeUnit.SECONDS);
       await().atMost(Duration.ofSeconds(5)).until(() -> KEYED_SENT.contains(ids[1]));
-      podB.relayBatch(); // B's next pass: the key is in flight - row 1 still waits
+      podB.relayBatch(true); // B's next pass: the key is in flight - row 1 still waits
       await()
           .during(Duration.ofSeconds(1))
           .atMost(Duration.ofSeconds(2))

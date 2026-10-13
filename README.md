@@ -100,7 +100,7 @@ sequenceDiagram
     participant DB as outbox table
     participant T as OutboxRelayTrigger
     participant R as OutboxRelay (1 thread)
-    participant L as CONCURRENT lane (≤ max-in-flight)
+    participant L as CONCURRENT lane (queue → ≤ max-in-flight)
     participant Pub as OutboxPublisher SPI
     participant K as Kafka / HTTP endpoint
 
@@ -110,10 +110,10 @@ sequenceDiagram
     DB-->>T: AFTER_COMMIT event
     T->>R: poke (normal path, milliseconds)
     Note over R: a fixed-delay sweep (default 5s)<br/>is the safety net for missed pokes
-    R->>DB: CLAIM tx — stamp claimed_until = now + lease, COMMIT
-    R->>L: CONCURRENT rows (slot taken before the stamp)
+    R->>DB: CLAIM tx — one statement stamps claimed_until = now + lease, COMMIT
+    R->>L: CONCURRENT rows into the hand-off queue (≤ batch-size)
     R->>Pub: ORDERED rows, one by one, id order
-    L->>Pub: one send per (virtual) thread
+    L->>Pub: ≤ max-in-flight workers, one send at a time each
     Pub->>K: deliver — NO transaction, NO connection held
     K-->>Pub: ack
     Pub->>DB: BOOKING tx — guarded on the stamped lease:<br/>relayed_on + publisher hook + listeners, COMMIT
@@ -155,14 +155,36 @@ sequenceDiagram
   15 s for ORDERED, which must exceed `send-timeout`). Each ORDERED row's lease
   is renewed in the booking of the row before it, so it covers one send, never
   the batch.
-- **The CONCURRENT claim takes only free slots.** The slot (permit) is taken by
-  the claim before it stamps a row, never inside the send task, so no lease
-  burns while a row waits in a queue. On a JDK 21+ runtime with
-  `spring.threads.virtual.enabled=true` the sends run on virtual threads. Any
-  other runtime uses platform threads, and that fallback is safe only because
-  of this ordering: Spring's `SimpleAsyncTaskExecutor` starts one thread per
-  task, so `max-in-flight` is also the thread bound. The library's bytecode
-  stays on Java 17.
+- **The CONCURRENT claim runs ahead of the slots (1.6.0).** The relay claims
+  CONCURRENT rows into the lane's **hand-off queue**: whenever the queue is at
+  most half full, back up to `batch-size` rows. `max-in-flight` workers take
+  them one after another in claim order, so the slots bound the **sends**,
+  never the claim. A queued row's lease runs while it waits. A row that waited
+  **a tenth of its lease or longer is renewed right before its send**, guarded
+  on its stamp like the ORDERED renewal: a row another relay took meanwhile is
+  not sent, and a cancelled one is released unsent. Every send therefore
+  starts with at least nine tenths of its lease; on the fast path (a queue that
+  drains in milliseconds) nothing extra happens. Until 1.5.x the claim took
+  only free slots. A slot freed by a fast send then made a claim of a row or
+  two, and the relay thread paid two statements per row it claimed — the
+  cadence that capped a pod at about 110 rows/s whatever `max-in-flight` was
+  (see "Relay throughput"). Threads: on a JDK 21+ runtime with
+  `spring.threads.virtual.enabled=true` the workers run on virtual threads. Any
+  other runtime uses platform threads, which is safe because each permit is one
+  worker thread (Spring's `SimpleAsyncTaskExecutor` has no bound of its own),
+  so `max-in-flight` is also the thread bound. The library's bytecode stays on
+  Java 17.
+- **Relay passes (1.6.0).** One single-threaded relay per pod. Nudges coalesce:
+  however many arrive during a pass — after-commit pokes, room in the hand-off
+  queue — they make ONE follow-up pass. A pass keeps claiming while a lane's
+  claim comes back full (the CONCURRENT lane only while its queue has room).
+  **The ORDERED claim runs only when ORDERED rows may be due**: after a row of
+  that lane (or of no known lane) was appended or unparked in this pod, after
+  an ORDERED claim that came back full, and on every sweep. The sweep picks up
+  what no nudge announces: an ORDERED retry come due, a lapsed lease, a row
+  another pod appended and could not relay. A CONCURRENT-only deployment
+  therefore pays one claim per pass, not two, and an ORDERED retry is picked
+  up within `sweep-interval` of coming due (as on an idle relay before).
 - **Ordering at one replica** therefore means: ORDERED rows in `id` order,
   CONCURRENT rows in `id` order per ordering key. **Across replicas**
   `FOR UPDATE SKIP LOCKED` plus the lease is the guard: two pods never take
@@ -176,7 +198,16 @@ sequenceDiagram
   taken and a re-check in a fresh snapshot still finds it the key's head with
   nothing of its key in flight. A pod that loses the lock skips the key for
   one pass and sees the other pod's committed lease on the next. The claim
-  transactions run READ COMMITTED whatever the application's default.
+  transactions (and the ORDERED bookings, which renew the next row in the same
+  transaction) run READ COMMITTED whatever the application's default. **The
+  CONCURRENT lane's bookings and renewals run at the application's default
+  isolation (1.6.0)**: each is one guarded statement whose snapshot starts with
+  it, and the pin cost a round trip per row (the driver asks the server for
+  the current level before setting it). The default is READ COMMITTED on
+  PostgreSQL. A consumer that runs another default pays a serialization-error
+  path on a lease race — a relay re-taking the row after its lease lapsed —
+  never a wrong booking: the booking falls through to the failure path, which
+  finds the lease gone and books nothing, exactly as READ COMMITTED would.
 - **Running several relays with Kafka (1.5.0).** With more than one pod, the
   default Kafka publisher's ORDERED lane can publish one aggregate's rows out
   of order: pod A sends row 3 while pod B sends row 7 of the same aggregate,
@@ -233,24 +264,37 @@ sequenceDiagram
   rows of its key pass. A held row waits for its hold; a cancelled or parked
   row never comes back on its own.
 - **What a claim costs.** Both claims run on the relay thread, each in its own
-  short transaction: ORDERED first, then CONCURRENT, only when a lane slot is
-  free. The ORDERED sends start after both. Neither claim reads relayed rows
-  or the other lane's backlog.
+  short transaction: ORDERED first (when ORDERED rows may be due), then
+  CONCURRENT, when the lane's queue has room. The ORDERED sends start after
+  both. Neither claim reads relayed rows or the other lane's backlog. **The
+  statements a claim issues do not grow with the rows it takes (1.6.0)**: one
+  claim query (two with the wrap), ONE statement that tries every candidate
+  key's advisory lock, ONE re-check, ONE stamp per distinct lease length
+  (usually one), and the commit. 1.5.x paid a lock statement per key and a
+  flushed update per row on the relay thread.
   - The ORDERED claim reads its batch from its own index in `id` order.
   - The CONCURRENT claim reads the keys in flight through the lease index. It
     steps from key to key through the keyed index, **round-robin from a
     per-pod cursor**, and probes one head row per key not in flight. It stops
-    as soon as it holds as many rows as there are free slots.
-  - So the CONCURRENT claim's cost is bounded by the free slots plus the keys
-    it steps over: those in flight (bounded by the slots across pods) and
-    those whose rows are all backing off or held. It does not grow with the
-    table, with the lane's backlog, or with one key's backlog.
+    as soon as it holds as many rows as the lane has room for (at most
+    `batch-size`).
+  - So the CONCURRENT claim's cost is bounded by the rows it takes plus the
+    keys it steps over: those in flight (at most `batch-size` +
+    `max-in-flight` per pod) and those whose rows are all backing off or held.
+    It does not grow with the table, with the lane's backlog, or with one
+    key's backlog.
   - Measured with 5,000,000 relayed rows (`EXPLAIN (ANALYZE, BUFFERS)`):
     idle 0.5 ms; 100,000 pending rows of one key, in flight 1.0 ms, not in
     flight 0.9 ms; 10,000 keys × 10 rows 1.3 ms. The same under a custom and
     a generic plan: the statements carry no parameter-dependent `OR` and no
     join the planner could turn into a full read. `OutboxClaimPlanIT` pins
     the shape under both plan modes.
+  - A FULL claim since 1.6.0, measured with 1,000,000 relayed rows (both plan
+    modes alike): 100 heads from 10,000 keys × 10 rows 7 ms (1,314 buffers,
+    linear in the rows taken); the locks of their 100 keys, one statement,
+    0.5 ms and no table read; the stamp of the 100 leases, one statement,
+    2–3 ms; one RELAYED booking 0.4 ms (15 buffers). `OutboxClaimPlanIT` pins
+    these too.
   - **What does grow: rows that are pending but not yet due**, on the claim's
     own lane. Held rows (`release_at` in the future) and rows in backoff are
     stepped over on every pass: about **17–18 ms per 100,000 such rows**
@@ -288,9 +332,10 @@ sequenceDiagram
   leave, and a WARN names it. An ORDERED row cancelled before its turn is
   released unsent. An `unpark` never meets a live lease:
   only a booking parks a row, and that booking clears the lease.
-- **Shutdown.** The relay stops claiming, gives the sends in flight
-  `shutdown-grace` (default 10 s) to finish and book, and abandons the rest:
-  they book nothing, and their rows are redelivered once their leases lapse.
+- **Shutdown.** The relay stops claiming, drops the rows still queued unsent,
+  gives the sends in flight `shutdown-grace` (default 10 s) to finish and book,
+  and abandons the rest: they book nothing, and their rows (like the dropped
+  queued ones) are redelivered once their leases lapse.
 - **Publisher routing.** Everything that is not an `http(s)://` URL is a Kafka
   topic (the Kafka publisher registers at lowest precedence as the default).
   HTTP destinations are POSTed the payload with the relay headers. Consumers
@@ -318,6 +363,36 @@ sequenceDiagram
   `spring.kafka.template.observation-enabled=true`; the library stamps nothing
   home-grown.
 
+## Relay throughput
+
+What one pod's relay moves, measured by `OutboxRelayThroughputIT` (1.6.0): 10,000
+pending CONCURRENT rows over 5,000 ordering keys, a publisher that takes 1 ms, ONE relay,
+and a database that answers every statement **5 ms late** — a Toxiproxy latency toxic on
+the link, the per-statement time measured on a loaded box. Each run also checks that no
+key ever had two sends overlapping and that each key's rows went in `id` order.
+
+| `max-in-flight` | 1.5.0 | 1.6.0 |
+|---|---|---|
+| 8 (the default) | 49 rows/s (202.8 s) | 562 rows/s (17.8 s) |
+| 64 | 79 rows/s (127.3 s) | 1,520 rows/s (6.6 s) |
+
+- **Why 1.5.x was flat.** Its relay thread paid two statements for every row it claimed
+  (one advisory-lock call per key, one flushed update per stamped row), and it claimed
+  only as many rows as there were free slots. Throughput was about 1 / (2 × statement
+  time), whatever `max-in-flight` said: on the box under load ~110 rows/s per pod, the
+  same at 8 and at 64 slots.
+- **Since 1.6.0** a claim costs the same handful of statements for 1 row or 100. It runs
+  ahead of the slots into the hand-off queue, and each CONCURRENT row costs its booking:
+  `BEGIN` + one guarded `update … returning` + `COMMIT` (no isolation round trip; see the
+  ordering bullet above). So **`max-in-flight` is the lever**: one slot moves about
+  1 / (send + 2 × statement time) rows a second. Each sending slot holds a database
+  connection while it books, so size the pool above `max-in-flight` + 2 (the relay
+  thread's claim, the gauges).
+- **`batch-size` is the claim-side lever**: a claim tops the queue up to it, so with many
+  slots and slow statements a larger batch keeps them fed.
+- The ORDERED lane is unchanged in kind: its rows go one by one on the relay thread, and
+  one send plus its booking sets its pace.
+
 ## Requirements
 
 - Java 17+ (Java 21+ with `spring.threads.virtual.enabled=true` puts the
@@ -339,7 +414,7 @@ defaults below are what you get without any configuration:
 opentmf:
   outbox:
     sweep-interval: 5s       # fixed-delay relay sweep (timers are for the tail)
-    batch-size: 100          # rows claimed per relay pass
+    batch-size: 100          # rows one claim takes per lane; also the CONCURRENT hand-off queue
     max-attempts: 10         # the LIBRARY delivery budget (a publisher may declare its own)
     backoff-base: 5s         # first retry delay
     backoff-factor: 2.0      # exponential multiplier (a double)
@@ -355,7 +430,8 @@ opentmf:
     ordered:
       lease: 15s             # ORDERED lane default lease - short, > send-timeout
     concurrent:
-      max-in-flight: 8       # CONCURRENT sends at once per pod (also the thread bound)
+      max-in-flight: 8       # CONCURRENT sends at once per pod (also the thread bound) - the
+                             # send-side lever; size the connection pool above it
     kafka:                   # the default Kafka publisher (1.5.0)
       lane: ORDERED          # ORDERED | CONCURRENT - CONCURRENT for per-key order across pods
       ordering-key: AGGREGATE_ID  # on CONCURRENT: AGGREGATE_ID | NONE
@@ -367,7 +443,7 @@ opentmf:
 | Property         | Type       | Default | Notes                                                                 |
 |------------------|------------|---------|-----------------------------------------------------------------------|
 | `sweep-interval` | `Duration` | `5s`    | The safety-net timer; the after-commit poke is the normal path.       |
-| `batch-size`     | `int`      | `100`   | A full batch triggers an immediate follow-up claim (drain).           |
+| `batch-size`     | `int`      | `100`   | Rows one claim takes per lane; a full claim triggers an immediate follow-up (drain). Since 1.6.0 also the CONCURRENT lane's hand-off queue: the claim tops it up to this many once it is half empty. |
 | `max-attempts`   | `int`      | `10`    | The library budget; a publisher's `maxAttempts(event)` > 0 overrides it per row. |
 | `backoff-base`   | `Duration` | `5s`    | Delay after the first failure.                                        |
 | `backoff-factor` | `double`   | `2.0`   | `delay = base * factor^(attempts-1)`, capped; a publisher's `backoff(event, attempt)` overrides. |
@@ -376,7 +452,7 @@ opentmf:
 | `send-timeout`   | `Duration` | `10s`   | Non-transactional Kafka sends await the ack this long.                |
 | `lease`          | `Duration` | `2m`    | Lease of a CONCURRENT row when its publisher declares none; must exceed the lane's longest call. |
 | `ordered.lease`  | `Duration` | `15s`   | Lease of an ORDERED row when its publisher declares none. Short on purpose: after a pod stop the row waits this long. Must exceed `send-timeout` (validated at boot). |
-| `concurrent.max-in-flight` | `int` | `8` | CONCURRENT sends in flight per pod; the claim takes no more rows than free slots. |
+| `concurrent.max-in-flight` | `int` | `8` | CONCURRENT sends in flight per pod (also the thread bound). Since 1.6.0 the claim runs ahead of the slots, so this is the lever for the lane's throughput; each send holds a connection while it books, so the pool must exceed it. |
 | `kafka.lane`     | `ORDERED`/`CONCURRENT` | `ORDERED` | The default Kafka publisher's lane (1.5.0). `CONCURRENT` = per-aggregate order across pods (see "Running several relays with Kafka"). Stamped at append. |
 | `kafka.ordering-key` | `AGGREGATE_ID`/`NONE` | `AGGREGATE_ID` | On `CONCURRENT`: what orders a Kafka row. Ignored on `ORDERED`. The record key is the `aggregateId` either way. |
 | `kafka.lease`    | `Duration` | `15s`   | On `CONCURRENT`: a Kafka row's lease. Must exceed `send-timeout` (validated at boot). Ignored on `ORDERED`. |
@@ -422,7 +498,7 @@ reads the relayed history.
 | Metric                     | Type    | Meaning                                            |
 |----------------------------|---------|----------------------------------------------------|
 | `opentmf.outbox.pending`   | gauge by `lane` | Rows not yet relayed nor cancelled (held, parked and in-flight included) |
-| `opentmf.outbox.in-flight` | gauge by `lane` | Pending rows under a live lease, across pods — claimed, send not booked yet (1.3.0) |
+| `opentmf.outbox.in-flight` | gauge by `lane` | Pending rows under a live lease, across pods — claimed, send not booked yet (1.3.0); since 1.6.0 that includes CONCURRENT rows waiting in a hand-off queue |
 | `opentmf.outbox.parked`    | gauge by `lane` | Rows with `parked_on` stamped — **alert when > 0** |
 | `opentmf.outbox.metrics-age` | gauge | Seconds since the gauges were last refreshed successfully — **alert when above a few refresh periods** (e.g. > 60 s with the default 15 s): the values above are stale or NaN |
 | `opentmf.outbox.relay-lag` | gauge by `lane` | Seconds the lane's oldest *released* pending row has been deliverable (a held row is not lagging) |
@@ -967,10 +1043,14 @@ Accepted survivors, each reviewed:
 | `OutboxMaintenanceService.pruneExpired` / `unpark` (by filter) | the "anything to log" guard and the "more remain" message ternary (negations, boundaries) | Log-only; the counts and `moreTo…` flags are asserted by the unit tests and the ITs |
 | `OutboxMaintenanceService.pruneExpired` / `unpark` (by filter) | `nanoTime() < deadline` boundary | Equivalent: `<` vs `<=` on a nanosecond clock |
 | `OutboxRelayWorker.truncate` | `<=` vs `<` boundary | Equivalent mutant at exactly 4000 chars |
-| `OutboxRelayWorker.relayBatch` | negated `!lane.submit(...)` | Log-only: the refused send's permit and lease are handled inside `submit` |
+| `OutboxRelayWorker.relayBatch` | negated `!lane.submit(...)` | Log-only: a send the closing lane refuses keeps its lease, which lapses |
+| `OutboxRelayWorker.waitedLong` | `>=` vs `>` boundary | Equivalent: the two differ only when the wait equals a tenth of the lease to the nanosecond |
 | `OutboxRelayWorker.bookRelayed` / `bookFailure` | removed `logLapsed`; negated cancelled check before the WARN | Log-only; the lapse and sent-but-cancelled outcomes are asserted by the worker tests and `OutboxLeaseIT` |
 | `OutboxLaneStamper.stamp` | removed `setOrderingKey(null)` in the failure path | Equivalent: the key is never set before the throw it recovers from |
 | `OutboxConcurrentLane` | removed `setVirtualThreads`; `isVirtual` → false | Equivalent on the JDK 17 unit-test run; `OutboxHttpLaneVirtualIT` (JDK 21+) asserts the virtual threads, and PIT runs unit tests only |
+| `OutboxConcurrentLane.close` | the dropped-rows count (increment; `> 0` boundary and negation) | Log-only |
+| `OutboxConcurrentLane.startWorkers` | removed `release` after a refused worker start (no coverage) | Unreachable in sequence: `close` sets `closed` before the executor refuses; a race-only guard |
+| `OutboxConcurrentLane.work` | removed the `startWorkers()` re-check after the release | Race-only: a send queued between a worker's last empty poll and its release. `noQueuedSend_isEverStranded_whileWorkersComeAndGo` exercises the window under load; a unit test cannot force it |
 | `OutboxRelay.stop` | awaitTermination conditional | Shutdown-timing leg; a kill needs a grace-long hanging-task test for no insight |
 | `OutboxRelay.poke` | removed `passQueued.set(false)` after a rejection | Reachable only after shutdown, when no further pass can run anyway |
 | `OutboxRelay` thread factory | removed `setDaemon` | Asserted by `OutboxRelayTests` in every normal run; PIT's per-line selection misses the factory-lambda mapping |

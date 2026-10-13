@@ -94,13 +94,15 @@ public class OutboxAutoConfiguration {
   }
 
   /**
-   * The CONCURRENT lane: virtual threads when the runtime is 21+ AND the application enables
+   * The CONCURRENT lane: {@code max-in-flight} slots behind a hand-off queue of {@code batch-size}
+   * rows; virtual threads when the runtime is 21+ AND the application enables
    * {@code spring.threads.virtual.enabled} (Boot's own test), platform threads otherwise.
    */
   @Bean
   OutboxConcurrentLane outboxConcurrentLane(OutboxProperties properties, Environment environment) {
     return new OutboxConcurrentLane(
         properties.getConcurrent().getMaxInFlight(),
+        properties.getBatchSize(),
         Threading.VIRTUAL.isActive(environment),
         properties.getShutdownGrace());
   }
@@ -125,19 +127,35 @@ public class OutboxAutoConfiguration {
         properties,
         relayedListeners.orderedStream().toList(),
         relayTransactions(transactionManager),
+        laneTransactions(transactionManager),
         lane);
   }
 
   /**
-   * The relay's short claim and booking transactions, READ COMMITTED whatever the application's
-   * default: the CONCURRENT claim's re-check must see, in a NEW snapshot, the leases another pod
-   * committed before releasing a key's advisory lock - under REPEATABLE READ the transaction's
-   * first snapshot would hide them.
+   * The relay's short claim transactions and the ORDERED lane's bookings, READ COMMITTED whatever
+   * the application's default: the CONCURRENT claim's re-check must see, in a NEW snapshot, the
+   * leases another pod committed before releasing a key's advisory lock - under REPEATABLE READ
+   * the transaction's first snapshot would hide them; an ORDERED booking renews the NEXT row's
+   * lease in the same transaction, and a serialization error there would roll back a delivered
+   * row's booking. The pin costs a round trip per transaction (the driver reads the current level
+   * from the server before setting it).
    */
   static TransactionTemplate relayTransactions(PlatformTransactionManager transactionManager) {
     TransactionTemplate template = new TransactionTemplate(transactionManager);
     template.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
     return template;
+  }
+
+  /**
+   * The CONCURRENT lane's bookings and renewals (1.6.0), at the application's DEFAULT isolation -
+   * READ COMMITTED on PostgreSQL unless the application configured another. Each is one guarded
+   * statement whose snapshot starts with it (the failure booking: a locking read by id and lease,
+   * then the update). Under another default, the one race - a relay re-taking the row after its
+   * lease lapsed - raises a serialization error instead of matching nothing: the booking falls
+   * through to the failure path, which finds the lease gone and books nothing - the same outcome.
+   */
+  static TransactionTemplate laneTransactions(PlatformTransactionManager transactionManager) {
+    return new TransactionTemplate(transactionManager);
   }
 
   @Bean
