@@ -74,8 +74,11 @@ The relay's claim cadence: one pod moves an order of magnitude more CONCURRENT r
   PostgreSQL's statement log and pins both sides:
   - a CONCURRENT booking is `BEGIN`, one `update … returning`, `COMMIT`;
   - the claim still opens with the `SHOW`.
-- **The `in-flight` gauge** counts CONCURRENT rows waiting in a hand-off queue (they hold a
-  lease). Under load it reads up to `batch-size` higher per pod than on 1.5.x.
+- **The `in-flight` gauge reads higher under load.** `opentmf.outbox.in-flight` (lane
+  `concurrent`) now also counts the CONCURRENT rows waiting in a hand-off queue, since they
+  hold a lease: up to `batch-size` more per pod than on 1.5.x. Re-check dashboards and alerts
+  that read `opentmf.outbox.in-flight` - a threshold tuned to `max-in-flight` will now fire
+  under ordinary load.
 - **Shutdown** drops the rows still queued unsent. Like any send that outlives the
   shutdown grace, they are redelivered once their leases lapse.
 
