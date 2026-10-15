@@ -30,6 +30,16 @@ class OutboxOpsOpenApiTests {
     return new Yaml().load(OutboxOpsOpenApi.fragment());
   }
 
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> components(String kind) {
+    return (Map<String, Object>) ((Map<String, Object>) fragment().get("components")).get(kind);
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> component(String kind, String name) {
+    return (Map<String, Object>) components(kind).get(name);
+  }
+
   private static Set<String> fragmentOperations() {
     @SuppressWarnings("unchecked")
     Map<String, Map<String, Object>> paths = (Map<String, Map<String, Object>>) fragment().get("paths");
@@ -128,5 +138,16 @@ class OutboxOpsOpenApiTests {
       served.add(component.getName());
     }
     assertThat(documented).isEqualTo(served);
+  }
+
+  @Test
+  @DisplayName("limit declares no maximum: the toolkit CLAMPS a larger value to max-limit, it never rejects it")
+  void theLimitDeclaresNoMaximum_becauseALargerValueIsClamped() {
+    @SuppressWarnings("unchecked")
+    Map<String, Object> schema = (Map<String, Object>) component("parameters", "outboxLimit").get("schema");
+
+    // OutboxRoundTripIT pins the behaviour: limit=99999 is a 200 with every row, not a 400
+    assertThat(schema).doesNotContainKey("maximum").containsEntry("minimum", 1);
+    assertThat(component("parameters", "outboxLimit").get("description").toString()).contains("CLAMPED");
   }
 }

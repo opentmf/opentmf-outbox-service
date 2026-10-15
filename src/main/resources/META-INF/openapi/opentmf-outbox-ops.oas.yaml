@@ -27,7 +27,7 @@
 openapi: 3.1.0
 info:
   title: opentmf-outbox-service /ops/outbox fragment
-  version: 1.4.0
+  version: 1.7.0
   description: >-
     Paste-in contract for the outbox ops surface served by opentmf-outbox-service.
     Not a standalone API document — a fragment the consumer's OAS absorbs. The library's
@@ -233,8 +233,9 @@ components:
       description: >-
         Page size. Default = the consumer's `paging.default-limit` (library default 50);
         a value above `paging.max-limit` (library default 500) is CLAMPED to it, not
-        rejected; 0 or a negative value is a 400.
-      schema: { type: integer, minimum: 1, default: 50, maximum: 500 }
+        rejected - so the schema declares no `maximum` (1.7.0: it said 500, which a
+        black-box suite reads as "501 must be refused"); 0 or a negative value is a 400.
+      schema: { type: integer, minimum: 1, default: 50 }
     outboxRowId:
       name: id
       in: path
