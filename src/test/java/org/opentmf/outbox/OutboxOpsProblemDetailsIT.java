@@ -24,7 +24,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * answer a black-box suite provokes is documented by the shipped fragment on that operation, in the
  * media type it is written in - the toolkit's own 400 and 416 included, which keep their {@code
  * Tmf630Error} beside Boot's problem handler. The row routes ride along, so the standalone {@code
- * OutboxOpsWireConformanceTests} is not the only evidence for them.
+ * OutboxOpsWireConformanceTests} is not the only evidence for them. This consumer has also switched
+ * the toolkit's undeclared-query-parameter guard (3.5.0, opt-in) to REJECT, the strictest answer
+ * set a consumer can give on this surface.
  */
 @AutoConfigureMockMvc
 @SpringBootTest(
@@ -34,7 +36,8 @@ import org.springframework.transaction.support.TransactionTemplate;
       "spring.datasource.driver-class-name=org.testcontainers.jdbc.ContainerDatabaseDriver",
       "spring.liquibase.change-log=classpath:db/test-changelog.xml",
       "spring.jpa.hibernate.ddl-auto=validate",
-      "spring.mvc.problemdetails.enabled=true"
+      "spring.mvc.problemdetails.enabled=true",
+      "opentmf.tmf630.undeclared-query-params.on-undeclared=REJECT"
     })
 class OutboxOpsProblemDetailsIT {
 
@@ -83,6 +86,9 @@ class OutboxOpsProblemDetailsIT {
                 get("/ops/outbox").param("eventType", eventType).param("offset", "99"),
                 416))
         .isEqualTo(MediaType.APPLICATION_JSON);
+    // the guard on REJECT: Spring's page/size on a TMF-630 list are refused (toolkit 3.5.1)
+    assertThat(answers("GET /ops/outbox", get("/ops/outbox").param("page", "0"), 400))
+        .isEqualTo(MediaType.APPLICATION_JSON);
   }
 
   @Test
@@ -90,6 +96,9 @@ class OutboxOpsProblemDetailsIT {
     answers("GET /ops/outbox/{id}", get("/ops/outbox/987654321"), 404);
     answers("GET /ops/outbox/{id}", get("/ops/outbox/not-a-row"), 404);
     answers("GET /ops/outbox/{id}", get("/ops/outbox/99999999999999999999"), 400);
+    // the guard on REJECT: a query parameter the inspect route does not take
+    assertThat(answers("GET /ops/outbox/{id}", get("/ops/outbox/987654321").param("foo", "1"), 400))
+        .isEqualTo(MediaType.APPLICATION_JSON);
     answers("POST /ops/outbox/{id}/cancel", post("/ops/outbox/987654321/cancel"), 404);
     answers("POST /ops/outbox/unpark", get("/ops/outbox/unpark"), 405);
     answers(

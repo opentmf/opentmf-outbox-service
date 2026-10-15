@@ -148,7 +148,18 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OutboxRow' }
-        '400': { $ref: '#/components/responses/outboxRowIdOutOfRange' }
+        '400':
+          description: >-
+            The id is digits but beyond int64 (Spring's binding refusal, rendered by the
+            consumer as `OutboxProblem`) - or, where the consumer switched tmf630-toolkit's
+            undeclared-query-parameter guard to REJECT (3.5.0, opt-in), a query parameter this
+            route does not take (the toolkit's `Tmf630Error`, `reason` "Unknown query
+            parameter.").
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tmf630Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/OutboxProblem' }
         '401': { $ref: '#/components/responses/outboxUnauthorized' }
         '403': { $ref: '#/components/responses/outboxForbidden' }
         '404': { $ref: '#/components/responses/outboxRowNotFound' }
@@ -368,8 +379,10 @@ components:
     outboxBadRequest:
       description: >-
         A refused list request. The toolkit's own rejections — `limit` <= 0 or non-numeric
-        (`reason` "Invalid sort or paging parameter."), an unknown attribute-filter field —
-        are rendered by the toolkit itself as `Tmf630Error` (application/json); they do not
+        (`reason` "Invalid sort or paging parameter."), an unknown attribute-filter field,
+        and Spring's `page` / `size` where the consumer switched the toolkit's
+        undeclared-query-parameter guard to REJECT (3.5.1, opt-in) — are rendered by the
+        toolkit itself as `Tmf630Error` (application/json); they do not
         pass through the consumer's problem-detail mapper. An unknown state leg (`?state=` or
         `/state/{state}`) is the library's `ErrorResponse`, rendered by the consumer
         (`OutboxProblem`, application/problem+json).
