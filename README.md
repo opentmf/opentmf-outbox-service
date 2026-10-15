@@ -1120,10 +1120,11 @@ Accepted survivors, each reviewed:
 | `OutboxRelay` thread factory | removed `setDaemon` | Asserted by `OutboxRelayTests` in every normal run; PIT's per-line selection misses the factory-lambda mapping |
 | `OutboxMetrics` thread factory | removed `setDaemon` | Asserted by `OutboxMetricsTests` (the refresher thread is a daemon); same factory-lambda mapping miss |
 
-`NO_COVERAGE` entries (the Kafka publisher bean method, ops controller) are
-exercised by the Testcontainers ITs, which the posture deliberately keeps out
-of PIT (unit tests only); the other auto-configuration bean methods are
-covered by `KafkaLessStartupTests` since 1.2.1.
+`NO_COVERAGE` entries (the Kafka publisher bean method) are exercised by the
+Testcontainers ITs, which the posture deliberately keeps out of PIT (unit tests
+only); the other auto-configuration bean methods are covered by
+`KafkaLessStartupTests` since 1.2.1, and the ops controller's mutants are all
+killed by `OutboxOpsRoutingTests` since 1.7.0.
 
 ## Version History
 

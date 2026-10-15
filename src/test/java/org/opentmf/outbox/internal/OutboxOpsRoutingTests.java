@@ -7,11 +7,13 @@ import static org.hamcrest.Matchers.not;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
 import static org.springframework.http.HttpHeaders.ALLOW;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.options;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.lang.reflect.Method;
@@ -19,6 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxMaintenanceService;
+import org.opentmf.outbox.OutboxRowView;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -68,9 +71,41 @@ class OutboxOpsRoutingTests {
 
   @Test
   void digits_areTheRowRoutes() throws Exception {
-    mvc.perform(get("/ops/outbox/42")).andExpect(status().isOk());
-    mvc.perform(post("/ops/outbox/42/unpark")).andExpect(status().isOk());
-    mvc.perform(post("/ops/outbox/42/cancel")).andExpect(status().isOk());
+    when(maintenance.inspect(42L))
+        .thenReturn(
+            new OutboxRowView(
+                42L,
+                "it-aggregate",
+                "a-1",
+                "it.event.v1",
+                "hub:a",
+                null,
+                null,
+                0,
+                false,
+                false,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                "{}"));
+
+    mvc.perform(get("/ops/outbox/42"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.id").value(42))
+        .andExpect(jsonPath("$.payload").value("{}"));
+    mvc.perform(post("/ops/outbox/42/unpark"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.action").value("unparked"))
+        .andExpect(jsonPath("$.id").value(42));
+    mvc.perform(post("/ops/outbox/42/cancel"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.action").value("cancelled"))
+        .andExpect(jsonPath("$.id").value(42));
 
     verify(maintenance).inspect(42L);
     verify(maintenance).unpark(42L);
