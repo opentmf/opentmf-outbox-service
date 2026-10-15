@@ -8,7 +8,7 @@
 # and the `components` under its own `components`, keeps the names, and may pin itself
 # to it with a drift test (README "OAS fragment"). The paging was MEASURED against
 # tmf630-toolkit 3.1.1 and is PINNED by OutboxRoundTripIT against the toolkit the library
-# builds with (3.4.0 in 1.4.0) — the numbers below are the toolkit's rules, not aspirations:
+# builds with (3.5.1 in 1.7.0) — the numbers below are the toolkit's rules, not aspirations:
 #
 #   status  200  total == 0, or offset == 0 and every row fit in the page
 #           206  otherwise (offset > 0, or fewer rows than the total in this page)
