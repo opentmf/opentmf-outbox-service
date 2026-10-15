@@ -52,7 +52,8 @@ public interface OutboxPublisher {
      * Rows sent in parallel, one per (virtual, where enabled) thread, at most
      * {@code opentmf.outbox.concurrent.max-in-flight} at a time. The library promises NO order
      * between them, nor against ORDERED rows - except that rows sharing an {@link #orderingKey}
-     * are never in flight together and are taken in {@code id} order.
+     * are never in flight together and are taken in {@code id} order on the happy path (a row in
+     * backoff, parked or held lets later rows of its key pass it).
      */
     CONCURRENT
   }

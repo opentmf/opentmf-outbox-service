@@ -1116,10 +1116,10 @@ class OutboxRelayWorkerTests {
     orderedIdle();
     assertThat(table.get(1L).getRelayedOn()).isNotNull();
     assertThat(table.get(2L).getRelayedOn()).isNotNull();
-    assertThat(senders)
+    assertThat(senders) // the ORDERED lane's thread, not the caller's
+        .doesNotContain(Thread.currentThread().getName())
         .first()
-        .isEqualTo("opentmf-outbox-ordered"); // the ORDERED lane's thread, not the caller's
-    assertThat(senders).doesNotContain(Thread.currentThread().getName());
+        .isEqualTo("opentmf-outbox-ordered");
   }
 
   @Test

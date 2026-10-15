@@ -13,7 +13,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
-import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -132,7 +131,8 @@ class OutboxLaneIndependenceIT {
         .isLessThan(50);
 
     await().atMost(Duration.ofSeconds(40)).until(() -> ORDERED_SENT.size() == 100);
-    assertThat(ORDERED_SENT).containsExactlyElementsOf(ordered); // id order
+    List<Long> sent = List.copyOf(ORDERED_SENT);
+    assertThat(sent).containsExactlyElementsOf(ordered); // id order
     assertThat(ORDERED_MAX.get()).isEqualTo(1); // one at a time
   }
 }
