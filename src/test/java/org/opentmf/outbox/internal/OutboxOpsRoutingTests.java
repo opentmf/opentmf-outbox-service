@@ -28,8 +28,8 @@ import org.springframework.web.bind.annotation.PostMapping;
  * OUTBOX-OPS-ID-PATH-DIGITS-1 (1.7.0): the row routes take an id of digits only, so a literal
  * sibling segment is never read as an id. Before, {@code GET /ops/outbox/unpark} reached the
  * inspect route and answered 400 ("not a whole number"), and {@code OPTIONS /ops/outbox/unpark}
- * advertised GET. Now the first is the 405 of a path that serves POST only, the second names
- * POST alone, and any other segment that is not digits matches no row route (404).
+ * advertised GET. Now the first is the 405 of a path that serves POST only, the second names POST
+ * alone, and any other segment that is not digits matches no row route (404).
  */
 class OutboxOpsRoutingTests {
 
@@ -41,7 +41,8 @@ class OutboxOpsRoutingTests {
   void getUnpark_isNeverTheInspectRoute_butAMethodTheBulkUnparkDoesNotServe() throws Exception {
     mvc.perform(get("/ops/outbox/unpark"))
         .andExpect(status().isMethodNotAllowed())
-        .andExpect(header().string(ALLOW, allOf(containsString("POST"), not(containsString("GET")))));
+        .andExpect(
+            header().string(ALLOW, allOf(containsString("POST"), not(containsString("GET")))));
 
     verifyNoInteractions(maintenance);
   }
@@ -50,7 +51,8 @@ class OutboxOpsRoutingTests {
   void optionsUnpark_advertisesWhatThePathServes_neverGet() throws Exception {
     mvc.perform(options("/ops/outbox/unpark"))
         .andExpect(status().isOk())
-        .andExpect(header().string(ALLOW, allOf(containsString("POST"), not(containsString("GET")))));
+        .andExpect(
+            header().string(ALLOW, allOf(containsString("POST"), not(containsString("GET")))));
   }
 
   @Test
