@@ -72,11 +72,21 @@ library never imports that BOM (direct property pins in the pom).
   `OutboxRelayThroughputIT` (Toxiproxy 5 ms per statement, `-Dit.relay.latency-ms`) is the
   golden test: >= 500 rows/s at 8 slots, 10k rows < 15 s at 64; `OutboxLaneBookingStatementsIT`
   pins the booking's statements from PostgreSQL's own log.
+- **1.7.0 (2026-10-15)** - the ops contract as the first black-box suites found it (#13):
+  OUTBOX-OAS-LIMIT-CLAMP-1 (`limit` declares no `maximum`; the toolkit clamps),
+  OUTBOX-OPS-ID-PATH-DIGITS-1 (`{id:\d+}` on the three row routes: `GET /ops/outbox/unpark`
+  is a 405, a non-digit segment a 404), OUTBOX-OAS-FRAGMENT-SECURITY-RESPONSES-1 (every
+  operation `$ref`s 401/403/405/406/503 + 415 on the bulk unpark; every consumer-rendered
+  error carries `OutboxProblem` as problem+json; the six consumer answers + `OutboxProblem`
+  are `x-opentmf-refinable: true` - redefinable under the same name, the rest verbatim).
+  `OpsFragmentConformance` checks status AND written media type against the fragment
+  (`OutboxOpsWireConformanceTests`, `OutboxOpsProblemDetailsIT` with Boot problem details and
+  the toolkit guard on REJECT). tmf630-toolkit 3.5.1, central-publishing 0.12.0. A new error
+  answer on the ops surface must land in the fragment, or `OpsFragmentConformance` is red.
 
 ## Open
 
-- Develop is `1.6.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
-  heading `## 1.6.1 - <date>` (or the next minor's, if the row is a minor).
-- OUTBOX-UNUSED-INDEX-1 (filed 2026-10-13 by the coordinator, next release): prove
-  `ix_outbox_pending` reads zero scans (`pg_stat_user_indexes`, loaded instance), then drop
-  it in a changeset with rollback.
+- Develop is `1.7.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
+  heading `## 1.7.1 - <date>` (or the next minor's, if the row is a minor).
+- Nothing open. OUTBOX-UNUSED-INDEX-1 was closed by Gökhan on 2026-10-15: keep
+  `ix_outbox_pending` (measured the most-scanned index on every outbox table).
