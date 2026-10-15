@@ -129,9 +129,11 @@ sequenceDiagram
   from before 1.3.0) has no lane and rides ORDERED. An append never fails on
   this account: a row no publisher supports, or whose publisher throws while
   naming its lane, is stored without one and the relay books it as before.
-  The **ORDERED** lane is the single relay thread per pod: rows go one by one
-  in `id` order — the 1.2.x behaviour; the Kafka publisher rides it by default
-  (`opentmf.outbox.kafka.lane`, 1.5.0, below). The **CONCURRENT** lane sends rows
+  The **ORDERED** lane is one thread per pod: rows go one by one in `id`
+  order — the 1.2.x behaviour (its own thread since 1.7.1, so an ORDERED batch
+  never holds back a CONCURRENT claim; the relay thread only claims); the
+  Kafka publisher rides it by default (`opentmf.outbox.kafka.lane`, 1.5.0,
+  below). The **CONCURRENT** lane sends rows
   in parallel, one per thread, at most `concurrent.max-in-flight` (default 8)
   at a time; the HTTP publisher rides it, so a slow subscriber never delays a
   Kafka row again. CONCURRENT rows keep **no order** against ORDERED rows, nor
@@ -386,12 +388,13 @@ key ever had two sends overlapping and that each key's rows went in `id` order.
   `BEGIN` + one guarded `update … returning` + `COMMIT` (no isolation round trip; see the
   ordering bullet above). So **`max-in-flight` is the lever**: one slot moves about
   1 / (send + 2 × statement time) rows a second. Each sending slot holds a database
-  connection while it books, so size the pool above `max-in-flight` + 2 (the relay
-  thread's claim, the gauges).
+  connection while it books, so size the pool above `max-in-flight` + 3 (the relay
+  thread's claim, the ORDERED lane's booking - concurrent with the claim since 1.7.1 - and
+  the gauges).
 - **`batch-size` is the claim-side lever**: a claim tops the queue up to it, so with many
   slots and slow statements a larger batch keeps them fed.
-- The ORDERED lane is unchanged in kind: its rows go one by one on the relay thread, and
-  one send plus its booking sets its pace.
+- The ORDERED lane is unchanged in kind: its rows go one by one on one thread (its own
+  since 1.7.1), and one send plus its booking sets its pace.
 
 ## Requirements
 
@@ -456,7 +459,7 @@ opentmf:
 | `kafka.lane`     | `ORDERED`/`CONCURRENT` | `ORDERED` | The default Kafka publisher's lane (1.5.0). `CONCURRENT` = per-aggregate order across pods (see "Running several relays with Kafka"). Stamped at append. |
 | `kafka.ordering-key` | `AGGREGATE_ID`/`NONE` | `AGGREGATE_ID` | On `CONCURRENT`: what orders a Kafka row. Ignored on `ORDERED`. The record key is the `aggregateId` either way. |
 | `kafka.lease`    | `Duration` | `15s`   | On `CONCURRENT`: a Kafka row's lease. Must exceed `send-timeout` (validated at boot). Ignored on `ORDERED`. |
-| `shutdown-grace` | `Duration` | `10s`   | On stop: the relay thread's and the in-flight sends' time to finish; the rest lapse by lease. |
+| `shutdown-grace` | `Duration` | `10s`   | On stop: the relay thread's, the ORDERED batch's and the in-flight CONCURRENT sends' time to finish (each in turn); the rest lapse by lease. |
 | `metrics-refresh` | `Duration` | `15s`  | How often the gauges are re-read from the database; a scrape reads the last values. |
 | `maintenance.batch-size` | `int`    | `5000`  | Rows per batch of a bulk operation (prune, unpark by filter); each batch is its own transaction, no entity loaded. |
 | `maintenance.time-budget` | `Duration` | `10s` | One bulk call stops after this; the answer says `moreToPrune` / `moreToUnpark` and the caller calls again. |
@@ -1005,7 +1008,7 @@ The library is self-contained for consumer testing — no test-jar needed:
    (`if not exists`, so it applies to a library-created table and to an
    onboarded pre-library one alike). Rows pending at the upgrade have no lane
    and ride ORDERED once, including any pending HTTP backlog, which drains on
-   the relay thread as it would have under 1.2.x.
+   one thread as it would have under 1.2.x.
    **What the first start costs on a large table.** Changesets `004` and `005`
    build eight indexes `CONCURRENTLY`, so the appends of pods still running are
    never blocked. Each build still reads the whole table once. Measured: 0.7–1.8 s

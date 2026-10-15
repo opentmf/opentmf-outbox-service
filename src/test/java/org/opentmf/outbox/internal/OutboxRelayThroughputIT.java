@@ -234,6 +234,7 @@ class OutboxRelayThroughputIT {
     OutboxConcurrentLane lane =
         new OutboxConcurrentLane(
             maxInFlight, properties.getBatchSize(), false, properties.getShutdownGrace());
+    OutboxOrderedLane orderedLane = new OutboxOrderedLane(properties.getShutdownGrace());
     OutboxRelayWorker worker =
         new OutboxRelayWorker(
             repository,
@@ -244,8 +245,9 @@ class OutboxRelayThroughputIT {
             List.of(),
             OutboxAutoConfiguration.relayTransactions(transactionManager),
             OutboxAutoConfiguration.laneTransactions(transactionManager),
-            lane);
-    OutboxRelay relay = new OutboxRelay(worker, properties, lane);
+            lane,
+            orderedLane);
+    OutboxRelay relay = new OutboxRelay(worker, properties, lane, orderedLane);
     proxy.toxics().latency("latency", ToxicDirection.DOWNSTREAM, LATENCY_MS);
     relay.start();
     try {

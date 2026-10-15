@@ -107,6 +107,15 @@ public class OutboxAutoConfiguration {
         properties.getShutdownGrace());
   }
 
+  /**
+   * The ORDERED lane (1.7.1): one thread that sends a claimed ORDERED batch row after row, off the
+   * relay thread - so an ORDERED batch never holds back the CONCURRENT lane's next claim.
+   */
+  @Bean
+  OutboxOrderedLane outboxOrderedLane(OutboxProperties properties) {
+    return new OutboxOrderedLane(properties.getShutdownGrace());
+  }
+
   @Bean
   OutboxRelayWorker outboxRelayWorker(
       OutboxEventRepository repository,
@@ -116,7 +125,8 @@ public class OutboxAutoConfiguration {
       OutboxProperties properties,
       ObjectProvider<OutboxRelayedListener> relayedListeners,
       PlatformTransactionManager transactionManager,
-      OutboxConcurrentLane lane) {
+      OutboxConcurrentLane lane,
+      OutboxOrderedLane orderedLane) {
     // the post-relay seam: zero or more consumer beans, invoked in bean order inside the
     // booking transaction that stamps relayed_on (see OutboxRelayedListener)
     return new OutboxRelayWorker(
@@ -128,7 +138,8 @@ public class OutboxAutoConfiguration {
         relayedListeners.orderedStream().toList(),
         relayTransactions(transactionManager),
         laneTransactions(transactionManager),
-        lane);
+        lane,
+        orderedLane);
   }
 
   /**
@@ -160,8 +171,11 @@ public class OutboxAutoConfiguration {
 
   @Bean
   OutboxRelay outboxRelay(
-      OutboxRelayWorker worker, OutboxProperties properties, OutboxConcurrentLane lane) {
-    return new OutboxRelay(worker, properties, lane);
+      OutboxRelayWorker worker,
+      OutboxProperties properties,
+      OutboxConcurrentLane lane,
+      OutboxOrderedLane orderedLane) {
+    return new OutboxRelay(worker, properties, lane, orderedLane);
   }
 
   @Bean

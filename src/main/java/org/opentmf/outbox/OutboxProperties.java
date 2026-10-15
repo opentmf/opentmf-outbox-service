@@ -146,7 +146,7 @@ public class OutboxProperties {
   public static class Kafka {
 
     /**
-     * {@code ORDERED} (the default, as before 1.5.0): the single relay thread of each pod, in
+     * {@code ORDERED} (the default, as before 1.5.0): the one ORDERED thread of each pod, in
      * {@code id} order - two pods never take one row twice, but across pods rows interleave, so
      * strict order is NOT promised with several relays. {@code CONCURRENT}: rows of one ordering
      * key are never in flight together, within a pod or across pods, and go in {@code id} order on

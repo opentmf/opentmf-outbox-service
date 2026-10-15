@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.7.1 - 2026-10-16
+
+### Fixed
+
+- **The CONCURRENT lane no longer waits behind an ORDERED batch**
+  (OUTBOX-CONCURRENT-CLAIM-INDEPENDENT-1). Since 1.3.0 the relay thread claimed both lanes and
+  then sent the ORDERED batch itself, row after row. The CONCURRENT rows already handed over
+  went on sending, but the lane's next claim waited until the last ORDERED row of the batch was
+  booked. With a slow ORDERED receiver that is a long stall: in an end-to-end run, the
+  CONCURRENT lane relayed nothing for 26 s while ORDERED HTTP legs went out at about one a
+  second, then sent over 200 rows in two seconds.
+  - The ORDERED batch now goes to the **ORDERED lane's own thread** (`opentmf-outbox-ordered`),
+    and the relay thread only claims. A CONCURRENT row appended while an ORDERED batch sends is
+    claimed at once.
+  - The ORDERED lane keeps its guarantees: one batch in flight per pod (the relay claims it
+    only while the lane is idle, and the lane nudges the relay when a batch is done), rows one
+    at a time in `id` order, each under its short lease renewed by the booking of the row
+    before it.
+  - Measured by `OutboxLaneIndependenceIT`: 100 ORDERED rows to a receiver answering in 150 ms
+    (a 15 s batch) are sending when a CONCURRENT row is appended. It is delivered within two
+    seconds, while the ORDERED batch is still going. On 1.7.0 it waited for the batch.
+- **Pool sizing:** the relay thread's claim and an ORDERED booking can now hold a connection at
+  the same moment. Size the pool above `concurrent.max-in-flight` + 3 (was + 2).
+- **Shutdown:** the relay thread, then the ORDERED batch, then the CONCURRENT sends each get
+  `shutdown-grace` in turn; what is not booked by then is redelivered once its lease lapses, as
+  before.
+
 ## 1.7.0 - 2026-10-15
 
 The ops surface's contract, as the first black-box suites run against a pasted fragment found
