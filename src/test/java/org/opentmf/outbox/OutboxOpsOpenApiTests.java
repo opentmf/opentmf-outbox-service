@@ -279,9 +279,10 @@ class OutboxOpsOpenApiTests {
 
     for (String response : expected) {
       if (response.startsWith("responses.")) {
-        assertThat(component("responses", response.substring("responses.".length())).get("content"))
+        assertThat(component("responses", response.substring("responses.".length())))
             .as(response)
-            .isEqualTo(
+            .containsEntry(
+                "content",
                 Map.of(
                     "application/problem+json",
                     Map.of("schema", Map.of("$ref", "#/components/schemas/OutboxProblem"))));
