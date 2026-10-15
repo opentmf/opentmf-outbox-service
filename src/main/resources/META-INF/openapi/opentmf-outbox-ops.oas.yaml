@@ -125,7 +125,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OutboxRow' }
         '404':
-          description: No row with this id
+          description: No row with this id (or an id that is not digits - no row route takes it)
 
   /ops/outbox/{id}/unpark:
     post:
@@ -143,7 +143,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OutboxOpsAck' }
         '404':
-          description: No row with this id
+          description: No row with this id (or an id that is not digits - no row route takes it)
         '409':
           description: The row is not parked (already relayed, cancelled, or still pending)
 
@@ -195,7 +195,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OutboxOpsAck' }
         '404':
-          description: No row with this id
+          description: No row with this id (or an id that is not digits - no row route takes it)
         '409':
           description: >-
             The row is already relayed, already cancelled, or its send is in flight (a live
@@ -240,7 +240,10 @@ components:
       name: id
       in: path
       required: true
-      schema: { type: integer, format: int64 }
+      description: >-
+        The row id - digits only (1.7.0): the routes take `{id:\d+}`, so a segment that is not
+        digits (`unpark`, `-1`) matches no row route and is a 404, never this parameter's 400.
+      schema: { type: integer, format: int64, minimum: 0 }
 
   headers:
     X-Total-Count:

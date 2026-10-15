@@ -39,6 +39,12 @@ import org.springframework.web.server.ResponseStatusException;
  * row) answers <b>404</b>, its {@link IllegalStateException} (the row is not in the state the
  * action needs) answers <b>409</b> - mapped here via {@link ResponseStatusException}, no advice
  * bean, so the consumer's own exception handling is untouched.
+ *
+ * <p>The row routes take an id of DIGITS only ({@code {id:\d+}}, 1.7.0): a literal sibling such
+ * as {@code /outbox/unpark} is never read as an id - before, {@code GET /ops/outbox/unpark} reached
+ * the inspect route (a 400, "not a whole number") and {@code OPTIONS} on it advertised GET. A
+ * segment that is not digits matches no route (404); digits beyond a {@code long} are still the
+ * binding's 400.
  */
 @RestController
 @RequiredArgsConstructor
@@ -59,7 +65,7 @@ public class OutboxOpsController {
   }
 
   /** Unparks one parked row - parked_on cleared, attempts reset, due now, relay nudged. */
-  @PostMapping(path = "/outbox/{id}/unpark", produces = MediaType.APPLICATION_JSON_VALUE)
+  @PostMapping(path = "/outbox/{id:\\d+}/unpark", produces = MediaType.APPLICATION_JSON_VALUE)
   public Map<String, Object> unpark(@PathVariable(name = "id") long id) {
     mapped(
         () -> {
@@ -103,7 +109,7 @@ public class OutboxOpsController {
   }
 
   /** Cancels one unreleased row - never relayed from now on, retained for audit. */
-  @PostMapping(path = "/outbox/{id}/cancel", produces = MediaType.APPLICATION_JSON_VALUE)
+  @PostMapping(path = "/outbox/{id:\\d+}/cancel", produces = MediaType.APPLICATION_JSON_VALUE)
   public Map<String, Object> cancel(@PathVariable(name = "id") long id) {
     mapped(
         () -> {
@@ -176,7 +182,7 @@ public class OutboxOpsController {
    * here by ruling: this surface sits behind the consumer's admin role; the LIST stays
    * metadata-only.
    */
-  @GetMapping(path = "/outbox/{id}", produces = MediaType.APPLICATION_JSON_VALUE)
+  @GetMapping(path = "/outbox/{id:\\d+}", produces = MediaType.APPLICATION_JSON_VALUE)
   public OutboxRowView inspect(@PathVariable(name = "id") long id) {
     return mapped(() -> maintenance.inspect(id));
   }

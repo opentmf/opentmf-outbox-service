@@ -3,7 +3,11 @@ package org.opentmf.outbox;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
 import static org.awaitility.Awaitility.await;
+import static org.hamcrest.Matchers.allOf;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.not;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.options;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -359,6 +363,23 @@ class OutboxRoundTripIT {
     mockMvc
         .perform(post("/ops/outbox/{id}/unpark", relayed.getId()))
         .andExpect(status().isConflict());
+  }
+
+  /**
+   * OUTBOX-OPS-ID-PATH-DIGITS-1 (1.7.0) on the real application: the row routes take an id of
+   * digits only. {@code GET /ops/outbox/unpark} is the 405 of the bulk unpark's path - it was the
+   * inspect route's 400 ("not a whole number") - {@code OPTIONS} on it names POST alone, and a
+   * segment that is not digits matches no route.
+   */
+  @Test
+  void theRowRoutes_takeDigitsOnly_soUnparkIsNeverReadAsAnId() throws Exception {
+    mockMvc.perform(get("/ops/outbox/unpark")).andExpect(status().isMethodNotAllowed());
+    mockMvc
+        .perform(options("/ops/outbox/unpark"))
+        .andExpect(status().isOk())
+        .andExpect(header().string("Allow", allOf(containsString("POST"), not(containsString("GET")))));
+    mockMvc.perform(get("/ops/outbox/not-a-row")).andExpect(status().isNotFound());
+    mockMvc.perform(post("/ops/outbox/not-a-row/cancel")).andExpect(status().isNotFound());
   }
 
   /**

@@ -55,13 +55,18 @@ class OutboxOpsOpenApiTests {
       GetMapping get = m.getAnnotation(GetMapping.class);
       PostMapping post = m.getAnnotation(PostMapping.class);
       if (get != null) {
-        ops.add("GET " + base + get.path()[0]);
+        ops.add("GET " + base + template(get.path()[0]));
       }
       if (post != null) {
-        ops.add("POST " + base + post.path()[0]);
+        ops.add("POST " + base + template(post.path()[0]));
       }
     }
     return ops;
+  }
+
+  /** A mapping's path as OAS writes it: {@code {id:\d+}} is the path parameter {@code {id}}. */
+  private static String template(String mapping) {
+    return mapping.replaceAll("\\{(\\w+):[^}]*}", "{$1}");
   }
 
   @Test
@@ -149,5 +154,14 @@ class OutboxOpsOpenApiTests {
     // OutboxRoundTripIT pins the behaviour: limit=99999 is a 200 with every row, not a 400
     assertThat(schema).doesNotContainKey("maximum").containsEntry("minimum", 1);
     assertThat(component("parameters", "outboxLimit").get("description").toString()).contains("CLAMPED");
+  }
+
+  @Test
+  @DisplayName("the row id is digits only, as the {id:\\d+} routes take it")
+  void theRowIdIsDigitsOnly() {
+    @SuppressWarnings("unchecked")
+    Map<String, Object> schema = (Map<String, Object>) component("parameters", "outboxRowId").get("schema");
+
+    assertThat(schema).containsEntry("type", "integer").containsEntry("format", "int64").containsEntry("minimum", 0);
   }
 }
