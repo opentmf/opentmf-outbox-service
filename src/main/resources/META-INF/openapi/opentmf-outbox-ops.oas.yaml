@@ -8,26 +8,41 @@
 # and the `components` under its own `components`, keeps the names, and may pin itself
 # to it with a drift test (README "OAS fragment"). The paging was MEASURED against
 # tmf630-toolkit 3.1.1 and is PINNED by OutboxRoundTripIT against the toolkit the library
-# builds with (3.4.0 in 1.4.0) — the numbers below are the toolkit's rules, not aspirations:
+# builds with (3.5.1 in 1.7.0) — the numbers below are the toolkit's rules, not aspirations:
 #
 #   status  200  total == 0, or offset == 0 and every row fit in the page
 #           206  otherwise (offset > 0, or fewer rows than the total in this page)
 #           416  total > 0 and offset >= total; a total of 0 is NEVER a 416
 #           400  limit <= 0 or non-numeric, an unknown FILTER field, an unknown state leg
+#                (the toolkit's own Tmf630Error; the state leg is the consumer's problem)
 #   limit   default = paging.default-limit (library default 50); a value ABOVE
 #           paging.max-limit (library default 500) is CLAMPED to it, not rejected
 #   headers X-Total-Count, X-Result-Count and Content-Range on 200, 206 and 416;
 #           Content-Range is 1-BASED ("items 1-50/281", "items */281" on 416, "items */0"
 #           when empty); Link (first/prev/next/last) on 200 and 206
 #   body    a BARE JSON array of rows on 200/206 (never PageImpl JSON); the toolkit's own
-#           error object on 400/416 — NOT the consumer's RFC 9457 problem (see Tmf630Error)
+#           error object on its 400/416 — NOT the consumer's RFC 9457 problem (see Tmf630Error)
+#
+# Every error the CONSUMER renders is documented too (1.7.0), so a verbatim paste is complete:
+#   - the library's own refusals (Spring ErrorResponses: 404, 409, the state leg's and the bulk
+#     unpark's 400) and Spring's binding refusals carry `OutboxProblem` as application/problem+json
+#     — what Spring's RFC 9457 rendering writes (MEASURED by OutboxOpsProblemDetailsIT with
+#     Boot's spring.mvc.problemdetails.enabled=true, and by OutboxOpsWireConformanceTests);
+#   - every operation names the answers the consumer's security and web layer give before it
+#     runs — 401, 403, 405, 406, 503, and 415 where a JSON body is read — by $ref to the
+#     outboxUnauthorized … outboxServiceUnavailable response components.
+# REFINABLE BY NAME: the components marked `x-opentmf-refinable: true` (those six responses and
+# the OutboxProblem schema) are the consumer's own answers. A consumer may REDEFINE a marked
+# component under the SAME name — its wording, its headers, its problem schema (for example
+# `OutboxProblem: { $ref: '#/components/schemas/ProblemDetail' }`) — and the pasted paths stay
+# verbatim. Everything unmarked is the library's and is pasted verbatim.
 #
 # Paths are relative to the consumer's server URL (the library mounts under /ops on the
 # main port); the consumer's deny-by-default security gates them as admin-class.
 openapi: 3.1.0
 info:
   title: opentmf-outbox-service /ops/outbox fragment
-  version: 1.4.0
+  version: 1.7.0
   description: >-
     Paste-in contract for the outbox ops surface served by opentmf-outbox-service.
     Not a standalone API document — a fragment the consumer's OAS absorbs. The library's
@@ -63,11 +78,13 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/outboxPage' }
         '206': { $ref: '#/components/responses/outboxPartialPage' }
-        '400':
-          description: >-
-            An unknown state leg (a Spring `ErrorResponse` rendered by the consumer's error
-            handling), or a toolkit paging / filter error (see `Tmf630Error`).
+        '400': { $ref: '#/components/responses/outboxBadRequest' }
+        '401': { $ref: '#/components/responses/outboxUnauthorized' }
+        '403': { $ref: '#/components/responses/outboxForbidden' }
+        '405': { $ref: '#/components/responses/outboxMethodNotAllowed' }
+        '406': { $ref: '#/components/responses/outboxNotAcceptable' }
         '416': { $ref: '#/components/responses/outboxRangeNotSatisfiable' }
+        '503': { $ref: '#/components/responses/outboxServiceUnavailable' }
 
   /ops/outbox/state/{state}:
     get:
@@ -90,11 +107,13 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/outboxPage' }
         '206': { $ref: '#/components/responses/outboxPartialPage' }
-        '400':
-          description: >-
-            An unknown state leg (a Spring `ErrorResponse` rendered by the consumer's error
-            handling), or a toolkit paging / filter error (see `Tmf630Error`).
+        '400': { $ref: '#/components/responses/outboxBadRequest' }
+        '401': { $ref: '#/components/responses/outboxUnauthorized' }
+        '403': { $ref: '#/components/responses/outboxForbidden' }
+        '405': { $ref: '#/components/responses/outboxMethodNotAllowed' }
+        '406': { $ref: '#/components/responses/outboxNotAcceptable' }
         '416': { $ref: '#/components/responses/outboxRangeNotSatisfiable' }
+        '503': { $ref: '#/components/responses/outboxServiceUnavailable' }
 
   /ops/outbox/parked:
     get:
@@ -110,7 +129,12 @@ paths:
         '200': { $ref: '#/components/responses/outboxPage' }
         '206': { $ref: '#/components/responses/outboxPartialPage' }
         '400': { $ref: '#/components/responses/outboxBadRequest' }
+        '401': { $ref: '#/components/responses/outboxUnauthorized' }
+        '403': { $ref: '#/components/responses/outboxForbidden' }
+        '405': { $ref: '#/components/responses/outboxMethodNotAllowed' }
+        '406': { $ref: '#/components/responses/outboxNotAcceptable' }
         '416': { $ref: '#/components/responses/outboxRangeNotSatisfiable' }
+        '503': { $ref: '#/components/responses/outboxServiceUnavailable' }
 
   /ops/outbox/{id}:
     get:
@@ -124,8 +148,24 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OutboxRow' }
-        '404':
-          description: No row with this id
+        '400':
+          description: >-
+            The id is digits but beyond int64 (Spring's binding refusal, rendered by the
+            consumer as `OutboxProblem`) - or, where the consumer switched tmf630-toolkit's
+            undeclared-query-parameter guard to REJECT (3.5.0, opt-in), a query parameter this
+            route does not take (the toolkit's `Tmf630Error`, `reason` "Unknown query
+            parameter.").
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tmf630Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/OutboxProblem' }
+        '401': { $ref: '#/components/responses/outboxUnauthorized' }
+        '403': { $ref: '#/components/responses/outboxForbidden' }
+        '404': { $ref: '#/components/responses/outboxRowNotFound' }
+        '405': { $ref: '#/components/responses/outboxMethodNotAllowed' }
+        '406': { $ref: '#/components/responses/outboxNotAcceptable' }
+        '503': { $ref: '#/components/responses/outboxServiceUnavailable' }
 
   /ops/outbox/{id}/unpark:
     post:
@@ -142,10 +182,18 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OutboxOpsAck' }
-        '404':
-          description: No row with this id
+        '400': { $ref: '#/components/responses/outboxRowIdOutOfRange' }
+        '401': { $ref: '#/components/responses/outboxUnauthorized' }
+        '403': { $ref: '#/components/responses/outboxForbidden' }
+        '404': { $ref: '#/components/responses/outboxRowNotFound' }
+        '405': { $ref: '#/components/responses/outboxMethodNotAllowed' }
+        '406': { $ref: '#/components/responses/outboxNotAcceptable' }
         '409':
           description: The row is not parked (already relayed, cancelled, or still pending)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/OutboxProblem' }
+        '503': { $ref: '#/components/responses/outboxServiceUnavailable' }
 
   /ops/outbox/unpark:
     post:
@@ -173,8 +221,17 @@ paths:
               schema: { $ref: '#/components/schemas/OutboxUnparkReport' }
         '400':
           description: >-
-            `destination` missing or blank (a Spring `ErrorResponse` rendered by the
-            consumer's error handling).
+            `destination` missing or blank (the library's `ErrorResponse`), or a body that is
+            not a readable `OutboxUnparkFilter` (Spring's refusal) - rendered by the consumer.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/OutboxProblem' }
+        '401': { $ref: '#/components/responses/outboxUnauthorized' }
+        '403': { $ref: '#/components/responses/outboxForbidden' }
+        '405': { $ref: '#/components/responses/outboxMethodNotAllowed' }
+        '406': { $ref: '#/components/responses/outboxNotAcceptable' }
+        '415': { $ref: '#/components/responses/outboxUnsupportedMediaType' }
+        '503': { $ref: '#/components/responses/outboxServiceUnavailable' }
 
   /ops/outbox/{id}/cancel:
     post:
@@ -194,12 +251,20 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OutboxOpsAck' }
-        '404':
-          description: No row with this id
+        '400': { $ref: '#/components/responses/outboxRowIdOutOfRange' }
+        '401': { $ref: '#/components/responses/outboxUnauthorized' }
+        '403': { $ref: '#/components/responses/outboxForbidden' }
+        '404': { $ref: '#/components/responses/outboxRowNotFound' }
+        '405': { $ref: '#/components/responses/outboxMethodNotAllowed' }
+        '406': { $ref: '#/components/responses/outboxNotAcceptable' }
         '409':
           description: >-
             The row is already relayed, already cancelled, or its send is in flight (a live
             lease; retry once it is booked)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/OutboxProblem' }
+        '503': { $ref: '#/components/responses/outboxServiceUnavailable' }
 
   /ops/outbox/maintenance/prune:
     post:
@@ -219,6 +284,11 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OutboxPruneReport' }
+        '401': { $ref: '#/components/responses/outboxUnauthorized' }
+        '403': { $ref: '#/components/responses/outboxForbidden' }
+        '405': { $ref: '#/components/responses/outboxMethodNotAllowed' }
+        '406': { $ref: '#/components/responses/outboxNotAcceptable' }
+        '503': { $ref: '#/components/responses/outboxServiceUnavailable' }
 
 components:
   parameters:
@@ -233,13 +303,17 @@ components:
       description: >-
         Page size. Default = the consumer's `paging.default-limit` (library default 50);
         a value above `paging.max-limit` (library default 500) is CLAMPED to it, not
-        rejected; 0 or a negative value is a 400.
-      schema: { type: integer, minimum: 1, default: 50, maximum: 500 }
+        rejected - so the schema declares no `maximum` (1.7.0: it said 500, which a
+        black-box suite reads as "501 must be refused"); 0 or a negative value is a 400.
+      schema: { type: integer, minimum: 1, default: 50 }
     outboxRowId:
       name: id
       in: path
       required: true
-      schema: { type: integer, format: int64 }
+      description: >-
+        The row id - digits only (1.7.0): the routes take `{id:\d+}`, so a segment that is not
+        digits (`unpark`, `-1`) matches no row route and is a 404, never this parameter's 400.
+      schema: { type: integer, format: int64, minimum: 0 }
 
   headers:
     X-Total-Count:
@@ -304,12 +378,92 @@ components:
           schema: { $ref: '#/components/schemas/Tmf630Error' }
     outboxBadRequest:
       description: >-
-        A toolkit rejection: `limit` <= 0 or non-numeric (`reason` "Invalid sort or paging
-        parameter."), or an unknown attribute-filter field. Rendered by the toolkit itself
-        as `Tmf630Error` — it does not pass through the consumer's problem-detail mapper.
+        A refused list request. The toolkit's own rejections — `limit` <= 0 or non-numeric
+        (`reason` "Invalid sort or paging parameter."), an unknown attribute-filter field,
+        and Spring's `page` / `size` where the consumer switched the toolkit's
+        undeclared-query-parameter guard to REJECT (3.5.1, opt-in) — are rendered by the
+        toolkit itself as `Tmf630Error` (application/json); they do not
+        pass through the consumer's problem-detail mapper. An unknown state leg (`?state=` or
+        `/state/{state}`) is the library's `ErrorResponse`, rendered by the consumer
+        (`OutboxProblem`, application/problem+json).
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Tmf630Error' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/OutboxProblem' }
+    outboxRowIdOutOfRange:
+      description: >-
+        The id is digits but beyond int64 (`9223372036854775808`): Spring's binding refuses it
+        before the operation runs, rendered by the consumer.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/OutboxProblem' }
+    outboxRowNotFound:
+      description: >-
+        No row with this id — the library's `ErrorResponse`, rendered by the consumer. An id
+        that is not digits (`unpark`, `-1`) matches no row route (1.7.0) and is the consumer's
+        404 for a path it does not map.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/OutboxProblem' }
+
+    # The consumer's own answers, given before any operation runs (1.7.0). Each is REFINABLE BY
+    # NAME (`x-opentmf-refinable`): the consumer may redefine it under the same name.
+    outboxUnauthorized:
+      x-opentmf-refinable: true
+      description: >-
+        No credentials, or credentials the consumer does not accept — answered by the consumer's
+        security. The library's routes carry no security of their own: the consumer gates
+        `/ops/outbox/**` as admin-class.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/OutboxProblem' }
+    outboxForbidden:
+      x-opentmf-refinable: true
+      description: >-
+        Authenticated, but not allowed the ops surface (the consumer's admin role) — answered by
+        the consumer's security.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/OutboxProblem' }
+    outboxMethodNotAllowed:
+      x-opentmf-refinable: true
+      description: >-
+        The path exists but does not serve this method (`GET /ops/outbox/unpark`,
+        `DELETE /ops/outbox/{id}`) — answered by the consumer's web layer. Spring MVC sends an
+        `Allow` header naming the methods the path serves; a consumer that withholds it says so
+        by refining this component.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/OutboxProblem' }
+    outboxNotAcceptable:
+      x-opentmf-refinable: true
+      description: >-
+        The `Accept` header admits none of the media types the operation produces
+        (application/json; application/problem+json for a refusal) — Spring MVC refuses before
+        the operation runs and writes the problem as application/problem+json although the
+        caller did not ask for it (its fallback for a problem detail).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/OutboxProblem' }
+    outboxUnsupportedMediaType:
+      x-opentmf-refinable: true
+      description: >-
+        The request body's `Content-Type` is not application/json — Spring MVC refuses before
+        the operation runs.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/OutboxProblem' }
+    outboxServiceUnavailable:
+      x-opentmf-refinable: true
+      description: >-
+        The consumer cannot serve the call now and says so before the operation runs — for
+        example, the identity provider's signing keys cannot be fetched, so no token can be
+        verified. Retry later; a `Retry-After` header may say when. The library itself never
+        answers 503.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/OutboxProblem' }
 
   schemas:
     OutboxRow:
@@ -410,3 +564,31 @@ components:
         message:
           type: string
           description: The specific cause — "limit must be > 0", "Requested offset 999999 does not …".
+
+    OutboxProblem:
+      x-opentmf-refinable: true
+      type: object
+      description: >-
+        The body of an answer the CONSUMER renders — the library's own refusals (Spring
+        `ErrorResponse`s: 400, 404, 409), Spring's binding and transport refusals (400, 405,
+        406, 415) and the consumer's security (401, 403, 503) — as an RFC 9457 problem
+        detail, the shape Spring's problem-detail rendering writes (Boot's
+        `spring.mvc.problemdetails.enabled=true`, or an advice extending
+        `ResponseEntityExceptionHandler`). Other members are allowed. Generic on purpose: a
+        consumer whose problem says more refines this schema UNDER THIS NAME (for example
+        `OutboxProblem: { $ref: '#/components/schemas/ProblemDetail' }`) and the pasted paths
+        stay verbatim. The toolkit's own 400/416 body is `Tmf630Error`, not this.
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          description: The problem type; `about:blank` when the status says it all.
+        title: { type: string }
+        status:
+          type: integer
+          description: The HTTP status, as a number (`Tmf630Error` carries it as a string).
+        detail: { type: string }
+        instance:
+          type: string
+          format: uri-reference
+          description: The request path.

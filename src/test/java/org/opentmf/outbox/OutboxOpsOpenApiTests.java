@@ -4,9 +4,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.RecordComponent;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -21,13 +23,71 @@ import org.yaml.snakeyaml.Yaml;
  * The shipped OAS fragment and the controller describe the SAME surface: every mapping of {@link
  * OutboxOpsController} is a fragment path with that method, and the fragment names nothing the
  * controller does not serve. A route added to one side without the other is a red build here,
- * not a consumer's discovery.
+ * not a consumer's discovery. Since 1.7.0 it also pins what a VERBATIM paste needs to be complete:
+ * every operation names the answers of the consumer's security and transport by reference, every
+ * error carries a body, and the components the consumer may refine are marked - nothing else.
  */
 class OutboxOpsOpenApiTests {
+
+  /** The answers of the CONSUMER's security and transport, on every operation (1.7.0). */
+  private static final Map<String, String> CONSUMER_ANSWERS =
+      Map.of(
+          "401", "outboxUnauthorized",
+          "403", "outboxForbidden",
+          "405", "outboxMethodNotAllowed",
+          "406", "outboxNotAcceptable",
+          "503", "outboxServiceUnavailable");
+
+  /** The marker of a component the consumer may redefine under the same name. */
+  private static final String REFINABLE = "x-opentmf-refinable";
 
   @SuppressWarnings("unchecked")
   private static Map<String, Object> fragment() {
     return new Yaml().load(OutboxOpsOpenApi.fragment());
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> components(String kind) {
+    return (Map<String, Object>) ((Map<String, Object>) fragment().get("components")).get(kind);
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> component(String kind, String name) {
+    return (Map<String, Object>) components(kind).get(name);
+  }
+
+  /** Every operation of the fragment, keyed "VERB /path". */
+  @SuppressWarnings("unchecked")
+  private static Map<String, Map<String, Object>> operations() {
+    Map<String, Map<String, Object>> paths = (Map<String, Map<String, Object>>) fragment().get("paths");
+    Map<String, Map<String, Object>> ops = new TreeMap<>();
+    paths.forEach(
+        (path, item) ->
+            item.forEach((verb, op) -> ops.put(verb.toUpperCase() + " " + path, (Map<String, Object>) op)));
+    return ops;
+  }
+
+  /** A response as the reader sees it: a {@code $ref} to a response component followed. */
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> resolved(Object response) {
+    Map<String, Object> map = (Map<String, Object>) response;
+    Object ref = map.get("$ref");
+    return ref == null ? map : component("responses", ref.toString().substring("#/components/responses/".length()));
+  }
+
+  private static void collectRefs(Object node, List<String> refs) {
+    if (node instanceof Map<?, ?> map) {
+      map.forEach(
+          (key, value) -> {
+            if ("$ref".equals(key)) {
+              refs.add(value.toString());
+            } else {
+              collectRefs(value, refs);
+            }
+          });
+    } else if (node instanceof List<?> list) {
+      list.forEach(item -> collectRefs(item, refs));
+    }
   }
 
   private static Set<String> fragmentOperations() {
@@ -45,13 +105,18 @@ class OutboxOpsOpenApiTests {
       GetMapping get = m.getAnnotation(GetMapping.class);
       PostMapping post = m.getAnnotation(PostMapping.class);
       if (get != null) {
-        ops.add("GET " + base + get.path()[0]);
+        ops.add("GET " + base + template(get.path()[0]));
       }
       if (post != null) {
-        ops.add("POST " + base + post.path()[0]);
+        ops.add("POST " + base + template(post.path()[0]));
       }
     }
     return ops;
+  }
+
+  /** A mapping's path as OAS writes it: {@code {id:\d+}} is the path parameter {@code {id}}. */
+  private static String template(String mapping) {
+    return mapping.replaceAll("\\{(\\w+):[^}]*}", "{$1}");
   }
 
   @Test
@@ -128,5 +193,118 @@ class OutboxOpsOpenApiTests {
       served.add(component.getName());
     }
     assertThat(documented).isEqualTo(served);
+  }
+
+  @Test
+  @DisplayName("limit declares no maximum: the toolkit CLAMPS a larger value to max-limit, it never rejects it")
+  void theLimitDeclaresNoMaximum_becauseALargerValueIsClamped() {
+    @SuppressWarnings("unchecked")
+    Map<String, Object> schema = (Map<String, Object>) component("parameters", "outboxLimit").get("schema");
+
+    // OutboxRoundTripIT pins the behaviour: limit=99999 is a 200 with every row, not a 400
+    assertThat(schema).doesNotContainKey("maximum").containsEntry("minimum", 1);
+    assertThat(component("parameters", "outboxLimit").get("description").toString()).contains("CLAMPED");
+  }
+
+  @Test
+  @DisplayName("the row id is digits only, as the {id:\\d+} routes take it")
+  void theRowIdIsDigitsOnly() {
+    @SuppressWarnings("unchecked")
+    Map<String, Object> schema = (Map<String, Object>) component("parameters", "outboxRowId").get("schema");
+
+    assertThat(schema).containsEntry("type", "integer").containsEntry("format", "int64").containsEntry("minimum", 0);
+  }
+
+  @Test
+  @DisplayName("every operation names the consumer's security and transport answers by reference; 415 where a body is read")
+  void everyOperationDocumentsTheConsumersAnswers() {
+    operations()
+        .forEach(
+            (name, op) -> {
+              @SuppressWarnings("unchecked")
+              Map<String, Object> responses = (Map<String, Object>) op.get("responses");
+              CONSUMER_ANSWERS.forEach(
+                  (code, component) ->
+                      assertThat(responses)
+                          .as("%s %s", name, code)
+                          .containsEntry(code, Map.of("$ref", "#/components/responses/" + component)));
+              if (op.containsKey("requestBody")) {
+                assertThat(responses)
+                    .as("%s 415", name)
+                    .containsEntry("415", Map.of("$ref", "#/components/responses/outboxUnsupportedMediaType"));
+              } else {
+                assertThat(responses).as("%s reads no body", name).doesNotContainKey("415");
+              }
+            });
+  }
+
+  @Test
+  @DisplayName("every error response carries a body: no description-only 4xx or 5xx")
+  void everyErrorResponseCarriesABody() {
+    operations()
+        .forEach(
+            (name, op) -> {
+              @SuppressWarnings("unchecked")
+              Map<String, Object> responses = (Map<String, Object>) op.get("responses");
+              responses.forEach(
+                  (code, response) -> {
+                    if (!code.startsWith("2")) {
+                      assertThat(resolved(response)).as("%s %s", name, code).containsKey("content");
+                    }
+                  });
+            });
+  }
+
+  @Test
+  @DisplayName("the consumer's answers and the problem body are the refinable components - and nothing else is")
+  void onlyTheConsumersAnswersAreRefinable() {
+    Set<String> expected = new TreeSet<>();
+    CONSUMER_ANSWERS.values().forEach(c -> expected.add("responses." + c));
+    expected.add("responses.outboxUnsupportedMediaType");
+    expected.add("schemas.OutboxProblem");
+
+    Set<String> marked = new TreeSet<>();
+    @SuppressWarnings("unchecked")
+    Map<String, Map<String, Map<String, Object>>> all =
+        (Map<String, Map<String, Map<String, Object>>>) fragment().get("components");
+    all.forEach(
+        (kind, defs) ->
+            defs.forEach(
+                (name, def) -> {
+                  if (Boolean.TRUE.equals(def.get(REFINABLE))) {
+                    marked.add(kind + "." + name);
+                  }
+                }));
+    assertThat(marked).isEqualTo(expected);
+
+    for (String response : expected) {
+      if (response.startsWith("responses.")) {
+        assertThat(component("responses", response.substring("responses.".length())))
+            .as(response)
+            .containsEntry(
+                "content",
+                Map.of(
+                    "application/problem+json",
+                    Map.of("schema", Map.of("$ref", "#/components/schemas/OutboxProblem"))));
+      }
+    }
+    @SuppressWarnings("unchecked")
+    Map<String, Object> problem = (Map<String, Object>) component("schemas", "OutboxProblem").get("properties");
+    assertThat(problem).containsOnlyKeys("type", "title", "status", "detail", "instance");
+  }
+
+  @Test
+  @DisplayName("every $ref of the fragment resolves inside the fragment")
+  void everyReferenceResolves() {
+    List<String> refs = new ArrayList<>();
+    collectRefs(fragment(), refs);
+
+    assertThat(refs).isNotEmpty();
+    for (String ref : refs) {
+      String[] parts = ref.split("/");
+      assertThat(parts).as(ref).hasSize(4);
+      assertThat(parts[0] + "/" + parts[1]).as(ref).isEqualTo("#/components");
+      assertThat(components(parts[2])).as(ref).containsKey(parts[3]);
+    }
   }
 }

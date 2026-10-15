@@ -1,5 +1,91 @@
 # Changelog
 
+## 1.7.0 - 2026-10-15
+
+The ops surface's contract, as the first black-box suites run against a pasted fragment found
+it: the shipped OAS fragment says what the routes really do, a verbatim paste of it is
+complete, and a literal sibling segment is never read as a row id.
+
+### Changed (behaviour - read before upgrading)
+
+- **The row routes take an id of digits only** (OUTBOX-OPS-ID-PATH-DIGITS-1). `GET
+  /ops/outbox/{id}` and the `{id}/unpark` and `{id}/cancel` POSTs were mapped without a
+  constraint, so `GET /ops/outbox/unpark` reached the inspect route and answered 400 ("not a
+  whole number"), and `OPTIONS /ops/outbox/unpark` advertised GET. They are `{id:\d+}` now:
+  - `GET /ops/outbox/unpark` is a 405 (the path serves POST only), and `OPTIONS` on it names
+    POST alone;
+  - any other segment that is not digits (`/ops/outbox/state`, `/ops/outbox/-1`,
+    `POST /ops/outbox/abc/cancel`) matches no route: a 404 where it was a 400;
+  - digits beyond a `long` are still Spring's binding refusal, a 400.
+
+  Every valid request answers as before. Only a check that expected the 400 on a wrong path
+  sees a different code.
+
+### Changed (the OAS fragment - re-paste it)
+
+`META-INF/openapi/opentmf-outbox-ops.oas.yaml`, `info.version` 1.7.0. The paths and the
+2xx shapes are unchanged; the fragment loses one bound and gains the error answers.
+
+- **`limit` declares no `maximum`** (OUTBOX-OAS-LIMIT-CLAMP-1). The parameter said
+  `maximum: 500` while its description, and the toolkit, CLAMP a larger value to
+  `paging.max-limit` (`limit=501` is a 200). A black-box suite read the bound as "501 must be
+  refused". The clamp stays; the schema now agrees with it.
+- **Every error is documented, with its body** (OUTBOX-OAS-FRAGMENT-SECURITY-RESPONSES-1).
+  Before, the fragment named only the library's own 4xx, some without a body, and every
+  consumer layered its security and transport answers by hand, which broke exact-equality
+  drift tests. Now:
+  - every operation names, by `$ref`, the answers the consumer gives before it runs: 401
+    `outboxUnauthorized`, 403 `outboxForbidden`, 405 `outboxMethodNotAllowed`, 406
+    `outboxNotAcceptable`, 503 `outboxServiceUnavailable`, and 415
+    `outboxUnsupportedMediaType` on the bulk unpark's JSON body;
+  - every error the consumer renders carries `OutboxProblem`, a generic RFC 9457 problem
+    (`type`, `title`, `status` as a number, `detail`, `instance`; other members allowed), as
+    `application/problem+json` - what Spring writes with problem details on. The library's
+    own refusals gain it too: `outboxRowNotFound` (404) and `outboxRowIdOutOfRange` (400) on
+    the three row routes, the 409s, the bulk unpark's 400;
+  - `outboxBadRequest` on the three lists documents both renderings: the toolkit's
+    `Tmf630Error` (`application/json`) and the unknown state leg's problem;
+  - `outboxRowId` says digits only (`minimum: 0`);
+  - tmf630-toolkit's undeclared-query-parameter guard (3.5.0, opt-in, `IGNORE` by default):
+    where a consumer switches it to `REJECT`, its 400s are documented too - Spring's
+    `page` / `size` on the three lists (`outboxBadRequest`, `Tmf630Error`) and a query
+    parameter the inspect GET does not take (its 400 now lists `Tmf630Error` beside
+    `OutboxProblem`).
+
+  `OutboxOpsProblemDetailsIT` measures the media types on the real app, with the real toolkit,
+  `spring.mvc.problemdetails.enabled=true` and the guard on `REJECT`: the toolkit's own 400
+  and 416 stay `application/json` beside Boot's problem handler; the state leg's 400 and the
+  406 are `application/problem+json`.
+- **Refinable by name.** The six consumer answers and `OutboxProblem` carry
+  `x-opentmf-refinable: true`. A consumer may redefine a marked component under the SAME name
+  (its wording, headers such as `Retry-After`, its own problem schema - e.g.
+  `OutboxProblem: { $ref: '#/components/schemas/ProblemDetail' }`) and paste everything else
+  verbatim. A drift test compares the paths exactly and the components exactly unless
+  marked (README "OAS fragment" shows one).
+- **Consumers:** re-paste the fragment. Hand-layered 401/403/405/406/415/503 on the ops
+  routes are now part of it, and a named waiver for the `limit` bound or for
+  `/ops/outbox/unpark` can go.
+
+### Dependencies
+
+- tmf630-toolkit 3.4.0 → 3.5.1: the opt-in undeclared-query-parameter guard (default
+  `IGNORE`: nothing changes until a consumer switches it on; the fragment documents its
+  `REJECT` answers, above).
+- central-publishing-maven-plugin 0.11.0 → 0.12.0 (release profile only).
+- Held by name: pitest-maven 1.19.6 (latest 1.30.1), Gökhan's hold. Every other
+  property and plugin is current; the parent spring-boot-starter-parent 4.1.1 is the latest
+  GA.
+
+### Added (tests)
+
+- `OpsFragmentConformance`: a black-box check in miniature. A request answers the expected
+  status, the fragment documents it on that operation, and names the media type it was
+  written in. `OutboxOpsWireConformanceTests` (standalone, Spring's RFC 9457 advice) and
+  `OutboxOpsProblemDetailsIT` (the real application) use it.
+- `OutboxOpsRoutingTests` and `OutboxRoundTripIT` pin the digits-only row routes;
+  `OutboxOpsOpenApiTests` pins the per-operation codes, a body on every error, the refinable
+  set and that every `$ref` resolves.
+
 ## 1.6.0 - 2026-10-13
 
 The relay's claim cadence: one pod moves an order of magnitude more CONCURRENT rows, and

@@ -750,6 +750,13 @@ surface):
 | GET    | `/ops/outbox/parked`          | Runbook alias of `/ops/outbox/state/parked`                           |
 | GET    | `/ops/outbox/{id}`            | One row in full — payload + `last_error`, the pre-unpark forensic read (behind the consumer's admin role, by ruling) |
 
+The row routes take an id of **digits only** (`{id:\d+}`, 1.7.0). A literal sibling segment
+is never read as an id: `GET /ops/outbox/unpark` is the 405 of a path that serves POST only
+(up to 1.6.0 it reached the inspect route and answered 400, "not a whole number"), `OPTIONS`
+on it names POST alone, and any other segment that is not digits (`/ops/outbox/state`,
+`/ops/outbox/-1`) matches no route and is a 404. Digits beyond a `long` are still Spring's
+binding refusal, a 400.
+
 **The prune at scale (1.3.0).**
 - **How it deletes.** Batches of `maintenance.batch-size` terminal rows, oldest first, found
   through `ix_outbox_relayed_on` / `ix_outbox_cancelled_on` and deleted by id in one
@@ -831,7 +838,7 @@ documented absence — never a silently degraded endpoint). A toolkit-less
 consumer keeps the full `OutboxMaintenanceService` API and can wire its own
 endpoints.
 
-### OAS fragment (1.3.0)
+### OAS fragment (1.3.0; complete since 1.7.0)
 
 The ops surface is documented ONCE, in the jar:
 `META-INF/openapi/opentmf-outbox-ops.oas.yaml` (`OutboxOpsOpenApi.fragment()` returns its
@@ -839,24 +846,81 @@ text). It carries the eight routes above — the unpark by filter included, with
 prune's and unpark's `moreTo…` flags and the row view's `inFlight` / `claimedUntil` — with
 the TMF630 paging the toolkit really answers —
 200 / 206 / 416, `X-Total-Count`, `X-Result-Count`, a 1-based `Content-Range`, `Link`, the
-clamp of `limit` at `max-limit`, and the toolkit's own error object on 400/416 (which does
-NOT pass through the consumer's problem-detail mapper). Consumers paste its `paths` and
-`components` into their own OAS under their own server URL and security, keep the component
-names, and pin themselves with a drift test:
+clamp of `limit` at `max-limit` (so `limit` declares no `maximum` since 1.7.0), and the
+toolkit's own error object on its 400/416 (which does NOT pass through the consumer's
+problem-detail mapper).
+
+**Every error is documented, with its body (1.7.0)**, so a verbatim paste is complete:
+
+| Code | On | Answered by | Component |
+|---|---|---|---|
+| 400 | the three lists | the toolkit (`Tmf630Error`, application/json) - with its undeclared-query-parameter guard on REJECT also for Spring's `page` / `size`; an unknown state leg: the library, rendered by the consumer (problem) | `outboxBadRequest` |
+| 400 | the three row routes | Spring's binding: digits beyond int64 (problem); on the inspect GET also the toolkit guard on REJECT: an undeclared query parameter (`Tmf630Error`) | `outboxRowIdOutOfRange` on the POSTs, inline on the GET |
+| 400 | the bulk unpark | the library (no destination) or Spring (unreadable body) | inline |
+| 404 | the three row routes | the library (no such row); an id that is not digits matches no route | `outboxRowNotFound` |
+| 409 | the single unpark and cancel | the library (the row is not in the state the action needs) | inline |
+| 416 | the three lists | the toolkit (`Tmf630Error`) | `outboxRangeNotSatisfiable` |
+| 401, 403, 503 | every operation | the consumer's security | `outboxUnauthorized`, `outboxForbidden`, `outboxServiceUnavailable` |
+| 405, 406 | every operation | the consumer's web layer (Spring MVC) | `outboxMethodNotAllowed`, `outboxNotAcceptable` |
+| 415 | the bulk unpark | the consumer's web layer (Spring MVC) | `outboxUnsupportedMediaType` |
+
+Every error the consumer renders carries the generic RFC 9457 body `OutboxProblem`
+(`type`, `title`, `status` as a number, `detail`, `instance`; other members allowed) as
+`application/problem+json` — what Spring writes for these answers when problem details are
+on (`spring.mvc.problemdetails.enabled=true`, or an advice extending
+`ResponseEntityExceptionHandler`). `OutboxOpsProblemDetailsIT` measures it on the real app
+with the real toolkit: the toolkit's 400/416 stay `application/json` beside Boot's handler,
+the state leg's 400 and the 406 are problem+json; with the toolkit's undeclared-query-parameter
+guard switched to REJECT (opt-in since 3.5.0) its refusals are `Tmf630Error` too, on the lists
+and on the inspect GET. The fragment documents that rendering: a
+consumer still on Boot's default error JSON (`application/json`, `{timestamp, status, error,
+path}`) turns problem details on, or renders Spring's `ErrorResponse`s as problems in its own
+advice, rather than editing the library's components.
+
+**Refinable by name.** The six answers of the consumer's security and web layer
+(`outboxUnauthorized`, `outboxForbidden`, `outboxMethodNotAllowed`, `outboxNotAcceptable`,
+`outboxUnsupportedMediaType`, `outboxServiceUnavailable`) and the `OutboxProblem` schema
+are the consumer's own answers, and they are marked `x-opentmf-refinable: true`. A consumer
+may REDEFINE a marked component under the SAME name — its own wording, headers such as
+`Retry-After` or `WWW-Authenticate`, its own problem schema — and the pasted paths stay
+verbatim:
+
+```yaml
+components:
+  schemas:
+    OutboxProblem: { $ref: '#/components/schemas/ProblemDetail' }   # the consumer's problem
+  responses:
+    outboxServiceUnavailable: { $ref: '#/components/responses/SigningKeysUnavailable' }
+```
+
+Everything unmarked is the library's and is pasted verbatim. Consumers paste the `paths`
+and `components` into their own OAS under their own server URL and security, keep the
+component names, and pin themselves with a drift test that honours the marker:
 
 ```java
 @Test
-void theOpsSubtreeMatchesTheLibraryFragment() {
+void theOpsSurfaceIsPastedAsTheLibraryDescribesIt() {
   Map<String, Object> mine = new Yaml().load(myOasText());
   Map<String, Object> theirs = new Yaml().load(OutboxOpsOpenApi.fragment());
-  assertThat(opsSubtree(mine)).isEqualTo(opsSubtree(theirs)); // paths starting /ops/outbox
+  assertThat(opsPaths(mine)).isEqualTo(opsPaths(theirs)); // paths starting /ops/outbox
+  components(theirs).forEach((kind, name, definition) -> {
+    if (Boolean.TRUE.equals(definition.get("x-opentmf-refinable"))) {
+      assertThat(components(mine, kind)).containsKey(name); // refined, same name
+    } else {
+      assertThat(components(mine, kind)).containsEntry(name, definition); // verbatim
+    }
+  });
 }
 ```
 
 The library's own guard (`OutboxOpsOpenApiTests`) keeps the fragment equal to the
-controller's mappings and its `OutboxRow` schema equal to `OutboxRowView`'s fields, and `OutboxRoundTripIT` pins the paging behaviour against the real
-toolkit — a toolkit bump that changes it turns THIS build red, not four consumers' OAS files
-silently wrong.
+controller's mappings and its `OutboxRow` schema equal to `OutboxRowView`'s fields, and pins
+the per-operation error codes, a body on every error, the refinable set and that every
+`$ref` resolves. `OutboxRoundTripIT` pins the paging behaviour against the real toolkit, and
+`OpsFragmentConformance` (used by `OutboxOpsWireConformanceTests` and
+`OutboxOpsProblemDetailsIT`) checks each provoked answer's status AND media type against
+the fragment — a toolkit or Spring bump that changes them turns THIS build red, not the
+consumers' OAS files silently wrong.
 
 ### Seal rule (ArchUnit)
 
@@ -1056,10 +1120,11 @@ Accepted survivors, each reviewed:
 | `OutboxRelay` thread factory | removed `setDaemon` | Asserted by `OutboxRelayTests` in every normal run; PIT's per-line selection misses the factory-lambda mapping |
 | `OutboxMetrics` thread factory | removed `setDaemon` | Asserted by `OutboxMetricsTests` (the refresher thread is a daemon); same factory-lambda mapping miss |
 
-`NO_COVERAGE` entries (the Kafka publisher bean method, ops controller) are
-exercised by the Testcontainers ITs, which the posture deliberately keeps out
-of PIT (unit tests only); the other auto-configuration bean methods are
-covered by `KafkaLessStartupTests` since 1.2.1.
+`NO_COVERAGE` entries (the Kafka publisher bean method) are exercised by the
+Testcontainers ITs, which the posture deliberately keeps out of PIT (unit tests
+only); the other auto-configuration bean methods are covered by
+`KafkaLessStartupTests` since 1.2.1, and the ops controller's mutants are all
+killed by `OutboxOpsRoutingTests` since 1.7.0.
 
 ## Version History
 
