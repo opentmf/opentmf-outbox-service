@@ -85,6 +85,10 @@ before upgrading.
   it is booked" - instead of "its send may be delivering now"; the inspect's `inFlight` and the
   OAS fragment's cancel description read the same way.
 
+- **Throughput:** unchanged at 8 slots (`OutboxRelayThroughputIT`, alternating A/B on a quiet
+  box: 548-559 rows/s against 526-569 for 1.8.0's code); at 64 slots 7.6 % lower (1,449 against
+  1,568 rows/s; 10,000 rows in 6.8 s, the bar 15 s) - the per-send bookkeeping of the heartbeat
+  and the live-slot depth.
 - **Pool sizing:** the send heartbeat's renewal (or a give-back) can hold a connection beside
   the claim, an ORDERED booking, the gauges and every slot's booking. Size the pool above
   `concurrent.max-in-flight` + 4 (was + 3).

@@ -129,7 +129,9 @@ class OutboxMaintenanceServiceTests {
           .as(lane.name())
           .isInstanceOf(OutboxRowInFlightException.class) // an IllegalStateException: 409
           .hasMessageContaining("claimed by a relay") // queued or sending (1.9.0 wording)
-          .hasMessageContaining("cancellable once it is booked");
+          .hasMessageContaining("cancellable once it is booked")
+          .extracting(e -> ((OutboxRowInFlightException) e).claimedUntil())
+          .isEqualTo(inFlight.getClaimedUntil());
       assertThat(inFlight.getCancelledOn()).as(lane.name()).isNull();
     }
   }

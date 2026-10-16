@@ -227,6 +227,7 @@ public final class Receiver {
 
   /** Per row, the lease stamp its FIRST send carried - the claim that sent it, less its lease. */
   private static final Map<Long, OffsetDateTime> FIRST_STAMP = new ConcurrentHashMap<>();
+
   private static final Map<Long, Integer> LISTENED = new ConcurrentHashMap<>();
   private static volatile CountDownLatch released = new CountDownLatch(1);
   private static SplittableRandom random = new SplittableRandom(0);

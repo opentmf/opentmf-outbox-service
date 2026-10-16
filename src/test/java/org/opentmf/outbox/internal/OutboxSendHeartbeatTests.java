@@ -9,6 +9,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -18,6 +19,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.opentmf.outbox.OutboxEvent;
@@ -73,9 +75,65 @@ class OutboxSendHeartbeatTests {
     assertThat(stamps.getValue())
         .matches("\\{\"\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{6}Z\"}");
     assertThat(row.stamp).isAfter(before.plusSeconds(1)); // now + 3 s, from now + 1 s
+    assertThat(row.stamp).isBefore(before.plusSeconds(3)); // a lease from now, not the bound
     assertThat(row.marked).isTrue();
     assertThat(row.lost).isFalse();
     heartbeat.finished(row);
+  }
+
+  /** Marked, its lease already at its bound: nothing to write - no statement. */
+  @Test
+  void aMarkedSendAtItsBound_isLeftAlone() {
+    Leased row = row(7L, Duration.ofSeconds(3), Duration.ofSeconds(1));
+    heartbeat.started(row);
+    row.marked = true;
+    // its bound (10 s from its start) falls half a second before its stamp, still ahead of now
+    row.sendStartedAt = row.stamp.toInstant().minus(Duration.ofSeconds(10)).minusMillis(500);
+
+    heartbeat.beat(); // a renewal could only shorten it: none
+
+    verify(repository, never()).renewSending(any(), any(), any(), any());
+    heartbeat.finished(row);
+  }
+
+  /** Not yet marked, near its bound: the renewal is the mark alone, never a shorter lease. */
+  @Test
+  void anUnmarkedSendNearItsBound_isMarked_itsLeaseNeverShortened() {
+    Leased row = row(7L, Duration.ofSeconds(3), Duration.ofSeconds(1));
+    OffsetDateTime before = row.stamp;
+    when(repository.renewSending(any(), any(), any(), any())).thenReturn(List.of(7L));
+    heartbeat.started(row);
+    row.sendStartedAt = Instant.now().minus(Duration.ofMillis(9_800)); // bound in 200 ms
+
+    heartbeat.beat();
+
+    assertThat(row.marked).isTrue();
+    assertThat(row.stamp).isEqualTo(before); // the deadline lies before the stamp: kept
+    heartbeat.finished(row);
+  }
+
+  /** Every tick also measures the clock when due and runs what the relay registered. */
+  @Test
+  void aBeat_measuresTheClock_andRunsTheRegisteredTasks() {
+    AtomicInteger measured = new AtomicInteger();
+    OutboxSendHeartbeat counted =
+        new OutboxSendHeartbeat(
+            repository,
+            TransactionOperations.withoutTransaction(),
+            new OutboxClock(
+                Clock.systemUTC(),
+                () -> {
+                  measured.incrementAndGet();
+                  return Instant.now();
+                }),
+            Duration.ofSeconds(10));
+    AtomicInteger ran = new AtomicInteger();
+    counted.onBeat(ran::incrementAndGet);
+
+    counted.beat();
+
+    assertThat(measured).hasValue(OutboxClock.SAMPLES);
+    assertThat(ran).hasValue(1);
   }
 
   @Test

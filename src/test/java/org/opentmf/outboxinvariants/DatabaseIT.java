@@ -187,11 +187,11 @@ class DatabaseIT {
   /**
    * The drain's starvation bound. The CONCURRENT claim takes keys round-robin and a key's rows in
    * {@code id} order, so its ORDER is round by round (a key's first row, then its second, ...),
-   * keys in string order within a round. A row with {@code r} rows ahead of it in that order, on
-   * a drain of {@code N} rows that took {@code T}, gets its turn at about {@code T x r / N}; it
-   * may wait {@value #TURN_FACTOR} times that (two pods walk with their own cursors, the pace
-   * is not uniform) plus {@link #TURN_SLACK} - never more. A row passed over for good would
-   * exceed it; a drain that merely takes its time does not.
+   * keys in string order within a round. A row with {@code r} rows ahead of it in that order, on a
+   * drain of {@code N} rows that took {@code T}, gets its turn at about {@code T x r / N}; it may
+   * wait {@value #TURN_FACTOR} times that (two pods walk with their own cursors, the pace is not
+   * uniform) plus {@link #TURN_SLACK} - never more. A row passed over for good would exceed it; a
+   * drain that merely takes its time does not.
    */
   private static void starvedInClaimOrder(Findings f, Instant eligible) {
     Map<Long, Delivery> first = new HashMap<>();
@@ -204,7 +204,10 @@ class DatabaseIT {
       drained = d.end().isAfter(drained) ? d.end() : drained;
     }
     Map<String, List<Long>> byKey = new HashMap<>();
-    first.values().forEach(d -> byKey.computeIfAbsent(d.destination(), k -> new ArrayList<>()).add(d.rowId()));
+    first
+        .values()
+        .forEach(
+            d -> byKey.computeIfAbsent(d.destination(), k -> new ArrayList<>()).add(d.rowId()));
     record Turn(long rowId, int round, String key) {}
     List<Turn> order = new ArrayList<>();
     byKey.forEach(
@@ -226,7 +229,10 @@ class DatabaseIT {
       worst = Math.max(worst, (waited - TURN_SLACK.toMillis()) / share);
       if (waited > TURN_FACTOR * share + TURN_SLACK.toMillis()) {
         if (late++ < 10) {
-          f.add("S", "row %d (claim-order rank %d of %d) waited %.0f ms - past %.1f x its share of the %.0f ms drain (%.0f ms) + %s".formatted(turn.rowId(), rank, n, waited, TURN_FACTOR, drain, share, TURN_SLACK));
+          f.add(
+              "S",
+              "row %d (claim-order rank %d of %d) waited %.0f ms - past %.1f x its share of the %.0f ms drain (%.0f ms) + %s"
+                  .formatted(turn.rowId(), rank, n, waited, TURN_FACTOR, drain, share, TURN_SLACK));
         }
       }
     }

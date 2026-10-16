@@ -1069,6 +1069,25 @@ class OutboxRelayWorkerTests {
     assertThat(third.getRelayedOn()).isNotNull();
   }
 
+  /**
+   * 1.9.0: an ORDERED row behind the batch head whose previous lease lapsed while its send was
+   * under way - its turn books the lapse (no send, no renewal), and the batch goes on.
+   */
+  @Test
+  void anOrderedRowWhoseSendLapsedBefore_isCountedInItsTurn_andTheBatchGoesOn() {
+    OutboxEvent first = pending(1L, 0);
+    OutboxEvent lapsed = lapsedWhileSending(2L, 0, Lane.ORDERED);
+    OutboxEvent third = pending(3L, 0);
+
+    relay();
+
+    assertThat(first.getRelayedOn()).isNotNull();
+    verify(publisher, never()).deliver(lapsed);
+    assertThat(lapsed.getAttempts()).isEqualTo(1);
+    assertThat(lapsed.getLastError()).startsWith("OutboxLeaseLapsedException");
+    assertThat(third.getRelayedOn()).isNotNull();
+  }
+
   @Test
   void anOrderedRowWhoseLeaseWasTaken_isSkipped() {
     OutboxEvent first = pending(1L, 0);

@@ -1341,6 +1341,16 @@ Accepted survivors, each reviewed:
 | `OutboxMetrics` thread factory | removed `setDaemon` | Asserted by `OutboxMetricsTests` (the refresher thread is a daemon); same factory-lambda mapping miss |
 | `OutboxOrderedLane` thread factory | removed `setDaemon` | Asserted by `OutboxOrderedLaneTests` (the ORDERED lane's thread is a daemon); same factory-lambda mapping miss |
 | `OutboxRelay.stop` / `OutboxOrderedLane.close` | removed `interrupt()` after an interrupted wait (no coverage) | Reached only when the stopping thread is itself interrupted mid-wait; restores the flag for the caller |
+| `OutboxClock.measure` / `measureIfDue` / `warnOnSkew` | the fastest-trip, uncertainty, re-measure and skew boundaries; the negated "back within" message | Equivalent at the exact nanosecond; the message is log-only |
+| `OutboxProperties.sendBound` / `httpReadTimeout`, `KafkaOutboxPublisher.longer`, `OutboxSendHeartbeat.bound` | `>=` vs `>` | Equivalent: equal durations give the same answer either way |
+| `OutboxConcurrentLane.liveSlots`, `OutboxSendHeartbeat.dueRenewal` | the horizon and two-thirds boundaries | Equivalent at the exact nanosecond |
+| `OutboxConcurrentLane.evictStranded` | `rowId >= 0` vs `> 0` | Equivalent: no row has id 0 (only a row-less send is `-1`) |
+| `OutboxRelayWorker` | removed `setSendingSince(null)` on the detached mirror, the cancelled release and the failure booking | Equivalent: every claim's stamp clears the column, and a lapse is counted only on a row that carries a lease AND the mark - every booking clears the lease |
+| `OutboxRelayWorker.book` / `giveBackStranded` | removed `addSuppressed`; the released count | Forensics- and log-only |
+| `OutboxRelay.start` / `stop`, `OutboxRelayWorker.send` | removed the send heartbeat's wiring (`onBeat`, `start`, `stop`, `started`, `finished`) | The heartbeat's own tests use it directly; the wiring is the invariants suite's (B1, B4, K1 assert renewals, the bound and the give-back) - PIT runs unit tests only |
+| `OutboxSendHeartbeat.finished` | removed `unlock` | Equivalent: a finished row leaves the sending set and is never locked by the heartbeat again |
+| `OutboxSendHeartbeat` thread factory | removed `setDaemon` | As the other factories: asserted where the thread runs, missed by PIT's per-line mapping |
+| `OutboxHttpClients` | the Apache, Jetty and Reactor branches (no coverage); the JDK client's read timeout; `present` → false | None of those clients is on the unit-test classpath, by design (and `present` false is that classpath's own answer); the read timeout is the suite's F4 |
 
 `NO_COVERAGE` entries (the Kafka publisher bean method) are exercised by the
 Testcontainers ITs, which the posture deliberately keeps out of PIT (unit tests

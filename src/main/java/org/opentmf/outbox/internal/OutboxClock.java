@@ -18,11 +18,10 @@ import lombok.extern.slf4j.Slf4j;
  * stamped leases that had already lapsed for every other pod.
  *
  * <p>Each measurement takes {@link #SAMPLES} round trips and keeps the FASTEST - the one with the
- * least room for an asymmetric delay - and an offset within that round trip's own uncertainty
- * (half of it, plus {@link #UNCERTAINTY_FLOOR}) is taken as none: a pod that shares the
- * database's clock stays on its own, never "corrected" by a slow round trip (through a proxy, on
- * a loaded host, a single trip can be a hundred milliseconds one way). A failed measurement keeps
- * the last offset; a
+ * least room for an asymmetric delay - and an offset within that round trip's own uncertainty (half
+ * of it, plus {@link #UNCERTAINTY_FLOOR}) is taken as none: a pod that shares the database's clock
+ * stays on its own, never "corrected" by a slow round trip (through a proxy, on a loaded host, a
+ * single trip can be a hundred milliseconds one way). A failed measurement keeps the last offset; a
  * pod that never reached the database runs on its own clock until it does. A skew above {@link
  * #WARN_SKEW} is logged - the relay is right either way, but the host's clock is not.
  *
@@ -99,8 +98,7 @@ public class OutboxClock {
         long roundTrip = System.nanoTime() - started;
         if (roundTrip < fastest) {
           fastest = roundTrip;
-          measuredOffset =
-              Duration.between(before.plusNanos(roundTrip / 2), databaseNow).toNanos();
+          measuredOffset = Duration.between(before.plusNanos(roundTrip / 2), databaseNow).toNanos();
         }
       }
       long uncertainty = fastest / 2 + UNCERTAINTY_FLOOR.toNanos();

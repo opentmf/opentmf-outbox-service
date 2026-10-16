@@ -156,10 +156,48 @@ class OutboxClockTests {
     assertThat(log.list).noneMatch(e -> e.getLevel() == Level.WARN);
   }
 
+  /** A database every round trip of which takes ~20 ms, its clock answering half-way. */
+  private static OutboxClock slowTrips(Duration skew) {
+    return new OutboxClock(
+        Clock.systemUTC(),
+        () -> {
+          try {
+            Thread.sleep(10);
+            Instant halfWay = Instant.now().plus(skew);
+            Thread.sleep(10);
+            return halfWay;
+          } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(ex);
+          }
+        });
+  }
+
+  /** The offset is taken against the JVM's instant HALF-way through the round trip. */
+  @Test
+  void theOffset_isMeasuredHalfWayThroughTheRoundTrip() {
+    OutboxClock clock = slowTrips(Duration.ofMinutes(5));
+
+    clock.measure();
+
+    assertThat(clock.offset()).isCloseTo(Duration.ofMinutes(5), Duration.ofMillis(6));
+  }
+
+  /** An offset beyond half the fastest round trip (plus a millisecond) is no noise: applied. */
+  @Test
+  void anOffsetBeyondHalfTheRoundTrip_isApplied_withinIt_isNone() {
+    OutboxClock beyond = slowTrips(Duration.ofMillis(25)); // uncertainty ~11 ms
+    beyond.measure();
+    assertThat(beyond.offset()).isBetween(Duration.ofMillis(18), Duration.ofMillis(32));
+
+    OutboxClock within = slowTrips(Duration.ofMillis(6));
+    within.measure();
+    assertThat(within.offset()).isZero();
+  }
+
   @Test
   void anOffsetAboveTheUncertainty_isApplied() {
-    OutboxClock clock =
-        new OutboxClock(Clock.systemUTC(), () -> Instant.now().plusMillis(40));
+    OutboxClock clock = new OutboxClock(Clock.systemUTC(), () -> Instant.now().plusMillis(40));
 
     clock.measure();
 
