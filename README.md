@@ -1110,7 +1110,7 @@ Accepted survivors, each reviewed:
 | `OutboxMaintenanceService.pruneExpired` / `unpark` (by filter) | the "anything to log" guard and the "more remain" message ternary (negations, boundaries) | Log-only; the counts and `moreTo…` flags are asserted by the unit tests and the ITs |
 | `OutboxMaintenanceService.pruneExpired` / `unpark` (by filter) | `nanoTime() < deadline` boundary | Equivalent: `<` vs `<=` on a nanosecond clock |
 | `OutboxRelayWorker.truncate` | `<=` vs `<` boundary | Equivalent mutant at exactly 4000 chars |
-| `OutboxRelayWorker.relayBatch` | negated `!lane.submit(...)` | Log-only: a send the closing lane refuses keeps its lease, which lapses |
+| `OutboxRelayWorker.relayBatch` | negated `!lane.submit(...)` and `!orderedLane.submit(...)` | Log-only: a send or a batch the closing lane refuses keeps its leases, which lapse |
 | `OutboxRelayWorker.waitedLong` | `>=` vs `>` boundary | Equivalent: the two differ only when the wait equals a tenth of the lease to the nanosecond |
 | `OutboxRelayWorker.bookRelayed` / `bookFailure` | removed `logLapsed`; negated cancelled check before the WARN | Log-only; the lapse and sent-but-cancelled outcomes are asserted by the worker tests and `OutboxLeaseIT` |
 | `OutboxLaneStamper.stamp` | removed `setOrderingKey(null)` in the failure path | Equivalent: the key is never set before the throw it recovers from |
@@ -1122,6 +1122,8 @@ Accepted survivors, each reviewed:
 | `OutboxRelay.poke` | removed `passQueued.set(false)` after a rejection | Reachable only after shutdown, when no further pass can run anyway |
 | `OutboxRelay` thread factory | removed `setDaemon` | Asserted by `OutboxRelayTests` in every normal run; PIT's per-line selection misses the factory-lambda mapping |
 | `OutboxMetrics` thread factory | removed `setDaemon` | Asserted by `OutboxMetricsTests` (the refresher thread is a daemon); same factory-lambda mapping miss |
+| `OutboxOrderedLane` thread factory | removed `setDaemon` | Asserted by `OutboxOrderedLaneTests` (the ORDERED lane's thread is a daemon); same factory-lambda mapping miss |
+| `OutboxRelay.stop` / `OutboxOrderedLane.close` | removed `interrupt()` after an interrupted wait (no coverage) | Reached only when the stopping thread is itself interrupted mid-wait; restores the flag for the caller |
 
 `NO_COVERAGE` entries (the Kafka publisher bean method) are exercised by the
 Testcontainers ITs, which the posture deliberately keeps out of PIT (unit tests

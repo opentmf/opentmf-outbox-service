@@ -17,6 +17,10 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import jakarta.persistence.Column;
@@ -49,6 +53,7 @@ import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.opentmf.outbox.OutboxRelayedListener;
 import org.opentmf.outbox.TerminalOutboxException;
 import org.springframework.beans.BeanUtils;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Limit;
 import org.springframework.transaction.support.TransactionCallback;
 import org.springframework.transaction.support.TransactionOperations;
@@ -74,6 +79,12 @@ class OutboxRelayWorkerTests {
       new OutboxConcurrentLane(2, 2, false, Duration.ofSeconds(5));
   /** The ORDERED lane's one thread (1.7.1): a batch is sent off the calling thread. */
   private final OutboxOrderedLane orderedLane = new OutboxOrderedLane(Duration.ofSeconds(5));
+
+  /**
+   * What the ORDERED lane logs: a batch that throws is caught and logged on the lane's thread, so
+   * no test would see it otherwise - every test ends with none.
+   */
+  private final ListAppender<ILoggingEvent> orderedLaneLog = new ListAppender<>();
   private int committed;
   private int rolledBack;
   private boolean failCommits;
@@ -117,6 +128,8 @@ class OutboxRelayWorkerTests {
   }
 
   OutboxRelayWorkerTests() {
+    orderedLaneLog.start();
+    ((Logger) LoggerFactory.getLogger(OutboxOrderedLane.class)).addAppender(orderedLaneLog);
     when(publisher.supports(any())).thenReturn(true);
     doThrow(new AssertionError("unstubbed publish")).when(publisher).publish(any());
     doReturn(null).when(publisher).deliver(any()); // delivered, no result - per test overridden
@@ -190,6 +203,10 @@ class OutboxRelayWorkerTests {
   void closeLane() {
     lane.close();
     orderedLane.close();
+    ((Logger) LoggerFactory.getLogger(OutboxOrderedLane.class)).detachAppender(orderedLaneLog);
+    assertThat(orderedLaneLog.list)
+        .as("no ORDERED batch threw on the lane's thread")
+        .noneMatch(event -> event.getLevel() == Level.ERROR);
   }
 
   /** The row under the lease {@code stamp}, as the lease guard reads it. */
