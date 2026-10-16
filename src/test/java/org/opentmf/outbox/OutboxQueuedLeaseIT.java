@@ -5,11 +5,9 @@ import static org.awaitility.Awaitility.await;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -143,7 +141,6 @@ class OutboxQueuedLeaseIT {
 
       // three seconds behind the busy slots - three times its lease, three sweeps
       Set<OffsetDateTime> stamps = ConcurrentHashMap.newKeySet();
-      List<Long> polls = new CopyOnWriteArrayList<>();
       await()
           .pollInterval(Duration.ofMillis(100))
           .during(Duration.ofSeconds(3))
@@ -154,7 +151,6 @@ class OutboxQueuedLeaseIT {
                 if (stamp != null) {
                   stamps.add(stamp);
                 }
-                polls.add(System.nanoTime());
                 return !FAST_DELIVERED.containsKey(fast); // no slot was free
               });
       assertThat(stamps)

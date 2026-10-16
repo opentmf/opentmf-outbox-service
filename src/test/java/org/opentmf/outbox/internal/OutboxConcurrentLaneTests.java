@@ -109,6 +109,21 @@ class OutboxConcurrentLaneTests {
   }
 
   @Test
+  void theLane_measuresItsOwnSends() {
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(2, 100, false, Duration.ofSeconds(5));
+    AtomicInteger done = new AtomicInteger();
+    assertThat(lane.depth()).isZero(); // nothing measured yet
+
+    IntStream.range(0, 5).forEach(i -> lane.submit(done::incrementAndGet));
+
+    await().atMost(Duration.ofSeconds(5)).until(() -> done.get() == 5);
+    await() // fast sends: claim ahead up to the capacity
+        .atMost(Duration.ofSeconds(5))
+        .untilAsserted(() -> assertThat(lane.depth()).isEqualTo(100));
+    lane.close();
+  }
+
+  @Test
   void theDepthIsAMovingAverage_oneSlowSendMovesItAnEighth() {
     OutboxConcurrentLane lane = new OutboxConcurrentLane(8, 1_000_000, false, Duration.ofSeconds(5));
     lane.sendTook(Duration.ofMillis(10).toNanos()); // the first sample sets it: 800

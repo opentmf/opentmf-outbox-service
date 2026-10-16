@@ -1282,7 +1282,7 @@ class OutboxRelayWorkerTests {
    * again and queued it at the tail, and its old place was dropped as lost.
    */
   @Test
-  void aQueuedRowWhoseLeaseLapsed_isNeverClaimedAgain_andIsSentOnceInItsPlace() throws Exception {
+  void aQueuedRowWhoseLeaseLapsed_isNeverClaimedAgain_andIsSentOnceInItsPlace() {
     when(publisher.lease(any())) // row 1's send outlasts the test; row 2 has a one-second lease
         .thenAnswer(
             inv ->
