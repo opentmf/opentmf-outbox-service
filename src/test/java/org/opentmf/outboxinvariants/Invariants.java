@@ -295,7 +295,7 @@ final class Invariants {
           } else {
             findings.add(
                 "I2",
-                "key %s: row %d delivered after row %d - out of id order (row %d: release_at %s, attempts %d, first delivered %s; row %d sent %s)"
+                "key %s: row %d delivered after row %d - out of id order (row %d: release_at %s, attempts %d, first delivered %s; row %d claimed %s, sent %s)"
                     .formatted(
                         entry.getKey(),
                         later.rowId(),
@@ -305,6 +305,7 @@ final class Invariants {
                         passed == null ? -1 : passed.attempts(),
                         later.start(),
                         earlier.rowId(),
+                        passerClaimed,
                         earlier.start()));
           }
         }

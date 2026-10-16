@@ -74,7 +74,7 @@ public class ScriptedPublisher implements OutboxPublisher {
     Receiver.stamped(event.getId(), event.getClaimedUntil()); // the claim's stamp, as handed over
     boolean interrupted = false;
     try {
-      pause(Receiver.latency(script));
+      pause(Receiver.latency(script, event.getId(), attempt));
       switch (step.outcome()) {
         case FAIL -> throw new IllegalStateException("scripted failure, attempt " + attempt);
         case TERMINAL -> throw new TerminalOutboxException("scripted refusal, attempt " + attempt);

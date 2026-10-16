@@ -4,6 +4,8 @@ import static org.awaitility.Awaitility.await;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -321,6 +323,81 @@ class LanesIT {
         .filter(d -> d.rowId() == rowId)
         .map(Delivery::start)
         .min(Comparator.naturalOrder())
+        .orElseThrow();
+  }
+
+  /**
+   * A6: a HELD head is stepped over at CLAIM time - and the checker judges the claim, not the send
+   * (the gate's K3 finding). One slot, held by a send for 0.7 s (under the lane's one-second live
+   * mark, so nothing is given back); row 1 of key k held for 0.4 s; row 2 of key k, due at once, is
+   * claimed into the hand-off queue while row 1 is still held, and sent once the slot frees - after
+   * row 1's hold has ended. Row 1 then waits for row 2 (its key is in flight) and goes second: the
+   * documented pass-over of a held head. The old checker compared the hold with row 2's SEND and
+   * flagged it; this scenario provokes exactly that race and requires it.
+   */
+  @Test
+  void a6_aHeldHead_isSteppedOverAtClaimTime_theCheckerJudgesTheClaim() {
+    try (Scenario s = Scenario.start("A6-held-head-stepped-over-at-claim", 0)) {
+      Receiver.script("inv:a6w/", Script.concurrent()); // a measured fast send: the lane queues
+      Receiver.script("inv:a6f/", Script.concurrent().steps(Step.holdUntilReleased())); // the slot
+      Receiver.script("inv:a6/", Script.concurrent());
+      s.startPod("pod-a", "opentmf.outbox.concurrent.max-in-flight=1");
+      Pod pod = s.pod(0);
+      long warm = pod.append("inv:a6w/w", "a6-warm");
+      await().atMost(Duration.ofSeconds(10)).until(() -> delivered(warm) == 1);
+      long slot = pod.append("inv:a6f/x", "a6-slot");
+      await().atMost(Duration.ofSeconds(10)).until(() -> Receiver.sending().containsKey(slot));
+      Instant slotTaken = Instant.now();
+      OffsetDateTime release = OffsetDateTime.now(ZoneOffset.UTC).plusNanos(400_000_000L);
+      long held = pod.append("inv:a6/k", "a6-held", release);
+      long passer = pod.append("inv:a6/k", "a6-passer");
+      await()
+          .atMost(Duration.ofSeconds(2))
+          .until(() -> Scenario.count("id = " + passer + " and claimed_until is not null") == 1);
+      await()
+          .pollDelay(Duration.between(Instant.now(), slotTaken.plusMillis(700)).abs())
+          .atMost(Duration.ofSeconds(3))
+          .until(() -> true);
+      Receiver.release(); // the slot frees: the queued row 2 goes
+      Findings f = s.finish(Duration.ofMinutes(1), Expect.strict());
+      Delivery passerSend = firstDelivered(passer);
+      Delivery heldSend = firstDelivered(held);
+      Instant passerClaimed =
+          Receiver.firstStamp(passer).toInstant().minus(Duration.ofMinutes(2)); // the lease
+      Instant hold = release.toInstant();
+      String instants =
+          "row 2 claimed %s, row 1's hold ended %s, row 2 sent %s, row 1 sent %s"
+              .formatted(passerClaimed, hold, passerSend.start(), heldSend.start());
+      f.figure(instants);
+      System.out.println("INVARIANTS: A6 " + instants); // the evidence, pass or fail
+      if (!(passerClaimed.isBefore(hold) && hold.isBefore(passerSend.start()))) {
+        f.add(
+            "S",
+            "the race was not provoked: row 2 must be claimed before row 1's hold ends and sent"
+                + " after it");
+      }
+      if (!heldSend.start().isAfter(passerSend.start())) {
+        f.add("S", "the held row went first - no pass-over to judge");
+      }
+      boolean sendTimeRuleHeld = hold.isAfter(passerSend.start());
+      if (sendTimeRuleHeld) {
+        f.add(
+            "S",
+            "the old send-time rule would have accepted it - the scenario no longer pins the"
+                + " claim-time rule");
+      }
+      f.assertNone(); // I2 accepts it: row 1 was held when row 2 was CLAIMED
+    }
+  }
+
+  private static long delivered(long rowId) {
+    return Receiver.deliveries().stream().filter(d -> d.rowId() == rowId && d.delivered()).count();
+  }
+
+  private static Delivery firstDelivered(long rowId) {
+    return Receiver.deliveries().stream()
+        .filter(d -> d.rowId() == rowId && d.delivered())
+        .min(Comparator.comparing(Delivery::start))
         .orElseThrow();
   }
 }

@@ -230,7 +230,12 @@ public final class Receiver {
 
   private static final Map<Long, Integer> LISTENED = new ConcurrentHashMap<>();
   private static volatile CountDownLatch released = new CountDownLatch(1);
+
+  /** The scenario's generator - the test thread's draws only (rows, actions, pauses). */
   private static SplittableRandom random = new SplittableRandom(0);
+
+  /** The scenario's seed: each send's latency draws from a stream derived from it and the send. */
+  private static volatile long seed;
 
   /** A new scenario: no scripts, no deliveries, the receiver held, the given seed. */
   public static void reset(long seed) {
@@ -246,6 +251,7 @@ public final class Receiver {
     synchronized (Receiver.class) {
       random = new SplittableRandom(seed);
     }
+    Receiver.seed = seed;
   }
 
   public static void script(String destinationPrefix, Script script) {
@@ -261,15 +267,19 @@ public final class Receiver {
         .orElseGet(Script::concurrent);
   }
 
-  static Duration latency(Script script) {
+  /**
+   * One send's latency, from a stream derived from the seed, the row and the attempt - never the
+   * generator's: the sending threads' draws then take nothing from the test thread's sequence, and
+   * a seed replays every row's fate (lane, key, hold, outcome, latency) whatever the threads did.
+   */
+  static Duration latency(Script script, long rowId, int attempt) {
     long min = script.minLatency.toNanos();
     long max = script.maxLatency.toNanos();
     if (max <= min) {
       return script.minLatency;
     }
-    synchronized (Receiver.class) {
-      return Duration.ofNanos(min + random.nextLong(max - min));
-    }
+    SplittableRandom own = new SplittableRandom(seed ^ (rowId * 0x9E3779B97F4A7C15L) ^ attempt);
+    return Duration.ofNanos(min + own.nextLong(max - min));
   }
 
   /** A seeded draw for the scenarios' own randomness. */
