@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
@@ -109,6 +110,20 @@ class OutboxOpsProblemDetailsIT {
         "POST /ops/outbox/unpark",
         post("/ops/outbox/unpark").contentType(MediaType.APPLICATION_JSON).content("{}"),
         400);
+    // typed strictly, whatever the application's mapper coerces (1.8.0): never a 200
+    for (String body :
+        List.of(
+            "{\"destination\": false}",
+            "{\"destination\": 0}",
+            "{\"destination\": \"hub:a\", \"parkedFrom\": 1.5}",
+            "{\"destination\": \"hub:a\", \"reference\": true}")) {
+      assertThat(
+              answers(
+                  "POST /ops/outbox/unpark",
+                  post("/ops/outbox/unpark").contentType(MediaType.APPLICATION_JSON).content(body),
+                  400))
+          .isEqualTo(MediaType.APPLICATION_PROBLEM_JSON);
+    }
     answers(
         "POST /ops/outbox/maintenance/prune",
         post("/ops/outbox/maintenance/prune").accept(MediaType.TEXT_PLAIN),

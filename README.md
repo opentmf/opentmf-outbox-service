@@ -795,6 +795,12 @@ reference)` from your own ops code).
 - **What it unparks.** Every parked row of that destination, optionally within a
   `parked_on` range and of one `reference`. The destination is required: there is no
   "unpark everything".
+- **Typed strictly (1.8.0).** The library reads the JSON body itself, not through the
+  consumer's mapper, and never coerces: `destination` and `reference` take a string or null,
+  `parkedFrom` / `parkedTo` an RFC 3339 date-time with an offset or null. A boolean, a number,
+  an object or an array is a 400 naming the field (`destination: expected a string, got a
+  boolean`) - up to 1.7.0 a default mapper turned `{"destination": false}` into the
+  destination "false" and answered 200. Other members are ignored.
 - **What each row looks like after.** Exactly as the single unpark leaves it: parked
   stamp cleared, attempts reset, due now, `last_error` kept. It runs under the same
   guard: a row an ops action holds is waited for and re-checked.

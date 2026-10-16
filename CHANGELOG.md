@@ -2,8 +2,9 @@
 
 ## 1.8.0 - 2026-10-16
 
-A slow ORDERED receiver no longer stalls the CONCURRENT lane, and a consumer whose error model is
-not RFC 9457 can paste the ops fragment's paths verbatim.
+A slow ORDERED receiver no longer stalls the CONCURRENT lane, the unpark by filter no longer
+coerces a wrongly typed field, and a consumer whose error model is not RFC 9457 can paste the ops
+fragment's paths verbatim.
 
 ### Fixed
 
@@ -24,6 +25,18 @@ not RFC 9457 can paste the ops fragment's paths verbatim.
   - Measured by `OutboxLaneIndependenceIT`: 100 ORDERED rows to a receiver answering in 150 ms
     (a 15 s batch) are sending when a CONCURRENT row is appended. It is delivered within two
     seconds, while the ORDERED batch is still going. On 1.7.0 it waited for the batch.
+- **The unpark by filter types its body strictly** (OUTBOX-UNPARK-FILTER-STRICT-TYPES-1). It
+  bound `destination` as a plain string through the consumer's mapper, and a default mapper
+  coerces scalars: `{"destination": false}` became the destination "false", passed the blank
+  check and answered 200 (a black-box suite's negative test found it). The library now reads
+  the JSON object itself, whatever the consumer's mapper does, and never coerces: `destination`
+  and `reference` take a string or null, `parkedFrom` / `parkedTo` an RFC 3339 date-time with
+  an offset or null. A boolean, a number, an object or an array - and a date-time without an
+  offset, or a number read as epoch seconds - is a 400 naming the field; nothing is unparked.
+  A sent offset is now kept as sent rather than normalised to UTC (the instant is the same).
+  `OutboxOpsUnparkFilterStrictTypesTests` sends `false`, `true`, `0`, `1`, `1.5`, `{}` and
+  arrays on every field; `OutboxOpsProblemDetailsIT` shows the 400 through the application's
+  own mapper (it was a 200).
 - **Pool sizing:** the relay thread's claim and an ORDERED booking can now hold a connection at
   the same moment. Size the pool above `concurrent.max-in-flight` + 3 (was + 2).
 - **Shutdown:** the relay thread, then the ORDERED batch, then the CONCURRENT sends each get

@@ -8,6 +8,7 @@ import static org.mockito.Mockito.when;
 
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxMaintenanceService;
 import org.opentmf.outbox.OutboxPruneResult;
@@ -114,7 +115,7 @@ class OutboxOpsControllerTests {
 
     assertThat(
             controller.unparkByFilter(
-                new OutboxOpsController.UnparkFilter("hub:a", from, null, null)))
+                Map.of("destination", "hub:a", "parkedFrom", from.toString())))
         .containsEntry("outboxRowsUnparked", 42L)
         .containsEntry("moreToUnpark", true);
   }
@@ -124,11 +125,7 @@ class OutboxOpsControllerTests {
     when(maintenance.unpark(null, null, null, null))
         .thenThrow(new IllegalArgumentException("An unpark by filter needs a destination"));
 
-    Throwable thrown =
-        catchThrowable(
-            () ->
-                controller.unparkByFilter(
-                    new OutboxOpsController.UnparkFilter(null, null, null, null)));
+    Throwable thrown = catchThrowable(() -> controller.unparkByFilter(Map.of()));
 
     assertErrorResponse(thrown, HttpStatus.BAD_REQUEST);
   }

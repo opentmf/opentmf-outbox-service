@@ -422,8 +422,11 @@ components:
     outboxUnparkFilterBadRequest:
       x-opentmf-refinable: content
       description: >-
-        `destination` missing or blank (the library's `ErrorResponse`), or a body that is not a
-        readable `OutboxUnparkFilter` (Spring's refusal) - rendered by the consumer.
+        `destination` missing or blank, or a field of another JSON type than the schema's - the
+        filter is typed strictly, never coerced (1.8.0): `false`, `0` or `1.5` for a string, a
+        number for a date-time, a date-time without an offset (the library's `ErrorResponse`,
+        naming the field); or a body that is not a JSON object (Spring's refusal) - rendered by
+        the consumer.
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/OutboxProblem' }
@@ -540,6 +543,10 @@ components:
 
     OutboxUnparkFilter:
       type: object
+      description: >-
+        Typed strictly (1.8.0): each member takes exactly its schema's JSON type or null - no
+        boolean or number is read as a string, no number as a date-time. Other members are
+        ignored.
       required: [destination]
       properties:
         destination:
