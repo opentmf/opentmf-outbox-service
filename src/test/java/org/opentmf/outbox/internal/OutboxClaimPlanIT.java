@@ -420,11 +420,53 @@ class OutboxClaimPlanIT {
     }
   }
 
-  /** The gauges over a million relayed rows and nothing open: none reads the relayed history. */
+  /** Every partial index over OPEN rows - none holds a relayed row. */
+  private static final List<String> OPEN_ROW_INDEXES =
+      List.of(
+          "ix_outbox_pending",
+          "ix_outbox_ordered_claim",
+          "ix_outbox_concurrent_keyed",
+          "ix_outbox_concurrent_unkeyed",
+          "ix_outbox_parked_lane",
+          "ix_outbox_open_since_ordered",
+          "ix_outbox_open_since_concurrent",
+          "ix_outbox_claimed_until");
+
+  /** An idle gauge reads 1-3 buffers; the relayed history is 14,286 heap pages. */
+  private static final long IDLE_BUFFER_BOUND = 16;
+
+  /**
+   * The gauges over a million relayed rows and nothing open: none reads the relayed history - only
+   * partial indexes over open rows, no sequential scan, a handful of buffers.
+   *
+   * <p>Not the exact per-lane indexes, which the 100k-pending case pins where they hold rows: idle,
+   * every open-row index is EMPTY and the planner's pick between two of them is a TIE. Measured
+   * (1.8.0): the keyed count costs 0.12..4.14 through {@code ix_outbox_concurrent_keyed} and
+   * through {@code ix_outbox_pending} alike - inside the planner's fuzz - and the heap's
+   * all-visible fraction after VACUUM, which depends on what snapshots happened to be open, tips it
+   * (pg_class.relallvisible = 0 reproduces the pick of {@code ix_outbox_pending} exactly). A gate
+   * run on a busy machine read that index once; both are empty, both read nothing relayed.
+   */
   @Test
   @Order(0)
   void theGauges_idle_neverReadTheRelayedRows() throws Exception {
-    assertGaugesIndexedOnly("idle");
+    Map<String, String> now = Map.of("now", "now()");
+    Map<String, String> gauges =
+        Map.of(
+            "open-not-parked", OutboxGaugeSql.OPEN_NOT_PARKED,
+            "parked", OutboxGaugeSql.PARKED,
+            "open-since", OutboxGaugeSql.OPEN_SINCE,
+            "in-flight", OutboxGaugeSql.IN_FLIGHT);
+    for (Map.Entry<String, String> gauge : gauges.entrySet()) {
+      String what = "idle " + gauge.getKey();
+      assertIndexedOnly(what, gauge.getValue(), now, OPEN_ROW_INDEXES);
+      for (String mode : PLAN_MODES) {
+        JsonNode plan = explain(gauge.getValue(), mode, now).get("Plan");
+        assertThat(plan.get("Shared Hit Blocks").asLong() + plan.get("Shared Read Blocks").asLong())
+            .as("%s, %s: buffers", what, mode)
+            .isLessThanOrEqualTo(IDLE_BUFFER_BOUND);
+      }
+    }
   }
 
   /**
