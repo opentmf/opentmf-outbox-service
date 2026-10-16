@@ -32,6 +32,18 @@ package org.opentmf.outbox.internal;
  *       taken again.
  * </ul>
  *
+ * <p><strong>Open, as ONE expression (1.9.0, changeset 008).</strong> Every part of these
+ * statements that reads open rows says "not relayed, not cancelled, not parked" as {@code
+ * coalesce(relayed_on, cancelled_on, parked_on) is null} - the predicate of the two claim indexes
+ * ({@code ix_outbox_concurrent_keyed}, {@code ix_outbox_concurrent_unkeyed}) - never as three
+ * separate {@code is null}s. The other partial indexes over open rows ({@code ix_outbox_pending},
+ * the relay-lag gauge's) say the three separately, so the planner cannot prove their predicate
+ * from a claim and never picks them for it, whatever the statistics say. Up to 1.8.0 it could:
+ * analysed while the open set was empty, it believed a backlog was one row, walked the keys
+ * through {@code ix_outbox_pending} (never analysed: the relay-lag index) and sorted the whole
+ * backlog for every key - about 36 s for one claim of 100 rows over 100,000. The in-flight probes
+ * keep {@code relayed_on is null}: it is {@code ix_outbox_claimed_until}'s predicate.
+ *
  * <p>Stepped over, not claimed: keys in flight (bounded by the lane's slots across pods), keys
  * whose rows are all in backoff or held, and unkeyed rows in backoff or held - the claim's cost
  * grows with those (measured in the README). Order: within a key, {@code id} order on the happy
@@ -57,7 +69,7 @@ final class OutboxClaimSql {
           cross join lateral (
             select h.id from outbox h
             where h.lane = 'CONCURRENT' and h.ordering_key = keys.k
-              and h.relayed_on is null and h.cancelled_on is null and h.parked_on is null
+              and coalesce(h.relayed_on, h.cancelled_on, h.parked_on) is null
               and (h.release_at is null or h.release_at <= :now)
               and h.next_attempt_on <= :now
               and (h.claimed_until is null or h.claimed_until <= :now)
@@ -70,11 +82,33 @@ final class OutboxClaimSql {
   private static final String LOCK =
       """
         join outbox e on e.id = c.id
-      where e.relayed_on is null and e.cancelled_on is null and e.parked_on is null
+      where coalesce(e.relayed_on, e.cancelled_on, e.parked_on) is null
         and (e.release_at is null or e.release_at <= :now)
         and e.next_attempt_on <= :now
         and (e.claimed_until is null or e.claimed_until <= :now)
       order by e.id
+      for update of e skip locked""";
+
+  /**
+   * The ORDERED lane's claim (native since 1.9.0; JPQL before): due rows with no live lease whose
+   * stamped lane is ORDERED or null (a row written before 1.3.0, or not through the writer), in
+   * {@code id} order, {@code FOR UPDATE SKIP LOCKED} - a row another pod is claiming is skipped,
+   * and once that claim commits the row carries a live lease. The lane test is a LITERAL: the
+   * JPQL bound it as a parameter, and under a generic plan the planner could not prove {@code
+   * ix_outbox_ordered_claim}'s predicate from {@code lane <> $1} - it read {@code
+   * ix_outbox_pending} and sorted the due ORDERED rows (1,864 buffers, about 100 ms over 20,000 of
+   * them, against 104 buffers and 1 ms for a custom plan).
+   */
+  static final String ORDERED =
+      """
+      select e.* from outbox e
+      where e.relayed_on is null and e.cancelled_on is null and e.parked_on is null
+        and (e.release_at is null or e.release_at <= :now)
+        and e.next_attempt_on <= :now
+        and (e.claimed_until is null or e.claimed_until <= :now)
+        and (e.lane is null or e.lane <> 'CONCURRENT')
+      order by e.id
+      limit :limit
       for update of e skip locked""";
 
   /** First pass: keys ABOVE {@code :after} (the cursor; {@code ""} = all), plus unkeyed rows. */
@@ -84,13 +118,13 @@ final class OutboxClaimSql {
             keys (k) as (
               (select o.ordering_key from outbox o
                where o.lane = 'CONCURRENT' and o.ordering_key is not null
-                 and o.relayed_on is null and o.cancelled_on is null and o.parked_on is null
+                 and coalesce(o.relayed_on, o.cancelled_on, o.parked_on) is null
                  and o.ordering_key > :after
                order by o.ordering_key limit 1)
               union all
               select (select o.ordering_key from outbox o
                       where o.lane = 'CONCURRENT' and o.ordering_key is not null
-                        and o.relayed_on is null and o.cancelled_on is null and o.parked_on is null
+                        and coalesce(o.relayed_on, o.cancelled_on, o.parked_on) is null
                         and o.ordering_key > keys.k
                       order by o.ordering_key limit 1)
               from keys where keys.k is not null),
@@ -101,7 +135,7 @@ final class OutboxClaimSql {
             unkeyed as (
               select u.id from outbox u
               where u.lane = 'CONCURRENT' and u.ordering_key is null
-                and u.relayed_on is null and u.cancelled_on is null and u.parked_on is null
+                and coalesce(u.relayed_on, u.cancelled_on, u.parked_on) is null
                 and (u.release_at is null or u.release_at <= :now)
                 and u.next_attempt_on <= :now
                 and (u.claimed_until is null or u.claimed_until <= :now)
@@ -121,13 +155,13 @@ final class OutboxClaimSql {
             keys (k) as (
               (select o.ordering_key from outbox o
                where o.lane = 'CONCURRENT' and o.ordering_key is not null
-                 and o.relayed_on is null and o.cancelled_on is null and o.parked_on is null
+                 and coalesce(o.relayed_on, o.cancelled_on, o.parked_on) is null
                  and o.ordering_key <= :until
                order by o.ordering_key limit 1)
               union all
               select (select o.ordering_key from outbox o
                       where o.lane = 'CONCURRENT' and o.ordering_key is not null
-                        and o.relayed_on is null and o.cancelled_on is null and o.parked_on is null
+                        and coalesce(o.relayed_on, o.cancelled_on, o.parked_on) is null
                         and o.ordering_key > keys.k and o.ordering_key <= :until
                       order by o.ordering_key limit 1)
               from keys where keys.k is not null),
@@ -165,13 +199,18 @@ final class OutboxClaimSql {
    * Run after the locks, it sees every lease another pod committed before releasing the key's
    * lock - which the first statement's snapshot could not. {@code id = any(...)} reads by primary
    * key; the in-flight probe reads {@code ix_outbox_claimed_until} (a live lease holds its key
-   * even on a cancelled row); the lower-due probe reads {@code ix_outbox_concurrent_keyed}.
+   * even on a cancelled row); the lower-due probe reads {@code ix_outbox_concurrent_keyed}. That
+   * probe is a correlated SCALAR subquery (1.9.0), never a {@code not exists}: an {@code exists}
+   * is flattened into an anti-join, and on a table never analysed the planner then scanned the
+   * whole keyed index once per candidate - 10 million buffers, 35 s for 100 candidates over a
+   * 100,000-row backlog. A scalar subquery runs per candidate with its key as a parameter, so the
+   * key and the id bound are its index condition.
    */
   static final String RECHECK =
       """
       select r.id from outbox r
       where r.id = any (cast(:ids as bigint[]))
-        and r.relayed_on is null and r.cancelled_on is null and r.parked_on is null
+        and coalesce(r.relayed_on, r.cancelled_on, r.parked_on) is null
         and (r.release_at is null or r.release_at <= :now)
         and r.next_attempt_on <= :now
         and (r.claimed_until is null or r.claimed_until <= :now)
@@ -180,24 +219,60 @@ final class OutboxClaimSql {
           where f.claimed_until is not null and f.relayed_on is null
             and f.claimed_until > :now
             and f.lane = 'CONCURRENT' and f.ordering_key = r.ordering_key)
-        and not exists (
-          select 1 from outbox o
+        and (
+          select o.id from outbox o
           where o.lane = 'CONCURRENT' and o.ordering_key = r.ordering_key and o.id < r.id
-            and o.relayed_on is null and o.cancelled_on is null and o.parked_on is null
+            and coalesce(o.relayed_on, o.cancelled_on, o.parked_on) is null
             and (o.release_at is null or o.release_at <= :now)
             and o.next_attempt_on <= :now
-            and (o.claimed_until is null or o.claimed_until <= :now))""";
+            and (o.claimed_until is null or o.claimed_until <= :now)
+          order by o.ordering_key, o.id limit 1) is null""";
 
   /**
    * Writes the lease of every claimed row that shares one lease end, in ONE statement (1.6.0; one
    * flushed update per row before): {@code claimed_until} and {@code next_attempt_on} - the latter
-   * so a pre-1.3.0 relay sees a leased row as not due. The rows are already locked by the claim
-   * ({@code FOR UPDATE}); {@code id = any(...)} reads by primary key.
+   * so a pre-1.3.0 relay sees a leased row as not due - and clears {@code sending_since} (1.9.0):
+   * a new holder's send has not started yet. The rows are already locked by the claim ({@code FOR
+   * UPDATE}); {@code id = any(...)} reads by primary key.
    */
   static final String STAMP =
       """
-      update outbox set claimed_until = :stamp, next_attempt_on = :stamp
+      update outbox set claimed_until = :stamp, next_attempt_on = :stamp, sending_since = null
       where id = any (cast(:ids as bigint[]))""";
+
+  /**
+   * The SEND HEARTBEAT (1.9.0): renews, in ONE statement, the lease of every row this pod is
+   * sending whose renewal is due - each guarded on the lease value this holder stamped, so a row
+   * another holder took (or a booking cleared) is not touched - and marks each send as under way
+   * ({@code sending_since}, kept once set). The rows come as four parallel arrays, unnested
+   * together: the ids, the stamps the guard compares, the new lease ends, and the instants the
+   * sends started. Returns the ids it renewed; a row missing is lost to this holder. The unnested
+   * ids join the table by primary key.
+   */
+  static final String RENEW_SENDING =
+      """
+      with renewed as (
+        update outbox o set claimed_until = v.renewed, next_attempt_on = v.renewed,
+          sending_since = coalesce(o.sending_since, v.since)
+        from unnest(cast(:ids as bigint[]), cast(:stamps as timestamptz[]),
+            cast(:renewed as timestamptz[]), cast(:since as timestamptz[]))
+          as v (id, stamp, renewed, since)
+        where o.id = v.id and o.claimed_until = v.stamp
+        returning o.id)
+      select id from renewed""";
+
+  /**
+   * Gives queued rows BACK (1.9.0), in ONE statement: every slot of the pod is busy with a send
+   * older than a second, so the rows it claimed into its hand-off queue in the second before would
+   * only wait behind them. Each row's lease is cleared - guarded on the stamp this holder wrote, so
+   * a row another holder took is not touched - and it is due at once, for any pod with a free slot.
+   * The rows come as two parallel arrays, unnested together; they join the table by primary key.
+   */
+  static final String RELEASE =
+      """
+      update outbox o set claimed_until = null, next_attempt_on = :now
+      from unnest(cast(:ids as bigint[]), cast(:stamps as timestamptz[])) as v (id, stamp)
+      where o.id = v.id and o.claimed_until = v.stamp""";
 
   /**
    * The RELAYED booking in ONE statement (1.6.0; a locking read plus a flushed update before),
@@ -211,7 +286,7 @@ final class OutboxClaimSql {
   static final String BOOK_RELAYED =
       """
       with booked as (
-        update outbox set claimed_until = null, relayed_on = :relayedOn,
+        update outbox set claimed_until = null, sending_since = null, relayed_on = :relayedOn,
           next_attempt_on = :relayedOn
         where id = :id and claimed_until = :stamp
         returning *)

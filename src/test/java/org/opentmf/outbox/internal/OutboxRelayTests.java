@@ -48,11 +48,10 @@ class OutboxRelayTests {
     OutboxConcurrentLane stoppedLane = lane();
     OutboxOrderedLane stoppedOrderedLane = orderedLane();
     OutboxRelay relay =
-        new OutboxRelay(
-            mock(OutboxRelayWorker.class),
+        new OutboxRelay(mock(OutboxRelayWorker.class),
             new OutboxProperties(),
             stoppedLane,
-            stoppedOrderedLane);
+            stoppedOrderedLane, OutboxSendHeartbeatFixture.idle(), OutboxClock.system());
     assertThatCode(
             () -> {
               relay.poke(); // no executor yet
@@ -75,7 +74,7 @@ class OutboxRelayTests {
                 calls.incrementAndGet() == 1
                     ? new Batch(0, properties.getBatchSize(), false, true)
                     : EMPTY);
-    OutboxRelay relay = new OutboxRelay(worker, properties, lane(), orderedLane());
+    OutboxRelay relay = new OutboxRelay(worker, properties, lane(), orderedLane(), OutboxSendHeartbeatFixture.idle(), OutboxClock.system());
     relay.start();
     try {
       relay.poke();
@@ -122,7 +121,7 @@ class OutboxRelayTests {
               }
               return new Batch(0, 1, false, true); // full, and room again
             });
-    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane, orderedLane());
+    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane, orderedLane(), OutboxSendHeartbeatFixture.idle(), OutboxClock.system());
 
     relay.relayPass(); // full - but the queue is above half: no second claim
 
@@ -143,7 +142,7 @@ class OutboxRelayTests {
               }
               return EMPTY;
             });
-    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane(), orderedLane());
+    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane(), orderedLane(), OutboxSendHeartbeatFixture.idle(), OutboxClock.system());
     relay.start();
     try {
       relay.poke(); // throws inside - swallowed
@@ -170,7 +169,7 @@ class OutboxRelayTests {
             });
     OutboxConcurrentLane lane = lane();
     OutboxOrderedLane orderedLane = orderedLane();
-    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane, orderedLane);
+    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane, orderedLane, OutboxSendHeartbeatFixture.idle(), OutboxClock.system());
     relay.start();
     try {
       assertThat(lane.submit(() -> {})).isTrue(); // the worker runs dry - the relay is nudged
@@ -199,7 +198,7 @@ class OutboxRelayTests {
               }
               return EMPTY;
             });
-    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane(), orderedLane());
+    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane(), orderedLane(), OutboxSendHeartbeatFixture.idle(), OutboxClock.system());
     relay.start();
     try {
       relay.poke();
@@ -241,7 +240,7 @@ class OutboxRelayTests {
               }
               return EMPTY;
             });
-    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane, orderedLane());
+    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane, orderedLane(), OutboxSendHeartbeatFixture.idle(), OutboxClock.system());
     relay.start();
     try {
       relay.poke();
@@ -276,7 +275,7 @@ class OutboxRelayTests {
               withOrdered.add(inv.getArgument(0));
               return fullOrdered.getAndDecrement() > 0 ? new Batch(100, 0, true, false) : EMPTY;
             });
-    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane(), orderedLane());
+    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane(), orderedLane(), OutboxSendHeartbeatFixture.idle(), OutboxClock.system());
 
     relay.relayPass(); // the first pass: whatever was pending at start
     relay.relayPass(); // a CONCURRENT nudge: one claim, not two
@@ -313,7 +312,7 @@ class OutboxRelayTests {
     OutboxOrderedLane orderedLane = orderedLane();
     CountDownLatch gate = new CountDownLatch(1);
     assertThat(orderedLane.submit(() -> hold(gate))).isTrue(); // a batch is sending
-    OutboxRelay relay = new OutboxRelay(worker, properties, lane(), orderedLane);
+    OutboxRelay relay = new OutboxRelay(worker, properties, lane(), orderedLane, OutboxSendHeartbeatFixture.idle(), OutboxClock.system());
     relay.start();
     try {
       relay.pokeOrdered(); // an ORDERED row was appended - but the lane is busy
@@ -342,7 +341,7 @@ class OutboxRelayTests {
             });
     OutboxProperties properties = new OutboxProperties();
     properties.setSweepInterval(Duration.ofHours(1)); // only the nudges run passes
-    OutboxRelay relay = new OutboxRelay(worker, properties, lane(), orderedLane());
+    OutboxRelay relay = new OutboxRelay(worker, properties, lane(), orderedLane(), OutboxSendHeartbeatFixture.idle(), OutboxClock.system());
     relay.start();
     try {
       relay.poke(); // the first pass claims the ORDERED lane anyway
@@ -372,7 +371,7 @@ class OutboxRelayTests {
               }
               return EMPTY;
             });
-    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane(), orderedLane());
+    OutboxRelay relay = new OutboxRelay(worker, new OutboxProperties(), lane(), orderedLane(), OutboxSendHeartbeatFixture.idle(), OutboxClock.system());
 
     relay.relayPass();
     relay.relayPass(); // fails

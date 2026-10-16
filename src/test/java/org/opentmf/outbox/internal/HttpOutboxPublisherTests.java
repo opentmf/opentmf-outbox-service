@@ -10,9 +10,11 @@ import static org.springframework.test.web.client.match.MockRestRequestMatchers.
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
 
+import java.net.URI;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxClientProfileResolver;
 import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.TerminalOutboxException;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.test.web.client.MockRestServiceServer;
@@ -105,16 +107,80 @@ class HttpOutboxPublisherTests {
   }
 
   @Test
-  void publish_resolverWithoutAMatch_fallsBackToThePlainClient() {
+  void publish_aRowWithoutAProfile_resolverWithoutAMatch_fallsBackToThePlainClient() {
     RestClient.Builder builder = RestClient.builder();
     MockRestServiceServer plainServer = MockRestServiceServer.bindTo(builder).build();
     plainServer.expect(requestTo("https://hub/cb")).andRespond(withSuccess());
 
     OutboxClientProfileResolver noMatch = (profile, destination) -> null;
     new HttpOutboxPublisher(builder.build(), noMatch, new ObjectMapper(), "svc")
-        .publish(event("https://hub/cb", "unknown-profile"));
+        .publish(event("https://hub/cb", null));
 
     plainServer.verify();
+  }
+
+  /** 1.9.0 (F1): an unknown profile is a configuration fault - parked, never sent plain. */
+  @Test
+  void publish_aRowNamingAnUnknownProfile_isRefused_neverSentThroughThePlainClient() {
+    RestClient.Builder builder = RestClient.builder();
+    MockRestServiceServer plainServer = MockRestServiceServer.bindTo(builder).build();
+    OutboxClientProfileResolver unknown = (profile, destination) -> null;
+    HttpOutboxPublisher publisher =
+        new HttpOutboxPublisher(builder.build(), unknown, new ObjectMapper(), "svc");
+
+    OutboxEvent row = event("https://hub/cb", "nope");
+    assertThatExceptionOfType(TerminalOutboxException.class)
+        .isThrownBy(() -> publisher.publish(row))
+        .withMessageContaining("'nope'")
+        .withMessageContaining("does not know");
+    plainServer.verify(); // nothing was sent
+  }
+
+  @Test
+  void publish_aRowNamingAProfile_withNoResolverAtAll_isRefused() {
+    RestClient.Builder builder = RestClient.builder();
+    MockRestServiceServer plainServer = MockRestServiceServer.bindTo(builder).build();
+    HttpOutboxPublisher publisher =
+        new HttpOutboxPublisher(builder.build(), null, new ObjectMapper(), "svc");
+
+    OutboxEvent row = event("https://hub/cb", "hub-7");
+    assertThatExceptionOfType(TerminalOutboxException.class)
+        .isThrownBy(() -> publisher.publish(row))
+        .withMessageContaining("'hub-7'")
+        .withMessageContaining("no OutboxClientProfileResolver");
+    plainServer.verify();
+  }
+
+  /** 1.9.0 (F5): only a 2xx relays - a 3xx is a failed attempt, its redirect not followed. */
+  @Test
+  void publish_a3xx_throwsForTheRelay_namingTheLocation() {
+    RestClient.Builder builder = RestClient.builder();
+    MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+    server
+        .expect(requestTo("https://hub/cb"))
+        .andRespond(withStatus(HttpStatus.FOUND).location(URI.create("https://elsewhere/cb")));
+    HttpOutboxPublisher publisher =
+        new HttpOutboxPublisher(builder.build(), null, new ObjectMapper(), "svc");
+
+    OutboxEvent row = event("https://hub/cb", null);
+    assertThatExceptionOfType(RestClientResponseException.class)
+        .isThrownBy(() -> publisher.publish(row))
+        .withMessageContaining("302")
+        .withMessageContaining("only a 2xx relays")
+        .withMessageContaining("https://elsewhere/cb");
+    server.verify();
+  }
+
+  @Test
+  void publish_2xxVariants_relay() {
+    for (HttpStatus status : new HttpStatus[] {HttpStatus.OK, HttpStatus.ACCEPTED, HttpStatus.NO_CONTENT}) {
+      RestClient.Builder builder = RestClient.builder();
+      MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+      server.expect(requestTo("https://hub/cb")).andRespond(withStatus(status));
+      new HttpOutboxPublisher(builder.build(), null, new ObjectMapper(), "svc")
+          .publish(event("https://hub/cb", null));
+      server.verify();
+    }
   }
 
   @Test

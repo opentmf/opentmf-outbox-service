@@ -11,7 +11,9 @@ package org.opentmf.outbox.internal;
  * <ul>
  *   <li>{@link #OPEN_NOT_PARKED} - the three claim indexes, whose predicates split the open,
  *       unparked rows by lane: {@code ix_outbox_ordered_claim}, {@code ix_outbox_concurrent_keyed}
- *       and {@code ix_outbox_concurrent_unkeyed} (index-only counts);
+ *       and {@code ix_outbox_concurrent_unkeyed} (index-only counts; the two CONCURRENT ones in
+ *       their own form since 1.9.0, {@code coalesce(relayed_on, cancelled_on, parked_on) is
+ *       null});
  *   <li>{@link #PARKED} - {@code ix_outbox_parked_lane}, one index-only count per lane;
  *   <li>{@link #OPEN_SINCE} - {@code ix_outbox_open_since_ordered} and
  *       {@code ix_outbox_open_since_concurrent}, each one's first entry: the instant the oldest
@@ -36,10 +38,10 @@ final class OutboxGaugeSql {
            and relayed_on is null and cancelled_on is null and parked_on is null) as ordered,
         (select count(*) from outbox
          where lane = 'CONCURRENT' and ordering_key is not null
-           and relayed_on is null and cancelled_on is null and parked_on is null)
+           and coalesce(relayed_on, cancelled_on, parked_on) is null)
         + (select count(*) from outbox
            where lane = 'CONCURRENT' and ordering_key is null
-             and relayed_on is null and cancelled_on is null and parked_on is null) as concurrent""";
+             and coalesce(relayed_on, cancelled_on, parked_on) is null) as concurrent""";
 
   static final String PARKED =
       """

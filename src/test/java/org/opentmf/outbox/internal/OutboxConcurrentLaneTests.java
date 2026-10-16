@@ -15,7 +15,8 @@ import org.junit.jupiter.api.Test;
 
 /**
  * The hand-off queue in front of the slots: the permits bound the sends while the queue holds the
- * rest; queued sends run in claim order; the room the relay may claim, and the nudge half-way down;
+ * rest; queued sends run in claim order; the room the relay may claim - as deep as the sends allow
+ * (1.9.0) - and the nudge half-way down;
  * no queued send is ever stranded; threads are daemons; close drops the queue and waits up to the
  * grace for the sends in flight.
  */
@@ -72,13 +73,171 @@ class OutboxConcurrentLaneTests {
   }
 
   @Test
-  void theRoom_isNoneAboveHalf_andTopsUpToTheCapacity_andHalfWayDownNudgesOnce() {
+  void beforeASendIsMeasured_theRoomIsTheFreeSlots_nothingAhead() {
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(4, 100, false, Duration.ofSeconds(5));
+
+    assertThat(lane.depth()).isZero();
+    assertThat(lane.room()).isEqualTo(4); // the free slots, not the capacity
+    lane.close();
+  }
+
+  /**
+   * OUTBOX-QUEUED-LEASE-STARVATION-1 (1.9.0): the depth follows the sends - fast sends claim ahead
+   * up to the capacity, as since 1.6.0; sends slower than the horizon per slot claim nothing ahead:
+   * only the free slots, so no row waits behind a busy one while its lease runs.
+   */
+  @Test
+  void theDepthFollowsTheSends_fastClaimAheadToTheCapacity_slowOnlyTheFreeSlots() {
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(8, 100, false, Duration.ofSeconds(5));
+
+    lane.sendTook(Duration.ofMillis(5).toNanos()); // 8 slots x 1 s / 5 ms = 1600: the capacity
+    assertThat(lane.depth()).isEqualTo(100);
+    assertThat(lane.room()).isEqualTo(100);
+
+    OutboxConcurrentLane slow = new OutboxConcurrentLane(8, 100, false, Duration.ofSeconds(5));
+    slow.sendTook(Duration.ofSeconds(36).toNanos()); // 8 x 1 s / 36 s < 1: nothing ahead
+    assertThat(slow.depth()).isZero();
+    assertThat(slow.room()).isEqualTo(8);
+
+    OutboxConcurrentLane between = new OutboxConcurrentLane(8, 100, false, Duration.ofSeconds(5));
+    between.sendTook(Duration.ofMillis(200).toNanos()); // 8 x 1 s / 200 ms = 40 rows ahead
+    assertThat(between.depth()).isEqualTo(40);
+    assertThat(between.room()).isEqualTo(48); // the free slots plus the depth
+    lane.close();
+    slow.close();
+    between.close();
+  }
+
+  /**
+   * 1.9.0 (K1, the flow shape): a slot busy with a send older than the horizon starts nothing
+   * soon, whatever the average says - a lane whose average is fast queues nothing behind it.
+   */
+  @Test
+  void aSlotBusyWithASendOlderThanTheHorizon_isNotLive_andTheDepthLeavesItOut() {
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(2, 100, false, Duration.ofSeconds(5));
+    lane.sendTook(Duration.ofMillis(1).toNanos()); // fast on average: 2 x 1 s / 1 ms - capacity
+    assertThat(lane.liveSlots()).isEqualTo(2);
+    assertThat(lane.depth()).isEqualTo(100);
+    CountDownLatch release = new CountDownLatch(1);
+    lane.submit(
+        () -> {
+          try {
+            release.await(10, TimeUnit.SECONDS); // a slow send in one slot
+          } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+          }
+        });
+    await()
+        .pollDelay(OutboxConcurrentLane.HORIZON.plusMillis(100))
+        .atMost(Duration.ofSeconds(5))
+        .untilAsserted(() -> assertThat(lane.liveSlots()).isEqualTo(1));
+    assertThat(lane.depth()).isEqualTo(100); // one live slot still covers the capacity
+
+    lane.sendTook(Duration.ofMillis(500).toNanos()); // the average now 63 ms: 1 x 1 s / 63 ms
+    assertThat(lane.depth()).isEqualTo(15);
+    release.countDown();
+    await().atMost(Duration.ofSeconds(5)).until(() -> lane.liveSlots() == 2);
+    lane.close();
+  }
+
+  @Test
+  void everySlotBusyWithAnOldSend_queuesNothingAhead() {
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(2, 100, false, Duration.ofSeconds(5));
+    lane.sendTook(Duration.ofMillis(1).toNanos());
+    CountDownLatch release = new CountDownLatch(1);
+    for (int i = 0; i < 2; i++) {
+      lane.submit(
+          () -> {
+            try {
+              release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException ex) {
+              Thread.currentThread().interrupt();
+            }
+          });
+    }
+    await()
+        .pollDelay(OutboxConcurrentLane.HORIZON.plusMillis(100))
+        .atMost(Duration.ofSeconds(5))
+        .untilAsserted(() -> assertThat(lane.liveSlots()).isZero());
+    assertThat(lane.depth()).isZero();
+    assertThat(lane.room()).isZero(); // no free slot, nothing ahead: the rows stay for other pods
+    release.countDown();
+    lane.close();
+  }
+
+  /**
+   * 1.9.0 (K1): rows queued in the second before the slots turned slow are given back once no slot
+   * is live - unsent - and only then; a send without a row is never given back.
+   */
+  @Test
+  void theQueue_isGivenBack_onlyWhileNoSlotIsLive() {
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(1, 100, false, Duration.ofSeconds(5));
+    lane.sendTook(Duration.ofMillis(1).toNanos());
+    CountDownLatch release = new CountDownLatch(1);
+    AtomicInteger sent = new AtomicInteger();
+    lane.submit(
+        1L,
+        () -> {
+          try {
+            release.await(10, TimeUnit.SECONDS); // the one slot, a slow send
+          } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+          }
+        });
+    await().atMost(Duration.ofSeconds(5)).until(() -> lane.available() == 0);
+    lane.submit(2L, sent::incrementAndGet);
+    lane.submit(sent::incrementAndGet); // no row: never given back
+    assertThat(lane.evictStranded()).isEmpty(); // the slot is live: its send is young
+
+    await()
+        .pollDelay(OutboxConcurrentLane.HORIZON.plusMillis(100))
+        .atMost(Duration.ofSeconds(5))
+        .until(() -> lane.liveSlots() == 0);
+    assertThat(lane.evictStranded()).containsExactly(2L);
+    assertThat(lane.queued()).isEqualTo(1);
+    assertThat(lane.evictStranded()).isEmpty(); // nothing left to give back
+
+    release.countDown();
+    await().atMost(Duration.ofSeconds(5)).until(() -> sent.get() == 1); // only the row-less one
+    lane.close();
+  }
+
+  @Test
+  void theLane_measuresItsOwnSends() {
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(2, 100, false, Duration.ofSeconds(5));
+    AtomicInteger done = new AtomicInteger();
+    assertThat(lane.depth()).isZero(); // nothing measured yet
+
+    IntStream.range(0, 5).forEach(i -> lane.submit(done::incrementAndGet));
+
+    await().atMost(Duration.ofSeconds(5)).until(() -> done.get() == 5);
+    await() // fast sends: claim ahead up to the capacity
+        .atMost(Duration.ofSeconds(5))
+        .untilAsserted(() -> assertThat(lane.depth()).isEqualTo(100));
+    lane.close();
+  }
+
+  @Test
+  void theDepthIsAMovingAverage_oneSlowSendMovesItAnEighth() {
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(8, 1_000_000, false, Duration.ofSeconds(5));
+    lane.sendTook(Duration.ofMillis(10).toNanos()); // the first sample sets it: 800
+    assertThat(lane.depth()).isEqualTo(800);
+
+    lane.sendTook(Duration.ofMillis(90).toNanos()); // 10 + (90 - 10) / 8 = 20 ms: 400
+
+    assertThat(lane.depth()).isEqualTo(400);
+    lane.close();
+  }
+
+  @Test
+  void theRoom_isNoneAboveHalfTheDepth_andHalfWayDownNudgesOnce() {
     OutboxConcurrentLane lane = new OutboxConcurrentLane(1, 10, false, Duration.ofSeconds(5));
+    lane.sendTook(Duration.ofMillis(1).toNanos()); // fast: the depth is the capacity, 10
     AtomicInteger nudges = new AtomicInteger();
     lane.onRoom(nudges::incrementAndGet);
     CountDownLatch gate = new CountDownLatch(1);
     CountDownLatch started = new CountDownLatch(1);
-    assertThat(lane.room()).isEqualTo(10);
+    assertThat(lane.room()).isEqualTo(10); // min(capacity, 1 free + 10) - 0
 
     lane.submit(
         () -> {
@@ -87,7 +246,7 @@ class OutboxConcurrentLaneTests {
         });
     hold(started); // the one slot is busy, nothing queued
     IntStream.range(0, 5).forEach(i -> lane.submit(() -> {}));
-    assertThat(lane.room()).isEqualTo(5); // half full: claim back up to the capacity
+    assertThat(lane.room()).isEqualTo(5); // half the depth queued: claim back up to it
     lane.submit(() -> {});
     assertThat(lane.room()).isZero(); // above half: no claim
     assertThat(nudges.get()).isZero();

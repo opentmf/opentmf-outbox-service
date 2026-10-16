@@ -126,14 +126,31 @@ public interface OutboxPublisher {
   }
 
   /**
-   * How long a claim of this row lasts - it MUST exceed this publisher's longest call, or a
-   * second holder re-claims the row while the first is still sending.
+   * How long a claim of this row lasts without a word from its holder. While a send runs, its pod
+   * renews the lease every third of it (1.9.0), up to the send's bound - the larger of the lease
+   * and {@link #sendTimeout}; a pod that dies stops renewing, and the row is taken over once the
+   * lease lapses. Up to 1.8.0 nothing renewed a running send: the lease had to exceed the
+   * publisher's longest call.
    *
    * @return the lease, or {@code null} for the library default of the row's lane
    *     ({@code opentmf.outbox.lease} for CONCURRENT, {@code opentmf.outbox.ordered.lease} for
    *     ORDERED)
    */
   default Duration lease(OutboxEvent event) {
+    return null;
+  }
+
+  /**
+   * How long one send of this row may run before the relay presumes it hung (1.9.0): the send
+   * heartbeat renews the row's lease up to the larger of its lease and this, never further; then
+   * it interrupts the send once, the lease lapses and the next claim counts the lapse as a failed
+   * attempt. A publisher whose call can legitimately take longer than {@code
+   * opentmf.outbox.send-timeout} - the library's Kafka publisher waits for its producer's own
+   * verdict - says so here.
+   *
+   * @return the bound, or {@code null} for {@code opentmf.outbox.send-timeout}
+   */
+  default Duration sendTimeout(OutboxEvent event) {
     return null;
   }
 

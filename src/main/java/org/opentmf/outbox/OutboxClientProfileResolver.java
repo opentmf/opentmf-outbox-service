@@ -13,8 +13,10 @@ public interface OutboxClientProfileResolver {
 
   /**
    * The client for a named profile, or the best client for a destination URL when no profile is
-   * set (longest-prefix base-url match). Return null for "no special client"
-   * - the publisher then uses its plain default.
+   * set (longest-prefix base-url match). With no profile set, return null for "no special client"
+   * - the publisher then uses its plain default. With a profile set, null means the profile is
+   * UNKNOWN: the row is refused ({@link TerminalOutboxException} naming the profile) and parks
+   * (1.9.0) - it never goes out through the plain client, without the profile's authentication.
    *
    * @param clientProfile the row's explicit profile, possibly null
    * @param destination the row's destination URL (for base-url matching when profile is null)

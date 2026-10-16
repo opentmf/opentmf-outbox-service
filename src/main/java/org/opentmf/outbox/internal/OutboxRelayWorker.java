@@ -1,8 +1,8 @@
 package org.opentmf.outbox.internal;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -13,6 +13,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
@@ -20,13 +22,14 @@ import lombok.extern.slf4j.Slf4j;
 import org.opentmf.outbox.OutboxBooking;
 import org.opentmf.outbox.OutboxBooking.Outcome;
 import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxLeaseLapsedException;
 import org.opentmf.outbox.OutboxProperties;
 import org.opentmf.outbox.OutboxPublisher;
 import org.opentmf.outbox.OutboxPublisher.ExhaustionOutcome;
 import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.opentmf.outbox.OutboxRelayedListener;
+import org.opentmf.outbox.OutboxSendError;
 import org.opentmf.outbox.TerminalOutboxException;
-import org.springframework.data.domain.Limit;
 import org.springframework.transaction.support.TransactionOperations;
 
 /**
@@ -45,9 +48,9 @@ import org.springframework.transaction.support.TransactionOperations;
  * <p>The lane is the one STAMPED on the row at append (null = ORDERED) - it wins even if the
  * publisher would now name another. The CLAIM takes: ORDERED rows up to {@code batch-size} (when
  * the relay says ORDERED rows may be due and the ORDERED lane is idle - one batch in flight per
- * pod); CONCURRENT rows up to the lane's ROOM - ahead of its
- * slots, into its hand-off queue of at most {@code batch-size} rows (1.6.0) - the query itself
- * keeping a key from going into flight twice. Neither lane's query reads the other lane's rows, so
+ * pod); CONCURRENT rows up to the lane's ROOM - ahead of its slots, into its hand-off queue as
+ * deep as the sends allow (1.6.0, 1.9.0), never a row this pod still holds queued - the query
+ * itself keeping a key from going into flight twice. Neither lane's query reads the other lane's rows, so
  * no backlog of one can hide a row of the other. A claim's cost on the relay thread does not grow
  * with the rows it takes (1.6.0): ONE statement tries every candidate key's advisory lock, ONE
  * re-checks the locked candidates, and ONE stamps every lease of the same length.
@@ -59,8 +62,24 @@ import org.springframework.transaction.support.TransactionOperations;
  * <p>ORDERED rows are stamped with the SHORT ordered lease, and each row's lease is RENEWED in
  * the booking transaction of the row before it - so every lease covers one send, never the whole
  * batch; a row cancelled before its turn is released unsent. A CONCURRENT row that waited in the
- * hand-off queue for a tenth of its lease or longer is renewed the same way right before its send,
- * so every send starts with at least nine tenths of its lease.
+ * hand-off queue for a tenth of its lease or longer is leased again the same way when it leaves
+ * the queue, right before its send, so every send starts with at least nine tenths of its lease -
+ * and a pod never claims a row it still holds queued, so a lease that lapsed in the queue costs
+ * the row nothing but the renewal (1.9.0).
+ *
+ * <p>WHILE a send runs, the {@link OutboxSendHeartbeat} keeps its lease - up to the send's bound,
+ * the larger of its lease and {@code send-timeout} (1.9.0) - and marks the send as under way
+ * ({@code sending_since}). A lease that lapses on a row whose send was under way (its pod died, or
+ * the send outran its bound) COUNTS as a failed attempt when the next claim takes the row: booked
+ * like any failure ({@link OutboxLeaseLapsedException} - backoff, then the publisher's budget
+ * parks or drops it), the row not sent on that claim. A send that never ends thus exhausts its
+ * row instead of being re-sent every lease forever, and its ORDERED lane or its key moves on.
+ * A lease that lapses on a row held UNSENT (queued, behind an ORDERED head) costs it nothing.
+ *
+ * <p>Anything a publisher, a booking hook or a relayed listener throws - an {@link Error}
+ * included - is a failed attempt under the same policy (1.9.0; an {@code Error} as the cause of
+ * an {@link OutboxSendError}); a failure booking whose hook throws again is booked without the
+ * hook, so the attempt counts. No throwable leaves a relay thread.
  *
  * <p>On failure: {@code attempts++}, {@code last_error} recorded, {@code next_attempt_on}
  * pushed out by the publisher's backoff (library exponential backoff by default); at the
@@ -101,32 +120,67 @@ class OutboxRelayWorker {
   /** The ORDERED lane's one thread (1.8.0): sends a claimed ORDERED batch off the relay thread. */
   private final OutboxOrderedLane orderedLane;
 
+  /** The database's time (1.9.0): every lease, due time and booking instant. */
+  private final OutboxClock clock;
+
+  /** Keeps the lease of every send in flight, up to its bound (1.9.0). */
+  private final OutboxSendHeartbeat heartbeat;
+
   /** The CONCURRENT claim's round-robin key cursor - read and moved on the relay thread only. */
   private String keyCursor = "";
 
-  /** One claimed row: its publisher, the lease value this holder stamped, and when. */
+  /**
+   * The CONCURRENT rows this pod holds in the lane's queue, not yet sending (1.9.0): a claim never
+   * takes one of them again. Up to 1.8.0 a queued row whose lease lapsed was claimed again by the
+   * next pass and queued at the TAIL - and its old place was dropped as lost.
+   */
+  private final Map<Long, Leased> queuedHere = new ConcurrentHashMap<>();
+
+  /**
+   * One claimed row: its publisher, the lease value this holder stamped, and when - and, while it
+   * is sent, what the {@link OutboxSendHeartbeat} needs (under {@link #lock}, which the booking
+   * takes too).
+   */
   static final class Leased {
     final OutboxEvent event;
     final OutboxPublisher publisher;
+    final Duration leaseLength;
+
+    /** The previous holder's lease lapsed while its send was under way: this claim counts it. */
+    final boolean lapsedSending;
+
+    final ReentrantLock lock = new ReentrantLock();
     OffsetDateTime leasedAt;
-    OffsetDateTime stamp;
-    boolean lost;
+    volatile OffsetDateTime stamp;
+    volatile boolean lost;
+
+    /** Whether the send is marked under way in the database ({@code sending_since}). */
+    volatile boolean marked;
+
+    boolean sending;
+    boolean interrupted;
+    Instant sendStartedAt;
+    Thread sender;
 
     Leased(
         OutboxEvent event,
         OutboxPublisher publisher,
         OffsetDateTime leasedAt,
-        OffsetDateTime stamp) {
+        OffsetDateTime stamp,
+        boolean lapsedSending) {
       this.event = event;
       this.publisher = publisher;
       this.leasedAt = leasedAt;
       this.stamp = stamp;
+      this.leaseLength = Duration.between(leasedAt, stamp);
+      this.lapsedSending = lapsedSending;
     }
 
     /** The committed lease, mirrored on the (now detached) row. */
     void mirrorStamp() {
       event.setClaimedUntil(stamp);
       event.setNextAttemptOn(stamp); // a pre-1.3.0 relay sees the leased row as not due
+      event.setSendingSince(null);
     }
   }
 
@@ -149,6 +203,11 @@ class OutboxRelayWorker {
 
   private record Attempt(Object result, RuntimeException failure) {}
 
+  /** A throwable as a booking's failure: an {@link Error} (or a sneaky checked one) wrapped. */
+  static RuntimeException asFailure(Throwable thrown) {
+    return thrown instanceof RuntimeException runtime ? runtime : new OutboxSendError(thrown);
+  }
+
   /**
    * Claims one batch and hands each lane its rows: the CONCURRENT rows to the lane's queue, the
    * ORDERED batch to the ORDERED lane's thread. Neither send runs on the calling thread, so the
@@ -161,7 +220,9 @@ class OutboxRelayWorker {
     Claimed ordered = withOrdered && !orderedLane.busy() ? claimOrdered() : Claimed.NONE;
     Claimed concurrent = claimConcurrent();
     for (Leased row : concurrent.rows()) {
-      if (!lane.submit(() -> relayConcurrent(row))) {
+      queuedHere.put(row.event.getId(), row);
+      if (!lane.submit(row.event.getId(), () -> relayConcurrent(row))) {
+        queuedHere.remove(row.event.getId());
         log.info(
             "Outbox row {} not sent - the relay is stopping; its lease lapses",
             row.event.getId());
@@ -181,7 +242,7 @@ class OutboxRelayWorker {
 
   /** The ORDERED claim, its own short transaction on the relay thread; its failure fails it. */
   private Claimed claimOrdered() {
-    Claimed claimed = tx.execute(status -> claimOrdered(now()));
+    Claimed claimed = tx.execute(status -> claimOrdered(clock.now()));
     claimed.rows().forEach(Leased::mirrorStamp);
     return claimed;
   }
@@ -197,7 +258,7 @@ class OutboxRelayWorker {
       return Claimed.NONE;
     }
     try {
-      Claimed claimed = tx.execute(status -> claimConcurrent(now(), room));
+      Claimed claimed = tx.execute(status -> claimConcurrent(clock.now(), room));
       claimed.rows().forEach(Leased::mirrorStamp);
       return claimed;
     } catch (RuntimeException ex) {
@@ -208,7 +269,7 @@ class OutboxRelayWorker {
 
   private Claimed claimOrdered(OffsetDateTime now) {
     int limit = properties.getBatchSize();
-    List<OutboxEvent> rows = repository.claimOrdered(now, Lane.CONCURRENT, Limit.of(limit));
+    List<OutboxEvent> rows = repository.claimOrdered(now, limit);
     List<Leased> leased = new ArrayList<>();
     for (OutboxEvent row : rows) {
       OutboxPublisher publisher = route(row);
@@ -237,6 +298,9 @@ class OutboxRelayWorker {
     }
     List<Leased> leased = new ArrayList<>();
     for (OutboxEvent row : acrossPods(rows, now)) {
+      if (queuedHere.containsKey(row.getId())) {
+        continue; // still queued here, its lease lapsed: it keeps its place, never a second one
+      }
       OutboxPublisher publisher = route(row);
       if (publisher != null) {
         leased.add(lease(row, publisher, Lane.CONCURRENT, now));
@@ -326,18 +390,26 @@ class OutboxRelayWorker {
   }
 
   /** The row's publisher - or null after booking the routing failure by the LIBRARY policy. */
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private OutboxPublisher route(OutboxEvent row) {
     try {
       return router.resolve(row);
-    } catch (RuntimeException ex) {
-      registerFailure(row, null, ex);
+    } catch (Throwable ex) { // a router or a publisher's supports() may throw anything
+      registerFailure(row, null, asFailure(ex));
       return null;
     }
   }
 
+  /**
+   * Leases one claimed row. Read BEFORE the stamp is written: a row whose previous lease lapsed
+   * while its send was under way - its pod died mid-send, or the send outran its bound - carries
+   * that lease still, and {@code sending_since}; this claim then books the lapse as a failed
+   * attempt instead of sending (see {@link #relayConcurrent}).
+   */
   private Leased lease(
       OutboxEvent row, OutboxPublisher publisher, Lane rowLane, OffsetDateTime now) {
-    return new Leased(row, publisher, now, leaseEnd(row, publisher, rowLane, now));
+    boolean lapsedSending = row.getClaimedUntil() != null && row.getSendingSince() != null;
+    return new Leased(row, publisher, now, leaseEnd(row, publisher, rowLane, now), lapsedSending);
   }
 
   /** {@code now + lease}, truncated to the column's microsecond precision so the guard matches. */
@@ -357,13 +429,19 @@ class OutboxRelayWorker {
    * One CONCURRENT row, on a lane worker: renewed first if it waited long in the hand-off queue,
    * then sent and booked.
    */
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void relayConcurrent(Leased row) {
+    queuedHere.remove(row.event.getId()); // it leaves the queue: from here on a claim may see it
     try {
+      if (row.lapsedSending) {
+        book(laneTx, row, lapsed(row), () -> NOTHING); // counted, not sent: backoff first
+        return;
+      }
       if (waitedLong(row) && !renewQueued(row)) {
         return; // taken by another holder meanwhile, or cancelled and released unsent
       }
       book(laneTx, row, send(row), () -> NOTHING);
-    } catch (RuntimeException ex) {
+    } catch (Throwable ex) { // nothing leaves a lane worker
       log.error(
           "Outbox row {} to {} - renewal or booking failed; the row is redelivered once its"
               + " lease lapses",
@@ -373,10 +451,59 @@ class OutboxRelayWorker {
     }
   }
 
+  /**
+   * Gives back the rows this pod holds queued while NO slot of its lane is live (1.9.0): each slot
+   * busy with a send older than a second, they would only wait behind them - claimed in the second
+   * before the slots turned slow. Their leases are released in ONE guarded statement, due at once,
+   * for any pod with a free slot (this one included, once a slot frees). Runs on the heartbeat's
+   * tick; a failed release leaves the leases to lapse - the rows were never sent, so it costs them
+   * nothing.
+   */
+  void giveBackStranded() {
+    List<Leased> rows =
+        lane.evictStranded().stream().map(queuedHere::remove).filter(Objects::nonNull).toList();
+    if (rows.isEmpty()) {
+      return;
+    }
+    try {
+      Integer released =
+          laneTx.execute(
+              status ->
+                  repository.releaseLeases(
+                      OutboxSqlArrays.ids(rows.stream().map(r -> r.event.getId()).toList()),
+                      OutboxSqlArrays.instants(rows.stream().map(r -> r.stamp).toList()),
+                      clock.now()));
+      log.info(
+          "Outbox gave {} queued rows back ({} released) - every slot is busy with a send older"
+              + " than {}; any pod with a free slot takes them",
+          rows.size(),
+          released,
+          OutboxConcurrentLane.HORIZON);
+    } catch (RuntimeException ex) {
+      log.warn(
+          "Outbox could not give {} queued rows back - their leases lapse, unsent: {}",
+          rows.size(),
+          ex.toString());
+    }
+  }
+
   /** Whether a queued row has waited a tenth of its lease or longer since it was leased. */
-  private static boolean waitedLong(Leased row) {
-    Duration lease = Duration.between(row.leasedAt, row.stamp);
-    return Duration.between(row.leasedAt, now()).compareTo(lease.dividedBy(10)) >= 0;
+  private boolean waitedLong(Leased row) {
+    return Duration.between(row.leasedAt, clock.now()).compareTo(row.leaseLength.dividedBy(10))
+        >= 0;
+  }
+
+  /**
+   * The attempt a lapsed lease stands for: the previous holder's send was under way when its
+   * lease ran out - it may have been delivered (the idempotency key dedups), it was never booked.
+   */
+  private static Attempt lapsed(Leased row) {
+    return new Attempt(
+        null,
+        new OutboxLeaseLapsedException(
+            "the lease of the send before this claim lapsed unbooked (the send was under way:"
+                + " its pod died, or it outran its bound) - counted as a failed attempt; row "
+                + row.event.getId()));
   }
 
   /**
@@ -398,6 +525,7 @@ class OutboxRelayWorker {
     return !row.lost;
   }
 
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void relayOrdered(List<Leased> ordered) {
     for (int i = 0; i < ordered.size(); i++) {
       Leased row = ordered.get(i);
@@ -406,8 +534,8 @@ class OutboxRelayWorker {
       }
       int index = i;
       try {
-        book(tx, row, send(row), () -> renewNext(ordered, index));
-      } catch (RuntimeException ex) {
+        book(tx, row, row.lapsedSending ? lapsed(row) : send(row), () -> renewNext(ordered, index));
+      } catch (Throwable ex) { // nothing leaves the ORDERED lane's thread
         log.error(
             "Outbox row {} to {} - booking failed; it and the rest of the batch are redelivered"
                 + " once their leases lapse",
@@ -444,27 +572,38 @@ class OutboxRelayWorker {
     OutboxEvent row = held.get();
     if (row.getCancelledOn() != null) {
       row.setClaimedUntil(null);
+      row.setSendingSince(null);
       afterCommit.add(() -> next.lost = true);
       log.info("Outbox row {} cancelled before its send - released unsent", row.getId());
       return false;
     }
-    OffsetDateTime now = now();
+    if (next.lapsedSending) {
+      return true; // its lapse is booked first, nothing sent: the lease it has covers that
+    }
+    OffsetDateTime now = clock.now();
     OffsetDateTime renewed = leaseEnd(row, next.publisher, rowLane, now);
     row.setClaimedUntil(renewed);
     row.setNextAttemptOn(renewed);
+    row.setSendingSince(now); // renewed for the send that starts right after this commit
     afterCommit.add(
         () -> {
           next.leasedAt = now;
           next.stamp = renewed;
+          next.marked = true;
         });
     return true;
   }
 
-  private static Attempt send(Leased row) {
+  /** One send, its lease kept by the heartbeat while it runs; whatever it throws is a failure. */
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
+  private Attempt send(Leased row) {
+    heartbeat.started(row);
     try {
       return new Attempt(row.publisher.deliver(row.event), null);
-    } catch (RuntimeException ex) {
-      return new Attempt(null, ex);
+    } catch (Throwable ex) { // an Error is a failed attempt too (1.9.0)
+      return new Attempt(null, asFailure(ex));
+    } finally {
+      heartbeat.finished(row);
     }
   }
 
@@ -473,8 +612,11 @@ class OutboxRelayWorker {
   /**
    * Books one attempt in its own short transaction; {@code alsoInTx} rides the same transaction
    * and returns what to apply once it committed. A refused RELAYED booking (a hook or listener
-   * threw - its writes roll back with the stamp) is booked as an ordinary failure instead.
+   * threw - its writes roll back with the stamp) is booked as an ordinary failure instead; a
+   * failure booking refused too (the hook threw again) is booked once more WITHOUT the hook, so
+   * the attempt counts and the row's budget ends it - never redelivered unbooked forever (1.9.0).
    */
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void book(
       TransactionOperations via, Leased row, Attempt attempt, Supplier<Runnable> alsoInTx) {
     RuntimeException failure = attempt.failure();
@@ -482,12 +624,23 @@ class OutboxRelayWorker {
       try {
         commit(via, () -> bookRelayed(row, attempt.result()), alsoInTx);
         return;
-      } catch (RuntimeException refused) {
-        failure = refused;
+      } catch (Throwable refused) {
+        failure = asFailure(refused);
       }
     }
     RuntimeException failed = failure;
-    commit(via, () -> bookFailure(row, failed), alsoInTx);
+    try {
+      commit(via, () -> bookFailure(row, failed, true), alsoInTx);
+    } catch (Throwable refusedAgain) {
+      log.error(
+          "Outbox row {} to {} - the failure booking was refused as well (its booking hook"
+              + " threw); booked without the hook",
+          row.event.getId(),
+          row.event.getDestination(),
+          refusedAgain);
+      failed.addSuppressed(refusedAgain);
+      commit(via, () -> bookFailure(row, failed, false), alsoInTx);
+    }
   }
 
   private static void commit(
@@ -502,7 +655,7 @@ class OutboxRelayWorker {
    */
   private Runnable bookRelayed(Leased leased, Object result) {
     Optional<OutboxEvent> held =
-        repository.bookRelayed(leased.event.getId(), leased.stamp, now());
+        repository.bookRelayed(leased.event.getId(), leased.stamp, clock.now());
     if (held.isEmpty()) {
       logLapsed(leased);
       return NOTHING;
@@ -525,7 +678,7 @@ class OutboxRelayWorker {
     return () -> metrics.recordRelayed(destination, tries);
   }
 
-  private Runnable bookFailure(Leased leased, RuntimeException ex) {
+  private Runnable bookFailure(Leased leased, RuntimeException ex, boolean withHook) {
     Optional<OutboxEvent> held = repository.lockLeased(leased.event.getId(), leased.stamp);
     if (held.isEmpty()) {
       logLapsed(leased);
@@ -533,10 +686,11 @@ class OutboxRelayWorker {
     }
     OutboxEvent row = held.get();
     row.setClaimedUntil(null);
+    row.setSendingSince(null);
     OutboxBooking booking;
     if (row.getCancelledOn() != null) {
       bookAttempt(row, ex);
-      row.setNextAttemptOn(now()); // no longer the lease end; never claimed again anyway
+      row.setNextAttemptOn(clock.now()); // no longer the lease end; never claimed again anyway
       booking = OutboxBooking.failed(Outcome.CANCELLED, ex, null);
       log.info(
           "Outbox row {} - send failed after it was cancelled; it retires cancelled: {}",
@@ -545,7 +699,9 @@ class OutboxRelayWorker {
     } else {
       booking = registerFailure(row, leased.publisher, ex);
     }
-    leased.publisher.onBooked(row, booking);
+    if (withHook) {
+      leased.publisher.onBooked(row, booking);
+    }
     String destination = row.getDestination();
     return booking.exhaustion() == ExhaustionOutcome.DROP
         ? () -> metrics.recordDropped(destination)
@@ -568,7 +724,7 @@ class OutboxRelayWorker {
     if (ex instanceof TerminalOutboxException || attempts >= maxAttemptsFor(event, publisher)) {
       return OutboxBooking.failed(Outcome.EXHAUSTED, ex, exhaust(event, publisher));
     }
-    event.setNextAttemptOn(now().plus(backoffFor(event, publisher, attempts)));
+    event.setNextAttemptOn(clock.now().plus(backoffFor(event, publisher, attempts)));
     log.warn(
         "Outbox relay attempt {} failed for row {} to {}: {}",
         attempts,
@@ -591,7 +747,7 @@ class OutboxRelayWorker {
     if (outcome == ExhaustionOutcome.DROP) {
       // given up: leaves the pending set as if relayed, forensics kept; NOT a delivery - no
       // listener fires, the relayed counter stays untouched
-      event.setRelayedOn(now());
+      event.setRelayedOn(clock.now());
       log.warn(
           "Outbox row {} to {} DROPPED after {} attempts by its publisher's policy: {}",
           event.getId(),
@@ -600,7 +756,7 @@ class OutboxRelayWorker {
           event.getLastError());
       return ExhaustionOutcome.DROP;
     }
-    event.setParkedOn(now());
+    event.setParkedOn(clock.now());
     log.error(
         "Outbox row {} to {} PARKED after {} attempts - ops action required (unpark after the"
             + " root cause is fixed): {}",
@@ -619,10 +775,6 @@ class OutboxRelayWorker {
   private Duration backoffFor(OutboxEvent event, OutboxPublisher publisher, int attempts) {
     Duration declared = publisher == null ? null : publisher.backoff(event, attempts);
     return declared != null ? declared : backoff.delayFor(attempts);
-  }
-
-  private static OffsetDateTime now() {
-    return OffsetDateTime.now(ZoneOffset.UTC);
   }
 
   private static String describe(RuntimeException ex) {

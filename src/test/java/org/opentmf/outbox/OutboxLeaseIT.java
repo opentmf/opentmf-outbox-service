@@ -18,6 +18,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -116,6 +117,12 @@ class OutboxLeaseIT {
           return scenario(event).equals("lapse") ? Duration.ofSeconds(2) : null;
         }
 
+        /** The lapse scenario's send is presumed hung after 2 s (its lease; 1.9.0's bound). */
+        @Override
+        public Duration sendTimeout(OutboxEvent event) {
+          return scenario(event).equals("lapse") ? Duration.ofSeconds(1) : null;
+        }
+
         @Override
         public Duration backoff(OutboxEvent event, int attempt) {
           return Duration.ofMillis(200);
@@ -135,7 +142,7 @@ class OutboxLeaseIT {
           switch (scenario(event)) {
             case "lapse" -> {
               if (mine.size() == 1) {
-                latency(5000); // outlives the 2 s lease: the row is re-claimed meanwhile
+                deafLatency(5000); // outruns its 2 s bound, deaf to the heartbeat's interrupt
                 LATE_ANSWERED.countDown();
               }
             }
@@ -210,6 +217,19 @@ class OutboxLeaseIT {
     }
   }
 
+  /** A call that ignores interrupts (a client that never honours one); the flag kept for after. */
+  static void deafLatency(long millis) {
+    long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(millis);
+    boolean interrupted = false;
+    for (long left = end - System.nanoTime(); left > 0; left = end - System.nanoTime()) {
+      interrupted |= Thread.interrupted(); // parkNanos returns at once while the flag is set
+      LockSupport.parkNanos(left);
+    }
+    if (interrupted) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
   /** The receiver's response time: a timed wait on a latch nobody opens. */
   static void latency(long millis) {
     try {
@@ -256,12 +276,19 @@ class OutboxLeaseIT {
             });
   }
 
+  /**
+   * 1.9.0: a send that outruns its BOUND (the larger of its 2 s lease and its 1 s send timeout)
+   * and ignores the heartbeat's interrupt has its lease lapse; the next claim books the lapse as a
+   * failed attempt (the hook sees RETRY), the retry delivers, and the late holder books nothing.
+   */
   @Test
-  void aLapsedLease_isReClaimed_andTheLateHolderBooksNothing() {
+  void aLapsedLease_isReClaimed_countedOnce_andTheLateHolderBooksNothing() {
     OutboxEvent row = append("lapse-concurrent:x");
 
     OutboxRowView booked = awaitRelayed(row); // by the SECOND holder, while the first still sends
     assertThat(DELIVERED.get(row.getId())).hasSize(2);
+    assertThat(booked.attempts()).isEqualTo(1); // the lapse, counted
+    assertThat(booked.lastError()).startsWith("OutboxLeaseLapsedException");
     awaitGate(LATE_ANSWERED); // the first holder has its answer and tries to book...
     await() // ...and books nothing: the row stays exactly as the second holder booked it
         .during(Duration.ofSeconds(1))
@@ -270,9 +297,9 @@ class OutboxLeaseIT {
             () ->
                 assertThat(maintenance.inspect(row.getId()))
                     .returns(booked.relayedOn(), OutboxRowView::relayedOn)
-                    .returns(0, OutboxRowView::attempts));
+                    .returns(1, OutboxRowView::attempts));
     assertThat(LISTENED.get(row.getId())).hasValue(1); // one booking, one listener call
-    assertThat(HOOKED.get(row.getId())).containsExactly(Outcome.RELAYED);
+    assertThat(HOOKED.get(row.getId())).containsExactly(Outcome.RETRY, Outcome.RELAYED);
     // both deliveries carry ONE idempotency key - the receiver dedups the second
     assertThat(DELIVERED.get(row.getId())).containsOnly("outbox-lease-it:outbox:" + row.getId());
   }

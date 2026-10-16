@@ -1,6 +1,7 @@
 package org.opentmf.outbox.internal;
 
 import io.micrometer.core.instrument.MeterRegistry;
+import java.time.Clock;
 import java.util.List;
 import org.opentmf.outbox.OutboxClientProfileResolver;
 import org.opentmf.outbox.OutboxEvent;
@@ -14,6 +15,7 @@ import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.AutoConfigurationPackage;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.thread.Threading;
@@ -26,7 +28,6 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
-import org.springframework.web.client.RestClient;
 import tools.jackson.databind.ObjectMapper;
 
 /**
@@ -59,9 +60,32 @@ public class OutboxAutoConfiguration {
       OutboxEventRepository repository,
       ApplicationEventPublisher eventPublisher,
       ObjectMapper objectMapper,
-      ObjectProvider<OutboxLaneStamper> laneStamper) {
+      ObjectProvider<OutboxLaneStamper> laneStamper,
+      OutboxClock clock) {
     // lazy: a consumer publisher that appends through the writer must not form a cycle
-    return new OutboxWriter(repository, eventPublisher, objectMapper, laneStamper::getObject);
+    return new OutboxWriter(
+        repository, eventPublisher, objectMapper, laneStamper::getObject, clock);
+  }
+
+  /**
+   * The outbox's time (1.9.0): the database's clock, as the JVM clock plus a measured offset - so
+   * no pod's own clock decides a lease, a retry or a hold. A consumer's own bean replaces it.
+   */
+  @Bean
+  @ConditionalOnMissingBean
+  OutboxClock outboxClock(OutboxEventRepository repository) {
+    return new OutboxClock(Clock.systemUTC(), repository::databaseNow);
+  }
+
+  /** Keeps the lease of every send in flight, up to its bound (1.9.0). */
+  @Bean
+  OutboxSendHeartbeat outboxSendHeartbeat(
+      OutboxEventRepository repository,
+      PlatformTransactionManager transactionManager,
+      OutboxClock clock,
+      OutboxProperties properties) {
+    return new OutboxSendHeartbeat(
+        repository, laneTransactions(transactionManager), clock, properties.getSendTimeout());
   }
 
   @Bean
@@ -78,14 +102,16 @@ public class OutboxAutoConfiguration {
   OutboxMetrics outboxMetrics(
       ObjectProvider<MeterRegistry> registry,
       OutboxEventRepository repository,
-      OutboxProperties properties) {
+      OutboxProperties properties,
+      OutboxClock clock) {
     // No registry bean (a consumer without actuator) = a simple local registry: the relay
     // keeps working, the gauges just have no exporter. Consumers with actuator get the real
     // one automatically.
     return new OutboxMetrics(
         registry.getIfAvailable(io.micrometer.core.instrument.simple.SimpleMeterRegistry::new),
         repository,
-        properties.getMetricsRefresh());
+        properties.getMetricsRefresh(),
+        clock);
   }
 
   @Bean
@@ -126,7 +152,9 @@ public class OutboxAutoConfiguration {
       ObjectProvider<OutboxRelayedListener> relayedListeners,
       PlatformTransactionManager transactionManager,
       OutboxConcurrentLane lane,
-      OutboxOrderedLane orderedLane) {
+      OutboxOrderedLane orderedLane,
+      OutboxClock clock,
+      OutboxSendHeartbeat heartbeat) {
     // the post-relay seam: zero or more consumer beans, invoked in bean order inside the
     // booking transaction that stamps relayed_on (see OutboxRelayedListener)
     return new OutboxRelayWorker(
@@ -139,7 +167,9 @@ public class OutboxAutoConfiguration {
         relayTransactions(transactionManager),
         laneTransactions(transactionManager),
         lane,
-        orderedLane);
+        orderedLane,
+        clock,
+        heartbeat);
   }
 
   /**
@@ -174,8 +204,10 @@ public class OutboxAutoConfiguration {
       OutboxRelayWorker worker,
       OutboxProperties properties,
       OutboxConcurrentLane lane,
-      OutboxOrderedLane orderedLane) {
-    return new OutboxRelay(worker, properties, lane, orderedLane);
+      OutboxOrderedLane orderedLane,
+      OutboxSendHeartbeat heartbeat,
+      OutboxClock clock) {
+    return new OutboxRelay(worker, properties, lane, orderedLane, heartbeat, clock);
   }
 
   @Bean
@@ -187,8 +219,9 @@ public class OutboxAutoConfiguration {
   public OutboxMaintenanceService outboxMaintenanceService(
       OutboxEventRepository repository,
       OutboxProperties properties,
-      ApplicationEventPublisher eventPublisher) {
-    return new OutboxMaintenanceService(repository, properties, eventPublisher);
+      ApplicationEventPublisher eventPublisher,
+      OutboxClock clock) {
+    return new OutboxMaintenanceService(repository, properties, eventPublisher, clock);
   }
 
   /**
@@ -240,9 +273,11 @@ public class OutboxAutoConfiguration {
     OutboxPublisher httpOutboxPublisher(
         ObjectProvider<OutboxClientProfileResolver> profileResolver,
         ObjectMapper objectMapper,
-        Environment environment) {
+        Environment environment,
+        OutboxProperties properties) {
       return new HttpOutboxPublisher(
-          RestClient.create(),
+          OutboxHttpClients.plain(
+              properties.getHttp().getConnectTimeout(), properties.httpReadTimeout()),
           profileResolver.getIfAvailable(),
           objectMapper,
           environment.getProperty("spring.application.name", "unknown"));

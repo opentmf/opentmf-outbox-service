@@ -31,7 +31,6 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
-import org.springframework.data.domain.Limit;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionCallback;
 import org.springframework.transaction.support.TransactionOperations;
@@ -274,7 +273,7 @@ class OutboxTwoRelaysIT {
   }
 
   private Long oneOrderedRow() {
-    return repository.claimOrdered(OffsetDateTime.now(), Lane.CONCURRENT, Limit.of(1)).stream()
+    return repository.claimOrdered(OffsetDateTime.now(), 1).stream()
         .map(OutboxEvent::getId)
         .findFirst()
         .orElse(null);
@@ -296,8 +295,7 @@ class OutboxTwoRelaysIT {
         new OutboxConcurrentLane(4, properties.getBatchSize(), false, Duration.ofSeconds(5));
     OutboxOrderedLane secondOrderedLane = new OutboxOrderedLane(Duration.ofSeconds(5));
     OutboxRelayWorker secondPod =
-        new OutboxRelayWorker(
-            repository,
+        new OutboxRelayWorker(repository,
             router,
             backoff,
             metrics,
@@ -306,7 +304,9 @@ class OutboxTwoRelaysIT {
             new TransactionTemplate(txManager),
             new TransactionTemplate(txManager),
             secondLane,
-            secondOrderedLane);
+            secondOrderedLane,
+            OutboxClock.system(),
+            OutboxSendHeartbeatFixture.idle());
     ExecutorService pods = Executors.newFixedThreadPool(2);
     try {
       long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
@@ -409,8 +409,7 @@ class OutboxTwoRelaysIT {
     OutboxOrderedLane orderedLaneA = new OutboxOrderedLane(Duration.ofSeconds(5));
     OutboxOrderedLane orderedLaneB = new OutboxOrderedLane(Duration.ofSeconds(5));
     OutboxRelayWorker podA =
-        new OutboxRelayWorker(
-            repository,
+        new OutboxRelayWorker(repository,
             router,
             backoff,
             metrics,
@@ -419,10 +418,11 @@ class OutboxTwoRelaysIT {
             podATx,
             podATx,
             laneA,
-            orderedLaneA);
+            orderedLaneA,
+            OutboxClock.system(),
+            OutboxSendHeartbeatFixture.idle());
     OutboxRelayWorker podB =
-        new OutboxRelayWorker(
-            repository,
+        new OutboxRelayWorker(repository,
             router,
             backoff,
             metrics,
@@ -431,7 +431,9 @@ class OutboxTwoRelaysIT {
             new TransactionTemplate(txManager),
             new TransactionTemplate(txManager),
             laneB,
-            orderedLaneB);
+            orderedLaneB,
+            OutboxClock.system(),
+            OutboxSendHeartbeatFixture.idle());
     ExecutorService pods = Executors.newSingleThreadExecutor();
     try {
       podATx.armed = true;

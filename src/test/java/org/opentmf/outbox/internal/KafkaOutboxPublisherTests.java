@@ -9,7 +9,9 @@ import static org.mockito.Mockito.when;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -19,6 +21,7 @@ import org.opentmf.outbox.OutboxProperties.KafkaOrderingKey;
 import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.springframework.kafka.KafkaException;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.core.ProducerFactory;
 import org.springframework.kafka.support.SendResult;
 import tools.jackson.databind.ObjectMapper;
 
@@ -147,15 +150,67 @@ class KafkaOutboxPublisherTests {
         .withMessageContaining("row 7");
   }
 
+  /** A template whose producer is configured with these settings (the rest: Kafka's defaults). */
+  @SuppressWarnings("unchecked")
+  private KafkaTemplate<Object, Object> producedWith(Map<String, Object> settings) {
+    KafkaTemplate<Object, Object> configured = mock(KafkaTemplate.class);
+    ProducerFactory<Object, Object> factory = mock(ProducerFactory.class);
+    when(factory.getConfigurationProperties()).thenReturn(settings);
+    when(configured.getProducerFactory()).thenReturn(factory);
+    return configured;
+  }
+
+  /**
+   * 1.9.0 (E1b): the acknowledgement is awaited as long as the PRODUCER may still deliver the
+   * record - its delivery timeout plus linger - and the whole send, its metadata wait first, is
+   * the bound the send heartbeat keeps the lease for. Never shorter than send-timeout.
+   */
+  @Test
+  void theWait_isTheProducersOwnVerdict_andTheSendTimeoutDeclaresTheWholeSend() {
+    KafkaOutboxPublisher configured =
+        new KafkaOutboxPublisher(
+            producedWith(
+                Map.of(
+                    ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 30_000,
+                    ProducerConfig.LINGER_MS_CONFIG, "5",
+                    ProducerConfig.MAX_BLOCK_MS_CONFIG, 10_000L)),
+            new OutboxProperties(),
+            new ObjectMapper(),
+            "svc");
+    assertThat(configured.sendTimeout(event("topic", null)))
+        .isEqualTo(Duration.ofMillis(10_000 + 30_000 + 5 + 1_000));
+
+    // no settings: Kafka's defaults - 60 s metadata, 120 s delivery
+    assertThat(publisher.sendTimeout(event("topic", null)))
+        .isBetween(Duration.ofSeconds(181), Duration.ofSeconds(182));
+
+    // a send-timeout above the producer's verdict wins the wait; the metadata wait comes on top
+    OutboxProperties patient = new OutboxProperties();
+    patient.setSendTimeout(Duration.ofMinutes(10));
+    patient.getKafka().setLease(Duration.ofMinutes(11));
+    patient.getOrdered().setLease(Duration.ofMinutes(11));
+    assertThat(
+            new KafkaOutboxPublisher(
+                    producedWith(Map.of(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 1_000)),
+                    patient,
+                    new ObjectMapper(),
+                    "svc")
+                .sendTimeout(event("topic", null)))
+        .isEqualTo(Duration.ofMinutes(11)); // 10 min awaited + 60 s max.block (Kafka's default)
+  }
+
   @Test
   @SuppressWarnings("unchecked")
   void publish_ackTimeout_throwsForTheRelay() {
+    KafkaTemplate<Object, Object> impatientTemplate =
+        producedWith(
+            Map.of(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 50, ProducerConfig.LINGER_MS_CONFIG, 0));
     OutboxProperties impatient = new OutboxProperties();
-    impatient.setSendTimeout(java.time.Duration.ofMillis(50));
+    impatient.setSendTimeout(Duration.ofMillis(50));
     KafkaOutboxPublisher slow =
-        new KafkaOutboxPublisher(template, impatient, new ObjectMapper(), "svc");
-    when(template.isTransactional()).thenReturn(false);
-    when(template.send(any(ProducerRecord.class))).thenReturn(new CompletableFuture<>());
+        new KafkaOutboxPublisher(impatientTemplate, impatient, new ObjectMapper(), "svc");
+    when(impatientTemplate.isTransactional()).thenReturn(false);
+    when(impatientTemplate.send(any(ProducerRecord.class))).thenReturn(new CompletableFuture<>());
 
     OutboxEvent event = event("topic", null);
     assertThatExceptionOfType(KafkaException.class)

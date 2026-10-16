@@ -286,9 +286,11 @@ class OutboxHttpLaneIT {
 
   /**
    * The cap under a burst: 20 rows to 20 receivers, every receiver holding its request - exactly
-   * {@code max-in-flight} (8) SENDS are ever in flight. Since 1.6.0 the claim runs ahead of the
-   * slots: the other 12 wait leased in the lane's hand-off queue (the in-flight gauge counts all
-   * 20 leases), and all 20 relay once the receivers answer.
+   * {@code max-in-flight} (8) SENDS are ever in flight. Since 1.9.0 nothing waits leased behind the
+   * held sends: the queue's depth follows the sends, and no send has completed - so the other 12
+   * stay unclaimed in the table (the in-flight gauge counts the 8 sending) until a slot frees, and
+   * all 20 relay once the receivers answer. (1.6.0 to 1.8.0 leased all 20 and queued 12 behind the
+   * held sends, their leases running while they waited.)
    */
   @Test
   void theCap_holdsUnderABurst() {
@@ -297,18 +299,19 @@ class OutboxHttpLaneIT {
       int n = i;
       burst.add(append("b-" + n, url("hold/" + n)));
     }
-
-    await().atMost(Duration.ofSeconds(20)).until(() -> HELD_NOW.get() == 8);
-    await()
-        .during(Duration.ofSeconds(2))
-        .atMost(Duration.ofSeconds(5))
-        .until(() -> HELD_NOW.get() == 8); // and it stays at the cap
-    assertThat(inFlightGauge()).isEqualTo(20d); // eight sending, twelve queued - all leased
-    assertThat(burst)
-        .filteredOn(row -> maintenance.inspect(row.getId()).claimedUntil() != null)
-        .hasSize(20);
-
-    BURST_GATE.countDown();
+    try {
+      await().atMost(Duration.ofSeconds(20)).until(() -> HELD_NOW.get() == 8);
+      await()
+          .during(Duration.ofSeconds(2))
+          .atMost(Duration.ofSeconds(5))
+          .until(() -> HELD_NOW.get() == 8); // and it stays at the cap
+      assertThat(inFlightGauge()).isEqualTo(8d); // eight sending - nothing queued behind them
+      assertThat(burst)
+          .filteredOn(row -> maintenance.inspect(row.getId()).claimedUntil() != null)
+          .hasSize(8);
+    } finally {
+      BURST_GATE.countDown(); // never leave the slots held for the next test
+    }
     await()
         .atMost(Duration.ofSeconds(60))
         .untilAsserted(
