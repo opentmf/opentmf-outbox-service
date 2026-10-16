@@ -686,9 +686,9 @@ final class Invariants {
         relayedRows++;
       }
     }
-    boolean stopped =
-        scenario.pods.stream()
-            .anyMatch(p -> p.stoppedAt != null && !scenario.killed.contains(p.name()));
+    // a stopped pod's context closed its registry - graceful or not: Scenario.stop marks the pod
+    // killed for I1's sake, and its drain still books into the closed registry
+    boolean stopped = scenario.pods.stream().anyMatch(p -> p.stoppedAt != null);
     if (!scenario.outages.isEmpty()
         && (long) relayedCounter < relayedRows
         && relayedRows - (long) relayedCounter <= 8L * scenario.pods.size()) {

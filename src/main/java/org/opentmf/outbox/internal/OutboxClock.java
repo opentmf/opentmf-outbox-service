@@ -17,7 +17,12 @@ import lombok.extern.slf4j.Slf4j;
  * whose clock ran ahead took rows under another pod's live lease, and a pod whose clock ran behind
  * stamped leases that had already lapsed for every other pod.
  *
- * <p>The offset is good to about half a round trip. A failed measurement keeps the last offset; a
+ * <p>Each measurement takes {@link #SAMPLES} round trips and keeps the FASTEST - the one with the
+ * least room for an asymmetric delay - and an offset within that round trip's own uncertainty
+ * (half of it, plus {@link #UNCERTAINTY_FLOOR}) is taken as none: a pod that shares the
+ * database's clock stays on its own, never "corrected" by a slow round trip (through a proxy, on
+ * a loaded host, a single trip can be a hundred milliseconds one way). A failed measurement keeps
+ * the last offset; a
  * pod that never reached the database runs on its own clock until it does. A skew above {@link
  * #WARN_SKEW} is logged - the relay is right either way, but the host's clock is not.
  *
@@ -31,6 +36,12 @@ public class OutboxClock {
 
   /** A skew worth a warning: the host's clock is off the database's by more than this. */
   static final Duration WARN_SKEW = Duration.ofSeconds(1);
+
+  /** Round trips per measurement; the fastest one is kept. */
+  static final int SAMPLES = 5;
+
+  /** Added to half the fastest round trip: an offset within the sum is measurement noise. */
+  static final Duration UNCERTAINTY_FLOOR = Duration.ofMillis(1);
 
   private final Clock jvm;
   private final Supplier<Instant> database;
@@ -79,11 +90,21 @@ public class OutboxClock {
       return false;
     }
     try {
-      long started = System.nanoTime();
-      Instant before = jvm.instant();
-      Instant databaseNow = database.get();
-      long roundTrip = System.nanoTime() - started;
-      long offset = Duration.between(before.plusNanos(roundTrip / 2), databaseNow).toNanos();
+      long fastest = Long.MAX_VALUE;
+      long measuredOffset = 0;
+      for (int sample = 0; sample < SAMPLES; sample++) {
+        long started = System.nanoTime();
+        Instant before = jvm.instant();
+        Instant databaseNow = database.get();
+        long roundTrip = System.nanoTime() - started;
+        if (roundTrip < fastest) {
+          fastest = roundTrip;
+          measuredOffset =
+              Duration.between(before.plusNanos(roundTrip / 2), databaseNow).toNanos();
+        }
+      }
+      long uncertainty = fastest / 2 + UNCERTAINTY_FLOOR.toNanos();
+      long offset = Math.abs(measuredOffset) <= uncertainty ? 0 : measuredOffset;
       offsetNanos = offset;
       measuredAtNanos = System.nanoTime();
       measured = true;

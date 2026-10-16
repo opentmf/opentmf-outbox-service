@@ -35,7 +35,9 @@ before upgrading.
   rows under another pod's live lease, a pod 5 min behind stamped leases that had already
   lapsed for every other pod, and a row appended by a pod ahead was not due for 5 min. The
   library now keeps time as the JVM clock plus an offset measured against the database
-  (`select clock_timestamp()`, half a round trip's accuracy) at relay start and every 30 s - for
+  (`select clock_timestamp()`, the fastest of five round trips; an offset within that trip's
+  own uncertainty is taken as none, so a pod on the database's clock is never "corrected" by a
+  slow round trip) at relay start and every 30 s - for
   every lease, due time, booking instant, cancel test and the append's `created_on`. A skew
   above a second is logged as a WARN. Not a literal `now()` in each statement: the holder must
   know the exact stamp it guards on, which would cost a round trip on every stamp, renewal and

@@ -95,7 +95,7 @@ class OutboxClockTests {
         new OutboxClock(
             jvm(Duration.ofSeconds(10)),
             () -> {
-              if (calls.incrementAndGet() > 1) {
+              if (calls.incrementAndGet() > OutboxClock.SAMPLES) {
                 throw new IllegalStateException("database gone");
               }
               return DATABASE_NOW;
@@ -123,7 +123,47 @@ class OutboxClockTests {
     clock.measureIfDue();
     clock.measureIfDue();
 
-    assertThat(calls).hasValue(1);
+    assertThat(calls).hasValue(OutboxClock.SAMPLES); // one measurement: its round trips
+  }
+
+  /**
+   * A pod on the database's clock, one slow round trip among the samples (a proxy, a loaded host):
+   * the fastest trip is kept and the offset left within its uncertainty is none - the clock is
+   * never "corrected" by the noise of its own measurement (the gate's K3 saw rows go 50-85 ms
+   * before their hold when one slow trip decided the offset).
+   */
+  @Test
+  void theSameClock_withASlowRoundTripAmongTheSamples_isLeftUncorrected() {
+    AtomicInteger calls = new AtomicInteger();
+    OutboxClock clock =
+        new OutboxClock(
+            Clock.systemUTC(),
+            () -> {
+              Instant now = Instant.now();
+              if (calls.incrementAndGet() == 1) {
+                try {
+                  Thread.sleep(150); // answered at once, the answer delayed 150 ms on the way back
+                } catch (InterruptedException ex) {
+                  Thread.currentThread().interrupt();
+                }
+              }
+              return now;
+            });
+
+    assertThat(clock.measure()).isTrue();
+
+    assertThat(clock.offset()).isZero();
+    assertThat(log.list).noneMatch(e -> e.getLevel() == Level.WARN);
+  }
+
+  @Test
+  void anOffsetAboveTheUncertainty_isApplied() {
+    OutboxClock clock =
+        new OutboxClock(Clock.systemUTC(), () -> Instant.now().plusMillis(40));
+
+    clock.measure();
+
+    assertThat(clock.offset()).isBetween(Duration.ofMillis(35), Duration.ofMillis(45));
   }
 
   @Test

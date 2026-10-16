@@ -184,13 +184,16 @@ sequenceDiagram
 - **The outbox keeps the database's time (1.9.0).** Every lease, due time,
   booking instant, cancel test and the append's `created_on` is the JVM clock
   plus an offset measured against the database (`select clock_timestamp()`,
-  the JVM's instant taken half-way through the round trip), at relay start and
-  every 30 s (`OutboxClock`; a consumer's own bean replaces it). A pod whose
+  the JVM's instant taken half-way through the round trip, the fastest of five
+  round trips kept), at relay start and every 30 s (`OutboxClock`; a
+  consumer's own bean replaces it). An offset within the fastest trip's own
+  uncertainty (half of it plus a millisecond) is taken as none, so a pod that
+  shares the database's clock is never "corrected" by a slow round trip. A pod whose
   clock is off thus neither takes a row under another pod's live lease, nor
   stamps a lease that has already lapsed for the others, nor appends a row due
   minutes late (all three up to 1.8.0). A skew above a second is logged. The
-  offset is good to half a round trip — milliseconds, against leases of
-  seconds. **Deliberately not a literal `now()` in each statement**: the
+  offset is good to half the fastest round trip — milliseconds, against leases
+  of seconds. **Deliberately not a literal `now()` in each statement**: the
   holder must know the exact stamp it guards on, so a database-side stamp
   would cost a `RETURNING` or a round trip on every stamp, renewal and
   booking.
