@@ -71,6 +71,7 @@ public class ScriptedPublisher implements OutboxPublisher {
     Step step = script.step(event, attempt);
     Instant start = Instant.now();
     Receiver.started(event.getId());
+    Receiver.stamped(event.getId(), event.getClaimedUntil()); // the claim's stamp, as handed over
     boolean interrupted = false;
     try {
       pause(Receiver.latency(script));

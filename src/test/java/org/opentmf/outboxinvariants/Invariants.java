@@ -14,6 +14,7 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -274,18 +275,37 @@ final class Invariants {
           boolean failedBefore =
               byRow.getOrDefault(later.rowId(), List.of()).stream()
                   .anyMatch(x -> !x.delivered() && x.end().isBefore(earlier.start().plus(SLACK)));
+          // held when the row that passed it was CLAIMED - which is up to its queue wait before its
+          // send: the claim instant is its first send's stamp less its lease (the send itself
+          // where no scripted publisher saw the stamp)
+          Instant passerClaimed = earlier.start();
+          OffsetDateTime stamp = Receiver.firstStamp(earlier.rowId());
+          Row passer = byId.get(earlier.rowId());
+          if (stamp != null && passer != null) {
+            Instant claimed = stamp.toInstant().minus(lease(scenario, passer));
+            passerClaimed = claimed.isBefore(passerClaimed) ? claimed : passerClaimed;
+          }
           boolean held =
               passed != null
                   && passed.releaseAt() != null
-                  && passed.releaseAt().isAfter(earlier.start());
+                  && passed.releaseAt().isAfter(passerClaimed.minus(SLACK));
           boolean failedInTable = passed != null && passed.attempts() > 0;
           if (failedBefore || held || failedInTable) {
             passes++;
           } else {
             findings.add(
                 "I2",
-                "key %s: row %d delivered after row %d - out of id order"
-                    .formatted(entry.getKey(), later.rowId(), earlier.rowId()));
+                "key %s: row %d delivered after row %d - out of id order (row %d: release_at %s, attempts %d, first delivered %s; row %d sent %s)"
+                    .formatted(
+                        entry.getKey(),
+                        later.rowId(),
+                        earlier.rowId(),
+                        later.rowId(),
+                        passed == null ? "?" : passed.releaseAt(),
+                        passed == null ? -1 : passed.attempts(),
+                        later.start(),
+                        earlier.rowId(),
+                        earlier.start()));
           }
         }
       }

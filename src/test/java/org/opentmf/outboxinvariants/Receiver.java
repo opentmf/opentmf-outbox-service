@@ -2,6 +2,7 @@ package org.opentmf.outboxinvariants;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -223,6 +224,9 @@ public final class Receiver {
   private static final Map<Long, Instant> SENDING = new ConcurrentHashMap<>();
   private static final Map<Long, Integer> NTH = new ConcurrentHashMap<>();
   private static final Map<Long, Integer> SENDING_COUNT = new ConcurrentHashMap<>();
+
+  /** Per row, the lease stamp its FIRST send carried - the claim that sent it, less its lease. */
+  private static final Map<Long, OffsetDateTime> FIRST_STAMP = new ConcurrentHashMap<>();
   private static final Map<Long, Integer> LISTENED = new ConcurrentHashMap<>();
   private static volatile CountDownLatch released = new CountDownLatch(1);
   private static SplittableRandom random = new SplittableRandom(0);
@@ -233,6 +237,7 @@ public final class Receiver {
     DELIVERIES.clear();
     SENDING.clear();
     SENDING_COUNT.clear();
+    FIRST_STAMP.clear();
     NTH.clear();
     LISTENED.clear();
     released.countDown();
@@ -292,6 +297,18 @@ public final class Receiver {
 
   static boolean awaitRelease(Duration atMost) throws InterruptedException {
     return released.await(atMost.toNanos(), TimeUnit.NANOSECONDS);
+  }
+
+  /** The lease stamp a row's send carried (the first one counts). */
+  static void stamped(long rowId, OffsetDateTime stamp) {
+    if (stamp != null) {
+      FIRST_STAMP.putIfAbsent(rowId, stamp);
+    }
+  }
+
+  /** The stamp the row's first send carried, if a scripted publisher sent it. */
+  static OffsetDateTime firstStamp(long rowId) {
+    return FIRST_STAMP.get(rowId);
   }
 
   static void started(long rowId) {
