@@ -15,7 +15,10 @@ library never imports that BOM (direct property pins in the pom).
   (the enforcer refuses the default JDK 25; ITs need Docker — Testcontainers
   Postgres + Kafka; the local SonarQube compose stack must be up). `-Pmutation`
   only defines pitest — PIT figures come from `mvn -Pmutation pitest:mutationCoverage`;
-  the README's "PIT survivor review" lists the accepted survivors.
+  the README's "PIT survivor review" lists the accepted survivors. Since 1.9.0 the default
+  failsafe execution includes the relay invariants suite (`org.opentmf.outboxinvariants`,
+  README "The invariants suite"); the whole gate takes ~18 min. A scenario's finding prints
+  its seed - re-run it with `-Dit.seed=<seed>`.
 - **Readiness** = gate green, both `versions:display-property-updates` and
   `display-plugin-updates` online with `-Pmutation,sonar,release` and the estate
   ignore string (the pom's own `<maven.version.ignore>`), Sonar 0 open, tree clean.
@@ -94,9 +97,21 @@ library never imports that BOM (direct property pins in the pom).
   never the consumer's mapper, never coerced). `OutboxClaimPlanIT`'s idle gauges pin open-row
   indexes + a buffer bound, not an index: two EMPTY partial indexes tie in the planner.
 
+- **1.9.0 (2026-10-16)** - #15: OUTBOX-RELAY-INVARIANTS-IT-1, the invariants suite (two or
+  three real pods, a toxic-proxied database, a real broker; six invariants checked after every
+  scenario) and everything it found: a heartbeat renews a running send's lease up to its bound;
+  a lapse counts as a failed attempt only when the send was under way (`sending_since`,
+  changeset 007, `OutboxLeaseLapsedException`); time is the database's (`OutboxClock` offset,
+  fastest of five round trips, uncertainty deadband); an `Error` is a failed attempt and nothing
+  leaves a relay thread; the Kafka publisher waits for the producer's verdict; cancel refuses a
+  CLAIMED row; claims state "open" as `coalesce(relayed_on, cancelled_on, parked_on) is null`
+  with changeset 008 rebuilding the two CONCURRENT claim indexes on it, the ORDERED claim native.
+  Roll 1.8.x -> 1.9.0 at a low backlog. The nine `java:S1181` suppressions are Gökhan's decision
+  (2026-10-16, README "Sonar suppressions") - the only Sonar suppressions in the repo.
+
 ## Open
 
-- Develop is `1.8.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
-  heading `## 1.8.1 - <date>` (or the next minor's, if the row is a minor).
-- Nothing open. OUTBOX-UNUSED-INDEX-1 was closed by Gökhan on 2026-10-15: keep
-  `ix_outbox_pending` (measured the most-scanned index on every outbox table).
+- Develop is `1.9.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
+  heading `## 1.9.1 - <date>` (or the next minor's, if the row is a minor).
+- Nothing open. `ix_outbox_pending` stays (Gökhan: OUTBOX-UNUSED-INDEX-1 closed
+  2026-10-15, reaffirmed 2026-10-16 when 1.9.0's F-9 first dropped it).
