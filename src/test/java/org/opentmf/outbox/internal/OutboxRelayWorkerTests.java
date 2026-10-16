@@ -58,7 +58,6 @@ import org.opentmf.outbox.OutboxSendError;
 import org.opentmf.outbox.TerminalOutboxException;
 import org.springframework.beans.BeanUtils;
 import org.slf4j.LoggerFactory;
-import org.springframework.data.domain.Limit;
 import org.springframework.transaction.support.TransactionCallback;
 import org.springframework.transaction.support.TransactionOperations;
 
@@ -148,14 +147,14 @@ class OutboxRelayWorkerTests {
     doThrow(new AssertionError("unstubbed publish")).when(publisher).publish(any());
     doReturn(null).when(publisher).deliver(any()); // delivered, no result - per test overridden
     // the two lane claims, emulated on the fake table (the real SQL is the ITs' job)
-    when(repository.claimOrdered(any(), any(), any(Limit.class)))
+    when(repository.claimOrdered(any(), anyInt()))
         .thenAnswer(
             inv -> {
               OffsetDateTime now = inv.getArgument(0);
-              Limit limit = inv.getArgument(2);
+              int limit = inv.getArgument(1);
               return table.values().stream()
                   .filter(e -> e.getLane() != Lane.CONCURRENT && claimable(e, now))
-                  .limit(limit.max())
+                  .limit(limit)
                   .toList();
             });
     when(repository.claimConcurrent(any(), any(), anyInt()))
@@ -1267,7 +1266,7 @@ class OutboxRelayWorkerTests {
 
     assertThat(batch.ordered()).isZero();
     assertThat(batch.concurrent()).isEqualTo(1);
-    verify(repository, never()).claimOrdered(any(), any(), any(Limit.class));
+    verify(repository, never()).claimOrdered(any(), anyInt());
     assertThat(ordered.getClaimedUntil()).isNull();
     assertThat(conc.getRelayedOn()).isNotNull();
   }
@@ -1325,7 +1324,7 @@ class OutboxRelayWorkerTests {
     assertThat(next.concurrent()).isEqualTo(1);
     assertThat(conc.getRelayedOn()).isNotNull(); // sent while the ORDERED batch waits
     assertThat(first.getRelayedOn()).isNull();
-    verify(repository, times(1)).claimOrdered(any(), any(), any(Limit.class));
+    verify(repository, times(1)).claimOrdered(any(), anyInt());
 
     gate.countDown();
     orderedIdle();
@@ -1369,7 +1368,7 @@ class OutboxRelayWorkerTests {
     OutboxEvent conc = concurrent(2L, null);
     doAnswer(inv -> List.of(copy(table.get(1L)))) // detached, as after the claim's commit
         .when(repository)
-        .claimOrdered(any(), any(), any(Limit.class));
+        .claimOrdered(any(), anyInt());
     doAnswer(inv -> List.of(copy(table.get(2L))))
         .when(repository)
         .claimConcurrent(any(), any(), anyInt());

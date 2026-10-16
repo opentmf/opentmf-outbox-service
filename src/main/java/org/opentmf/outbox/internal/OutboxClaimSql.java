@@ -89,6 +89,28 @@ final class OutboxClaimSql {
       order by e.id
       for update of e skip locked""";
 
+  /**
+   * The ORDERED lane's claim (native since 1.9.0; JPQL before): due rows with no live lease whose
+   * stamped lane is ORDERED or null (a row written before 1.3.0, or not through the writer), in
+   * {@code id} order, {@code FOR UPDATE SKIP LOCKED} - a row another pod is claiming is skipped,
+   * and once that claim commits the row carries a live lease. The lane test is a LITERAL: the
+   * JPQL bound it as a parameter, and under a generic plan the planner could not prove {@code
+   * ix_outbox_ordered_claim}'s predicate from {@code lane <> $1} - it read {@code
+   * ix_outbox_pending} and sorted the due ORDERED rows (1,864 buffers, about 100 ms over 20,000 of
+   * them, against 104 buffers and 1 ms for a custom plan).
+   */
+  static final String ORDERED =
+      """
+      select e.* from outbox e
+      where e.relayed_on is null and e.cancelled_on is null and e.parked_on is null
+        and (e.release_at is null or e.release_at <= :now)
+        and e.next_attempt_on <= :now
+        and (e.claimed_until is null or e.claimed_until <= :now)
+        and (e.lane is null or e.lane <> 'CONCURRENT')
+      order by e.id
+      limit :limit
+      for update of e skip locked""";
+
   /** First pass: keys ABOVE {@code :after} (the cursor; {@code ""} = all), plus unkeyed rows. */
   static final String CONCURRENT =
       IN_FLIGHT

@@ -98,6 +98,11 @@ rebuilds them on it); the other open-row indexes state the three `is null`s
 separately, so no claim can pick them. `OutboxClaimPlanIT` pins every
 statement on statistics taken while the open set was empty and on a table
 never analysed: a claim of 100 reads about 1,315 buffers in 7–8 ms on either.
+The ORDERED claim is native SQL with a literal lane test (1.9.0): as JPQL it
+bound the lane as a parameter, and under a generic plan it could not use
+`ix_outbox_ordered_claim` and sorted the due ORDERED rows through
+`ix_outbox_pending` (about 100 ms over 20,000 of them); now about 1 ms under
+both plan modes.
 
 `relayed` and `cancelled` overlap in exactly one case: a row cancelled after
 its lease LAPSED while its send was still running, whose send then succeeded —

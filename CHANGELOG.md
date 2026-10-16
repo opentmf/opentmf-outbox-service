@@ -129,6 +129,14 @@ before upgrading.
     analysed, beside the fresh statistics it always used;
   - **while 1.8.x pods still run** in a rolling upgrade, their CONCURRENT claim (three `is
     null`s) has no index of its own after 008 - roll at a low backlog.
+- **The ORDERED claim reads its own index under a generic plan too** (`OutboxClaimPlanIT`). It
+  was JPQL that bound the lane test as a parameter (`lane <> :concurrent`). Once pgjdbc
+  server-prepares the statement (after five executions) and PostgreSQL switches to a generic
+  plan, the planner cannot prove `ix_outbox_ordered_claim`'s predicate from `lane <> $1`: it read
+  `ix_outbox_pending` and sorted the due ORDERED rows - 1,864 buffers and 92-109 ms per claim over
+  20,000 due ORDERED rows, growing with the backlog, on every pass of every pod (since 1.3.0). It
+  is now native SQL with the literal `'CONCURRENT'`, pinned under custom and generic plans on
+  `ix_outbox_ordered_claim`: 104 buffers, about 1 ms. `ix_outbox_pending` stays.
 - **A short-lease CONCURRENT row no longer starves in the hand-off queue behind slow sends**
   (OUTBOX-QUEUED-LEASE-STARVATION-1). Since 1.6.0 the claim ran up to `batch-size` rows ahead
   of the slots, and a row's lease - stamped at the claim - ran while the row waited in the

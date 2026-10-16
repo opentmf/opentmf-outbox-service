@@ -30,7 +30,6 @@ import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.opentmf.outbox.OutboxRelayedListener;
 import org.opentmf.outbox.OutboxSendError;
 import org.opentmf.outbox.TerminalOutboxException;
-import org.springframework.data.domain.Limit;
 import org.springframework.transaction.support.TransactionOperations;
 
 /**
@@ -270,7 +269,7 @@ class OutboxRelayWorker {
 
   private Claimed claimOrdered(OffsetDateTime now) {
     int limit = properties.getBatchSize();
-    List<OutboxEvent> rows = repository.claimOrdered(now, Lane.CONCURRENT, Limit.of(limit));
+    List<OutboxEvent> rows = repository.claimOrdered(now, limit);
     List<Leased> leased = new ArrayList<>();
     for (OutboxEvent row : rows) {
       OutboxPublisher publisher = route(row);

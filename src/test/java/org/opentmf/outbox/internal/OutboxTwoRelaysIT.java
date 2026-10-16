@@ -31,7 +31,6 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
-import org.springframework.data.domain.Limit;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionCallback;
 import org.springframework.transaction.support.TransactionOperations;
@@ -274,7 +273,7 @@ class OutboxTwoRelaysIT {
   }
 
   private Long oneOrderedRow() {
-    return repository.claimOrdered(OffsetDateTime.now(), Lane.CONCURRENT, Limit.of(1)).stream()
+    return repository.claimOrdered(OffsetDateTime.now(), 1).stream()
         .map(OutboxEvent::getId)
         .findFirst()
         .orElse(null);

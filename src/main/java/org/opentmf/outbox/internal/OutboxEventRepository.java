@@ -9,9 +9,7 @@ import java.util.Optional;
 import org.opentmf.outbox.OutboxArchRules;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxMaintenanceService;
-import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.opentmf.outbox.OutboxWriter;
-import org.springframework.data.domain.Limit;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
@@ -39,27 +37,16 @@ public interface OutboxEventRepository
 
 
   /**
-   * The ORDERED lane's claim: {@code select … for update skip locked} over pending, not
+   * The ORDERED lane's claim ({@link OutboxClaimSql#ORDERED}, native since 1.9.0): pending, not
    * cancelled, not parked, released (no hold, or the hold has passed), due rows with no live
-   * lease whose stamped lane is ORDERED or null (a row written before 1.3.0, or not through the
-   * writer), in {@code id} order. Together with {@link #claimConcurrent} this is the ONE place
-   * the eligibility predicate lives. {@code SKIP LOCKED} (Hibernate lock timeout {@code -2}) is
-   * the cross-pod guard: a row another pod is claiming is skipped, and once that claim commits
-   * the row carries a live lease.
+   * lease whose stamped lane is ORDERED or null, in {@code id} order, {@code FOR UPDATE SKIP
+   * LOCKED}. Together with {@link #claimConcurrent} this is the ONE place the eligibility
+   * predicate lives.
+   *
+   * @param limit rows to claim at most (the batch size)
    */
-  @Lock(LockModeType.PESSIMISTIC_WRITE)
-  @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "-2"))
-  @Query(
-      """
-      select e from OutboxEvent e
-      where e.relayedOn is null and e.cancelledOn is null and e.parkedOn is null
-        and (e.releaseAt is null or e.releaseAt <= :now)
-        and e.nextAttemptOn <= :now
-        and (e.claimedUntil is null or e.claimedUntil <= :now)
-        and (e.lane is null or e.lane <> :concurrent)
-      order by e.id""")
-  List<OutboxEvent> claimOrdered(
-      @Param("now") OffsetDateTime now, @Param("concurrent") Lane concurrent, Limit limit);
+  @Query(value = OutboxClaimSql.ORDERED, nativeQuery = true)
+  List<OutboxEvent> claimOrdered(@Param("now") OffsetDateTime now, @Param("limit") int limit);
 
   /**
    * The CONCURRENT lane's claim, first pass ({@link OutboxClaimSql#CONCURRENT}): the same

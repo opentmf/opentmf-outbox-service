@@ -82,28 +82,7 @@ class OutboxClaimPlanIT {
           Map.entry("relayedOn", "timestamptz"),
           Map.entry("stamps", "varchar"),
           Map.entry("renewed", "varchar"),
-          Map.entry("since", "varchar"),
-          Map.entry("concurrent", "varchar"));
-
-  /**
-   * The ORDERED claim ({@code OutboxEventRepository.claimOrdered}, JPQL) as Hibernate renders it
-   * on PostgreSQL - the lane test a bound parameter, as the repository binds it. Under a GENERIC
-   * plan the parameter hides the lane, so {@code ix_outbox_ordered_claim}'s predicate cannot be
-   * proven and the claim reads {@code ix_outbox_pending}, sorting the due ORDERED rows: measured
-   * 1,864 buffers / 92-96 ms over 20,000 due ORDERED rows on either stale statistics shape, against
-   * 104 buffers / 1 ms for a custom plan. Pinned here to open-row indexes only.
-   */
-  static final String ORDERED_CLAIM =
-      """
-      select e.* from outbox e
-      where e.relayed_on is null and e.cancelled_on is null and e.parked_on is null
-        and (e.release_at is null or e.release_at <= :now)
-        and e.next_attempt_on <= :now
-        and (e.claimed_until is null or e.claimed_until <= :now)
-        and (e.lane is null or e.lane <> :concurrent)
-      order by e.id
-      fetch first :limit rows only
-      for no key update of e skip locked""";
+          Map.entry("since", "varchar"));
 
   private static final List<String> PLAN_MODES = List.of("force_custom_plan", "force_generic_plan");
 
@@ -518,6 +497,12 @@ class OutboxClaimPlanIT {
         from generate_series(1, 20000) g""");
     try {
       assertGaugesIndexedOnly("100k-pending");
+      // 1.9.0: the ORDERED claim reads its own index under both plan modes (a literal lane test)
+      assertIndexedOnly(
+          "ORDERED claim, 50,000 ORDERED rows pending",
+          OutboxClaimSql.ORDERED,
+          Map.of("now", "now() + interval '2 hours'", "limit", String.valueOf(FULL_BATCH)),
+          List.of("ix_outbox_ordered_claim"));
     } finally {
       execute("delete from outbox where aggregate_type = 'gauge'");
     }
@@ -759,12 +744,12 @@ class OutboxClaimPlanIT {
                 FULL_BATCH_BUFFER_BOUND))
         .as(state + ": wrap pass")
         .containsOnly((long) FULL_BATCH);
-    // the ORDERED claim reads open rows only (its generic plan: see ORDERED_CLAIM)
+    // the ORDERED claim: its own index under both plan modes (its lane test a literal, 1.9.0)
     assertIndexedOnly(
         state + " ORDERED claim",
-        ORDERED_CLAIM,
-        Map.of("now", "now()", "concurrent", "'CONCURRENT'", "limit", String.valueOf(FULL_BATCH)),
-        OPEN_ROW_INDEXES);
+        OutboxClaimSql.ORDERED,
+        Map.of("now", "now()", "limit", String.valueOf(FULL_BATCH)),
+        List.of("ix_outbox_ordered_claim"));
     // the gauges read open rows only - which open-row index is a planner's tie on these estimates
     Map<String, String> now = Map.of("now", "now()");
     List<String> openRows = new ArrayList<>(OPEN_ROW_INDEXES);
