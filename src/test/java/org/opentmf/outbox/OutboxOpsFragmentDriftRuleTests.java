@@ -126,7 +126,7 @@ class OutboxOpsFragmentDriftRuleTests {
             });
 
     assertThat(violations(consumer, fragment())).isEmpty();
-    assertThat(consumer.get("paths")).isEqualTo(fragment().get("paths")); // not one path edited
+    assertThat(consumer).containsEntry("paths", fragment().get("paths")); // not one path edited
     assertThat(new Yaml().dump(consumer)) // and its document promises no RFC 9457 anywhere
         .doesNotContain("application/problem+json");
   }

@@ -7,6 +7,7 @@ import java.lang.reflect.RecordComponent;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
@@ -358,7 +359,7 @@ class OutboxOpsOpenApiTests {
     all.values().stream()
         .flatMap(defs -> defs.values().stream())
         .map(def -> def.get(REFINABLE))
-        .filter(marker -> marker != null)
+        .filter(Objects::nonNull)
         .forEach(marker -> assertThat(marker).isIn(Boolean.TRUE, "content"));
   }
 
