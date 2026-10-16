@@ -227,13 +227,13 @@ class DatabaseIT {
       double waited = Duration.between(eligible, first.get(turn.rowId()).start()).toMillis();
       double share = drain * (rank + 1) / n;
       worst = Math.max(worst, (waited - TURN_SLACK.toMillis()) / share);
-      if (waited > TURN_FACTOR * share + TURN_SLACK.toMillis()) {
-        if (late++ < 10) {
-          f.add(
-              "S",
-              "row %d (claim-order rank %d of %d) waited %.0f ms - past %.1f x its share of the %.0f ms drain (%.0f ms) + %s"
-                  .formatted(turn.rowId(), rank, n, waited, TURN_FACTOR, drain, share, TURN_SLACK));
-        }
+      boolean past = waited > TURN_FACTOR * share + TURN_SLACK.toMillis();
+      late += past ? 1 : 0;
+      if (past && late <= 10) {
+        f.add(
+            "S",
+            "row %d (claim-order rank %d of %d) waited %.0f ms - past %.1f x its share of the %.0f ms drain (%.0f ms) + %s"
+                .formatted(turn.rowId(), rank, n, waited, TURN_FACTOR, drain, share, TURN_SLACK));
       }
     }
     String figure =

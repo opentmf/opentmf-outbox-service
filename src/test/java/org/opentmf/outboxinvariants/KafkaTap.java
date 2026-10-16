@@ -44,7 +44,7 @@ final class KafkaTap implements AutoCloseable {
               try (consumer) {
                 while (running.get()) {
                   for (ConsumerRecord<String, String> r : consumer.poll(Duration.ofMillis(200))) {
-                    record(r);
+                    tap(r);
                   }
                 }
               }
@@ -54,7 +54,7 @@ final class KafkaTap implements AutoCloseable {
     poller.start();
   }
 
-  private void record(ConsumerRecord<String, String> r) {
+  private void tap(ConsumerRecord<String, String> r) {
     Header key = r.headers().lastHeader(OutboxHeaders.IDEMPOTENCY_KEY);
     if (key == null) {
       return;
@@ -62,7 +62,7 @@ final class KafkaTap implements AutoCloseable {
     String text = new String(key.value(), StandardCharsets.UTF_8);
     long rowId = Long.parseLong(text.substring(text.lastIndexOf(':') + 1));
     Instant position = Instant.EPOCH.plusNanos(r.partition() * 1_000_000_000_000L + r.offset());
-    Receiver.record(
+    Receiver.recordDelivery(
         new Delivery(
             rowId,
             r.topic(),

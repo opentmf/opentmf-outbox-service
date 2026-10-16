@@ -390,6 +390,7 @@ class OutboxRelayWorker {
   }
 
   /** The row's publisher - or null after booking the routing failure by the LIBRARY policy. */
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private OutboxPublisher route(OutboxEvent row) {
     try {
       return router.resolve(row);
@@ -428,6 +429,7 @@ class OutboxRelayWorker {
    * One CONCURRENT row, on a lane worker: renewed first if it waited long in the hand-off queue,
    * then sent and booked.
    */
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void relayConcurrent(Leased row) {
     queuedHere.remove(row.event.getId()); // it leaves the queue: from here on a claim may see it
     try {
@@ -523,6 +525,7 @@ class OutboxRelayWorker {
     return !row.lost;
   }
 
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void relayOrdered(List<Leased> ordered) {
     for (int i = 0; i < ordered.size(); i++) {
       Leased row = ordered.get(i);
@@ -592,6 +595,7 @@ class OutboxRelayWorker {
   }
 
   /** One send, its lease kept by the heartbeat while it runs; whatever it throws is a failure. */
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private Attempt send(Leased row) {
     heartbeat.started(row);
     try {
@@ -612,6 +616,7 @@ class OutboxRelayWorker {
    * failure booking refused too (the hook threw again) is booked once more WITHOUT the hook, so
    * the attempt counts and the row's budget ends it - never redelivered unbooked forever (1.9.0).
    */
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void book(
       TransactionOperations via, Leased row, Attempt attempt, Supplier<Runnable> alsoInTx) {
     RuntimeException failure = attempt.failure();

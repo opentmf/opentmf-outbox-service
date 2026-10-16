@@ -74,8 +74,9 @@ class OutboxSendHeartbeatTests {
     assertThat(ids.getValue()).isEqualTo("{7}");
     assertThat(stamps.getValue())
         .matches("\\{\"\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{6}Z\"}");
-    assertThat(row.stamp).isAfter(before.plusSeconds(1)); // now + 3 s, from now + 1 s
-    assertThat(row.stamp).isBefore(before.plusSeconds(3)); // a lease from now, not the bound
+    assertThat(row.stamp) // now + 3 s, from now + 1 s: a lease from now, not the bound
+        .isAfter(before.plusSeconds(1))
+        .isBefore(before.plusSeconds(3));
     assertThat(row.marked).isTrue();
     assertThat(row.lost).isFalse();
     heartbeat.finished(row);

@@ -333,7 +333,7 @@ public final class Receiver {
   }
 
   /** Records one attempt - from a pod of this JVM, or parsed from a child pod's output. */
-  public static void record(Delivery delivery) {
+  public static void recordDelivery(Delivery delivery) {
     if (SENDING_COUNT.merge(delivery.rowId(), -1, Integer::sum) <= 0) {
       SENDING_COUNT.remove(delivery.rowId());
       SENDING.remove(delivery.rowId());

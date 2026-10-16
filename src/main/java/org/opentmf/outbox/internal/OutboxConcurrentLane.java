@@ -205,6 +205,7 @@ class OutboxConcurrentLane {
    * last empty poll and the release found no free slot - so it looks once more, and starts the
    * worker that send needs.
    */
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void work() {
     try {
       for (Queued next = poll(); next != null; next = poll()) {

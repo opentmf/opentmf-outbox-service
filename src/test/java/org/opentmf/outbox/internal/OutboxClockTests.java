@@ -14,6 +14,7 @@ import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
@@ -141,11 +142,8 @@ class OutboxClockTests {
             () -> {
               Instant now = Instant.now();
               if (calls.incrementAndGet() == 1) {
-                try {
-                  Thread.sleep(150); // answered at once, the answer delayed 150 ms on the way back
-                } catch (InterruptedException ex) {
-                  Thread.currentThread().interrupt();
-                }
+                // answered at once, the answer delayed 150 ms on the way back
+                LockSupport.parkNanos(Duration.ofMillis(150).toNanos());
               }
               return now;
             });
@@ -161,15 +159,10 @@ class OutboxClockTests {
     return new OutboxClock(
         Clock.systemUTC(),
         () -> {
-          try {
-            Thread.sleep(10);
-            Instant halfWay = Instant.now().plus(skew);
-            Thread.sleep(10);
-            return halfWay;
-          } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException(ex);
-          }
+          LockSupport.parkNanos(Duration.ofMillis(10).toNanos());
+          Instant halfWay = Instant.now().plus(skew);
+          LockSupport.parkNanos(Duration.ofMillis(10).toNanos());
+          return halfWay;
         });
   }
 

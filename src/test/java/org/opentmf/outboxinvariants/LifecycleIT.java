@@ -140,8 +140,9 @@ class LifecycleIT {
                     slow.add(Instant.now() + " " + q);
                   }
                   try {
-                    Thread.sleep(2000);
+                    Waits.interruptibly(Duration.ofSeconds(2));
                   } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
                     return;
                   }
                 }

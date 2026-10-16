@@ -107,7 +107,7 @@ final class Invariants {
     exactlyOncePerLease(scenario, expect, findings, rows, byRow);
     order(scenario, expect, findings, byId, byRow);
     if (!expect.skipStarvation) {
-      noStarvation(scenario, expect, findings, rows, byId, byRow);
+      noStarvation(scenario, expect, findings, rows, byRow);
     }
     consistency(findings, rows, byRow);
     gauges(scenario, expect, findings, rows, byRow);
@@ -325,7 +325,6 @@ final class Invariants {
       Expect expect,
       Findings findings,
       List<Row> rows,
-      Map<Long, Row> byId,
       Map<Long, List<Delivery>> byRow) {
     Duration sweep = duration(scenario, "opentmf.outbox.sweep-interval", "5s");
     int slots =

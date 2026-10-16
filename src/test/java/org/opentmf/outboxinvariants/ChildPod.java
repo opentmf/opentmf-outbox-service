@@ -73,7 +73,7 @@ public final class ChildPod {
             new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
       for (String line = in.readLine(); line != null; line = in.readLine()) {
         if (line.startsWith("DELIVERY|")) {
-          Receiver.record(Receiver.parse(line));
+          Receiver.recordDelivery(Receiver.parse(line));
         } else if (line.startsWith("STARTED|")) {
           Receiver.startedElsewhere(line);
           started.add(Long.parseLong(line.split("\\|")[1]));

@@ -113,7 +113,7 @@ class OutboxConcurrentLaneTests {
    * soon, whatever the average says - a lane whose average is fast queues nothing behind it.
    */
   @Test
-  void aSlotBusyWithASendOlderThanTheHorizon_isNotLive_andTheDepthLeavesItOut() throws Exception {
+  void aSlotBusyWithASendOlderThanTheHorizon_isNotLive_andTheDepthLeavesItOut() {
     OutboxConcurrentLane lane = new OutboxConcurrentLane(2, 100, false, Duration.ofSeconds(5));
     lane.sendTook(Duration.ofMillis(1).toNanos()); // fast on average: 2 x 1 s / 1 ms - capacity
     assertThat(lane.liveSlots()).isEqualTo(2);

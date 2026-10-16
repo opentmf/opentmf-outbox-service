@@ -102,6 +102,7 @@ class OutboxRelay {
    * One drain: claims the ORDERED lane when its rows may be due and it is idle, and the CONCURRENT
    * lane until its claim comes back short or its queue is full.
    */
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   void relayPass() {
     passQueued.set(false); // from here on a nudge queues the NEXT pass
     try {

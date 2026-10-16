@@ -18,6 +18,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -216,23 +217,20 @@ class OutboxLeaseIT {
     }
   }
 
-  /** The receiver's response time: a timed wait on a latch nobody opens. */
   /** A call that ignores interrupts (a client that never honours one); the flag kept for after. */
   static void deafLatency(long millis) {
     long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(millis);
     boolean interrupted = false;
-    while (System.nanoTime() < end) {
-      try {
-        TimeUnit.NANOSECONDS.sleep(Math.max(1_000_000, end - System.nanoTime()));
-      } catch (InterruptedException ex) {
-        interrupted = true;
-      }
+    for (long left = end - System.nanoTime(); left > 0; left = end - System.nanoTime()) {
+      interrupted |= Thread.interrupted(); // parkNanos returns at once while the flag is set
+      LockSupport.parkNanos(left);
     }
     if (interrupted) {
       Thread.currentThread().interrupt();
     }
   }
 
+  /** The receiver's response time: a timed wait on a latch nobody opens. */
   static void latency(long millis) {
     try {
       assertThat(new CountDownLatch(1).await(millis, TimeUnit.MILLISECONDS)).isFalse();

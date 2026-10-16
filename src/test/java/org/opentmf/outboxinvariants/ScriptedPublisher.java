@@ -95,7 +95,7 @@ public class ScriptedPublisher implements OutboxPublisher {
       Thread.currentThread().interrupt();
       throw new IllegalStateException("send interrupted", ex);
     } finally {
-      Receiver.record(
+      Receiver.recordDelivery(
           new Delivery(
               event.getId(),
               event.getDestination(),
@@ -131,23 +131,10 @@ public class ScriptedPublisher implements OutboxPublisher {
 
   /** Sleeps through every interrupt, then restores the flag - as a deaf blocking call would. */
   private static void deaf(Duration duration) {
-    long end = System.nanoTime() + duration.toNanos();
-    boolean interrupted = false;
-    while (System.nanoTime() < end) {
-      try {
-        Thread.sleep(Math.max(1, (end - System.nanoTime()) / 1_000_000));
-      } catch (InterruptedException ex) {
-        interrupted = true;
-      }
-    }
-    if (interrupted) {
-      Thread.currentThread().interrupt();
-    }
+    Waits.deafly(duration);
   }
 
   private static void pause(Duration duration) throws InterruptedException {
-    if (!duration.isZero()) {
-      Thread.sleep(duration.toMillis(), duration.toNanosPart() % 1_000_000);
-    }
+    Waits.interruptibly(duration);
   }
 }

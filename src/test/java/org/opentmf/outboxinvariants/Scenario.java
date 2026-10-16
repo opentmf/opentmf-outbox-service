@@ -171,7 +171,7 @@ public final class Scenario implements AutoCloseable {
     Instant from = Instant.now();
     Infra.cutDatabase(true);
     try {
-      Thread.sleep(duration.toMillis());
+      Waits.interruptibly(duration);
     } catch (InterruptedException ex) {
       Thread.currentThread().interrupt();
     } finally {

@@ -15,7 +15,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxPublisher.ExhaustionOutcome;
-import org.opentmf.outbox.OutboxUnparkResult;
 import org.opentmf.outboxinvariants.Receiver.Delivery;
 import org.opentmf.outboxinvariants.Receiver.Script;
 import org.opentmf.outboxinvariants.Receiver.Step;
@@ -130,13 +129,7 @@ class PoliciesIT {
       calls.add(
           CompletableFuture.supplyAsync(
               () ->
-                  attempt(
-                      go,
-                      () -> {
-                        OutboxUnparkResult r =
-                            s.pod(1).maintenance().unpark("inv:c2/k0", null, null, null);
-                        return r;
-                      })));
+                  attempt(go, () -> s.pod(1).maintenance().unpark("inv:c2/k0", null, null, null))));
       CompletableFuture<String> unpark =
           CompletableFuture.supplyAsync(
               () -> attempt(go, () -> s.pod(0).maintenance().unpark(raced)));

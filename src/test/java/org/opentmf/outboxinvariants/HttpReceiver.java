@@ -96,10 +96,10 @@ final class HttpReceiver implements AutoCloseable {
       if (answer.slowLoris()) { // the headers, then nothing
         exchange.sendResponseHeaders(answer.status(), 1_000_000);
         exchange.getResponseBody().flush();
-        Thread.sleep(answer.delay().toMillis());
+        Waits.interruptibly(answer.delay());
         return;
       }
-      Thread.sleep(answer.delay().toMillis());
+      Waits.interruptibly(answer.delay());
       byte[] body = answer.body().getBytes(StandardCharsets.UTF_8);
       exchange.sendResponseHeaders(answer.status(), body.length == 0 ? -1 : body.length);
       if (body.length > 0) {
@@ -118,7 +118,7 @@ final class HttpReceiver implements AutoCloseable {
         long rowId = Long.parseLong(key.substring(key.lastIndexOf(':') + 1));
         // a 2xx status line is the receiver's acceptance, whether or not it ever sends the body
         boolean ok = answer.status() >= 200 && answer.status() < 300;
-        Receiver.record(
+        Receiver.recordDelivery(
             new Delivery(
                 rowId,
                 url(path),

@@ -69,6 +69,7 @@ class OutboxOrderedLane {
     }
   }
 
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void run(Runnable batch) {
     try {
       batch.run(); // books and logs each row's outcome itself
