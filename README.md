@@ -512,7 +512,7 @@ reads the relayed history.
 | Metric                     | Type    | Meaning                                            |
 |----------------------------|---------|----------------------------------------------------|
 | `opentmf.outbox.pending`   | gauge by `lane` | Rows not yet relayed nor cancelled (held, parked and in-flight included) |
-| `opentmf.outbox.in-flight` | gauge by `lane` | Pending rows under a live lease, across pods — claimed, send not booked yet (1.3.0); since 1.6.0 that includes CONCURRENT rows waiting in a hand-off queue |
+| `opentmf.outbox.in-flight` | gauge by `lane` | Pending rows under a live lease, across pods — claimed, send not booked yet (1.3.0); since 1.6.0 that includes CONCURRENT rows waiting in a hand-off queue - since 1.8.1 only as many as the slots start within about a second, so behind slow sends it counts the sending rows alone |
 | `opentmf.outbox.parked`    | gauge by `lane` | Rows with `parked_on` stamped — **alert when > 0** |
 | `opentmf.outbox.metrics-age` | gauge | Seconds since the gauges were last refreshed successfully — **alert when above a few refresh periods** (e.g. > 60 s with the default 15 s): the values above are stale or NaN |
 | `opentmf.outbox.relay-lag` | gauge by `lane` | Seconds the lane's oldest *released* pending row has been deliverable (a held row is not lagging) |

@@ -29,6 +29,10 @@
 - **Still in claim order:** a short row behind slow ones waits for its key's turn in the
   claim's round-robin over keys - bounded by the keys ahead of it and the slots, no longer by
   the depth of a queue it can be pushed to the back of.
+- **The `opentmf.outbox.in-flight` gauge reads lower behind slow sends:** rows are no longer
+  leased into a queue behind busy slots, so with every slot held it counts the sending rows
+  alone (`OutboxHttpLaneIT`'s burst: 8 leased, where 1.6.0 to 1.8.0 leased 20). Re-check
+  dashboards and alerts on it.
 
 ## 1.8.0 - 2026-10-16
 
