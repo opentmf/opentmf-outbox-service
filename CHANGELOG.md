@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.8.1 - 2026-10-16
+
+### Fixed
+
+- **A short-lease CONCURRENT row no longer starves in the hand-off queue behind slow sends**
+  (OUTBOX-QUEUED-LEASE-STARVATION-1). Since 1.6.0 the claim ran up to `batch-size` rows ahead
+  of the slots, and a row's lease - stamped at the claim - ran while the row waited in the
+  queue. With every slot held by slow sends, a short-lease row waited, its lease lapsed, the
+  next pass claimed it AGAIN and queued it at the tail, and its old place was dropped as lost.
+  On a flow service no Kafka row (15 s lease) went out for six minutes behind HTTP sends of
+  about 36 s; one urgent row waited 256 s. Now:
+  - **the queue runs only as deep as the slots start within about a second**:
+    `max-in-flight` × 1 s / the moving average of a send, at most `batch-size`. With fast sends
+    that is the 1.6.0 queue; with sends slower than a second per slot it is none - the claim
+    takes only the free slots, and no row waits behind a busy one. Nothing is claimed ahead
+    before a send has been measured;
+  - **a pod never claims a row it still holds queued**, not even once its lease lapsed there:
+    the row keeps its place, and it is leased again when it leaves the queue (guarded on its
+    stamp, as before for a row that waited a tenth of its lease).
+  - Measured by `OutboxQueuedLeaseIT` (red on 1.8.0: the waiting row was claimed again): eight
+    sends hold the slots and a row with a one-second lease waits three seconds behind them. It
+    is never stamped while it waits, and goes out about 40 ms after one slot frees, once.
+  - **Why not "only the free slots" always:** measured, `OutboxRelayThroughputIT` then fell to
+    74–86 rows/s at 8 slots and 466–559 at 64 (from about 560 and 1,500) - back to the 1.5.x
+    cadence of one claim per freed slot. The depth that follows the sends keeps the fast
+    regime's queue and takes the slow regime's away.
+- **Still in claim order:** a short row behind slow ones waits for its key's turn in the
+  claim's round-robin over keys - bounded by the keys ahead of it and the slots, no longer by
+  the depth of a queue it can be pushed to the back of.
+
 ## 1.8.0 - 2026-10-16
 
 A slow ORDERED receiver no longer stalls the CONCURRENT lane, the unpark by filter no longer

@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
@@ -45,9 +46,9 @@ import org.springframework.transaction.support.TransactionOperations;
  * <p>The lane is the one STAMPED on the row at append (null = ORDERED) - it wins even if the
  * publisher would now name another. The CLAIM takes: ORDERED rows up to {@code batch-size} (when
  * the relay says ORDERED rows may be due and the ORDERED lane is idle - one batch in flight per
- * pod); CONCURRENT rows up to the lane's ROOM - ahead of its
- * slots, into its hand-off queue of at most {@code batch-size} rows (1.6.0) - the query itself
- * keeping a key from going into flight twice. Neither lane's query reads the other lane's rows, so
+ * pod); CONCURRENT rows up to the lane's ROOM - ahead of its slots, into its hand-off queue as
+ * deep as the sends allow (1.6.0, 1.8.1), never a row this pod still holds queued - the query
+ * itself keeping a key from going into flight twice. Neither lane's query reads the other lane's rows, so
  * no backlog of one can hide a row of the other. A claim's cost on the relay thread does not grow
  * with the rows it takes (1.6.0): ONE statement tries every candidate key's advisory lock, ONE
  * re-checks the locked candidates, and ONE stamps every lease of the same length.
@@ -59,8 +60,10 @@ import org.springframework.transaction.support.TransactionOperations;
  * <p>ORDERED rows are stamped with the SHORT ordered lease, and each row's lease is RENEWED in
  * the booking transaction of the row before it - so every lease covers one send, never the whole
  * batch; a row cancelled before its turn is released unsent. A CONCURRENT row that waited in the
- * hand-off queue for a tenth of its lease or longer is renewed the same way right before its send,
- * so every send starts with at least nine tenths of its lease.
+ * hand-off queue for a tenth of its lease or longer is leased again the same way when it leaves
+ * the queue, right before its send, so every send starts with at least nine tenths of its lease -
+ * and a pod never claims a row it still holds queued, so a lease that lapsed in the queue costs
+ * the row nothing but the renewal (1.8.1).
  *
  * <p>On failure: {@code attempts++}, {@code last_error} recorded, {@code next_attempt_on}
  * pushed out by the publisher's backoff (library exponential backoff by default); at the
@@ -103,6 +106,13 @@ class OutboxRelayWorker {
 
   /** The CONCURRENT claim's round-robin key cursor - read and moved on the relay thread only. */
   private String keyCursor = "";
+
+  /**
+   * The CONCURRENT rows this pod holds in the lane's queue, not yet sending (1.8.1): a claim never
+   * takes one of them again. Up to 1.8.0 a queued row whose lease lapsed was claimed again by the
+   * next pass and queued at the TAIL - and its old place was dropped as lost.
+   */
+  private final Set<Long> queuedHere = ConcurrentHashMap.newKeySet();
 
   /** One claimed row: its publisher, the lease value this holder stamped, and when. */
   static final class Leased {
@@ -161,7 +171,9 @@ class OutboxRelayWorker {
     Claimed ordered = withOrdered && !orderedLane.busy() ? claimOrdered() : Claimed.NONE;
     Claimed concurrent = claimConcurrent();
     for (Leased row : concurrent.rows()) {
+      queuedHere.add(row.event.getId());
       if (!lane.submit(() -> relayConcurrent(row))) {
+        queuedHere.remove(row.event.getId());
         log.info(
             "Outbox row {} not sent - the relay is stopping; its lease lapses",
             row.event.getId());
@@ -237,6 +249,9 @@ class OutboxRelayWorker {
     }
     List<Leased> leased = new ArrayList<>();
     for (OutboxEvent row : acrossPods(rows, now)) {
+      if (queuedHere.contains(row.getId())) {
+        continue; // still queued here, its lease lapsed: it keeps its place, never a second one
+      }
       OutboxPublisher publisher = route(row);
       if (publisher != null) {
         leased.add(lease(row, publisher, Lane.CONCURRENT, now));
@@ -358,6 +373,7 @@ class OutboxRelayWorker {
    * then sent and booked.
    */
   private void relayConcurrent(Leased row) {
+    queuedHere.remove(row.event.getId()); // it leaves the queue: from here on a claim may see it
     try {
       if (waitedLong(row) && !renewQueued(row)) {
         return; // taken by another holder meanwhile, or cancelled and released unsent

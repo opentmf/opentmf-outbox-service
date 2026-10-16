@@ -26,9 +26,9 @@ public class OutboxProperties {
   @NotNull private Duration sweepInterval = Duration.ofSeconds(5);
 
   /**
-   * Maximum rows one claim takes per lane - and the CONCURRENT lane's hand-off queue: the relay
-   * claims CONCURRENT rows ahead of the slots, at most this many waiting at once (1.6.0). Default
-   * 100.
+   * Maximum rows one claim takes per lane - and the CONCURRENT lane's hand-off queue at most: the
+   * relay claims CONCURRENT rows ahead of the slots (1.6.0), as deep as the slots start within
+   * about a second and never deeper than this (1.8.1 - none behind slow sends). Default 100.
    */
   @Positive private int batchSize = 100;
 
@@ -184,9 +184,9 @@ public class OutboxProperties {
 
     /**
      * Sends in flight at once, per relay - and on platform threads also the thread bound. The
-     * slots bound the SENDS, not the claim (1.6.0): the relay claims ahead into a hand-off queue
-     * of up to {@code batch-size} rows, and a row that waited there a tenth of its lease or longer
-     * is renewed before its send. Default 8.
+     * relay claims ahead of the slots into a hand-off queue (1.6.0) as deep as they start within
+     * about a second, at most {@code batch-size} rows (1.8.1); a row that waited there a tenth of
+     * its lease or longer is leased again before its send. Default 8.
      */
     @Positive private int maxInFlight = 8;
   }

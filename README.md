@@ -157,16 +157,27 @@ sequenceDiagram
   15 s for ORDERED, which must exceed `send-timeout`). Each ORDERED row's lease
   is renewed in the booking of the row before it, so it covers one send, never
   the batch.
-- **The CONCURRENT claim runs ahead of the slots (1.6.0).** The relay claims
-  CONCURRENT rows into the lane's **hand-off queue**: whenever the queue is at
-  most half full, back up to `batch-size` rows. `max-in-flight` workers take
-  them one after another in claim order, so the slots bound the **sends**,
-  never the claim. A queued row's lease runs while it waits. A row that waited
-  **a tenth of its lease or longer is renewed right before its send**, guarded
-  on its stamp like the ORDERED renewal: a row another relay took meanwhile is
-  not sent, and a cancelled one is released unsent. Every send therefore
-  starts with at least nine tenths of its lease; on the fast path (a queue that
-  drains in milliseconds) nothing extra happens. Until 1.5.x the claim took
+- **The CONCURRENT claim runs ahead of the slots (1.6.0), as far as the sends
+  allow (1.8.1).** The relay claims CONCURRENT rows into the lane's **hand-off
+  queue**, and `max-in-flight` workers take them one after another in claim
+  order, so the slots bound the **sends**. How deep the queue runs follows the
+  sends: it holds no more rows than the slots start within about a second
+  (`max-in-flight` × 1 s / the moving average of a send), at most `batch-size`.
+  With fast sends that is the full `batch-size` queue of 1.6.0; with sends that
+  take longer than a second per slot it is **none** — the claim takes only the
+  free slots, and no row waits behind a busy slot. Until a send has been
+  measured nothing is claimed ahead. **The lease and the queue:** a row's lease
+  is stamped when it is claimed; one that waited in the queue **a tenth of its
+  lease or longer is leased again when it leaves the queue**, right before its
+  send, guarded on its stamp like the ORDERED renewal: a row another relay took
+  meanwhile is not sent, and a cancelled one is released unsent. So every send
+  starts with at least nine tenths of its lease. **A pod never claims a row it
+  still holds queued** — not even after its lease lapsed there: the row keeps
+  its place. Up to 1.8.0 the queue always ran `batch-size` deep, so behind slow
+  sends a short-lease row (a Kafka row's 15 s behind HTTP sends of half a
+  minute) waited, its lease lapsed, the next pass claimed it again and queued
+  it at the **tail**, and its old place was dropped: no Kafka row went out for
+  minutes. Until 1.5.x the claim took
   only free slots. A slot freed by a fast send then made a claim of a row or
   two, and the relay thread paid two statements per row it claimed — the
   cadence that capped a pod at about 110 rows/s whatever `max-in-flight` was
@@ -446,7 +457,7 @@ opentmf:
 | Property         | Type       | Default | Notes                                                                 |
 |------------------|------------|---------|-----------------------------------------------------------------------|
 | `sweep-interval` | `Duration` | `5s`    | The safety-net timer; the after-commit poke is the normal path.       |
-| `batch-size`     | `int`      | `100`   | Rows one claim takes per lane; a full claim triggers an immediate follow-up (drain). Since 1.6.0 also the CONCURRENT lane's hand-off queue: the claim tops it up to this many once it is half empty. |
+| `batch-size`     | `int`      | `100`   | Rows one claim takes per lane; a full claim triggers an immediate follow-up (drain). Since 1.6.0 also the CONCURRENT lane's hand-off queue at most; since 1.8.1 the queue runs only as deep as the slots start within about a second (none behind sends slower than that). |
 | `max-attempts`   | `int`      | `10`    | The library budget; a publisher's `maxAttempts(event)` > 0 overrides it per row. |
 | `backoff-base`   | `Duration` | `5s`    | Delay after the first failure.                                        |
 | `backoff-factor` | `double`   | `2.0`   | `delay = base * factor^(attempts-1)`, capped; a publisher's `backoff(event, attempt)` overrides. |

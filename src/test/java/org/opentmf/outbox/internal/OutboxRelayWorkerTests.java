@@ -76,7 +76,7 @@ class OutboxRelayWorkerTests {
   private final List<OutboxBooking> bookings = new CopyOnWriteArrayList<>();
   /** Two slots, a hand-off queue of two: a claim takes at most two CONCURRENT rows. */
   private final OutboxConcurrentLane lane =
-      new OutboxConcurrentLane(2, 2, false, Duration.ofSeconds(5));
+      fast(new OutboxConcurrentLane(2, 2, false, Duration.ofSeconds(5)));
   /** The ORDERED lane's one thread (1.8.0): a batch is sent off the calling thread. */
   private final OutboxOrderedLane orderedLane = new OutboxOrderedLane(Duration.ofSeconds(5));
 
@@ -112,6 +112,15 @@ class OutboxRelayWorkerTests {
       };
 
   private final OutboxRelayWorker worker = workerOn(lane);
+
+  /**
+   * A lane that has measured a fast send (1.8.1): it claims ahead of its slots up to its capacity,
+   * as every lane did before - these tests are about that regime.
+   */
+  private static OutboxConcurrentLane fast(OutboxConcurrentLane lane) {
+    lane.sendTook(Duration.ofMillis(1).toNanos());
+    return lane;
+  }
 
   private OutboxRelayWorker workerOn(OutboxConcurrentLane onLane) {
     return new OutboxRelayWorker(
@@ -999,7 +1008,7 @@ class OutboxRelayWorkerTests {
 
   @Test
   void theClaim_takesAsManyRowsAsTheLaneHasRoom_aheadOfTheSlots_andTheSlotsBoundTheSends() {
-    OutboxConcurrentLane roomy = new OutboxConcurrentLane(2, 4, false, Duration.ofSeconds(5));
+    OutboxConcurrentLane roomy = fast(new OutboxConcurrentLane(2, 4, false, Duration.ofSeconds(5)));
     OutboxRelayWorker ahead = workerOn(roomy);
     for (long id = 1; id <= 6; id++) {
       concurrent(id, null);
@@ -1141,7 +1150,8 @@ class OutboxRelayWorkerTests {
 
   @Test
   void oneStatementStampsEveryLeaseOfOneLength_neverOneUpdatePerRow() {
-    OutboxConcurrentLane roomy = new OutboxConcurrentLane(2, 10, false, Duration.ofSeconds(5));
+    OutboxConcurrentLane roomy =
+        fast(new OutboxConcurrentLane(2, 10, false, Duration.ofSeconds(5)));
     OutboxRelayWorker ahead = workerOn(roomy);
     concurrent(1L, null);
     concurrent(2L, null);
@@ -1223,7 +1233,7 @@ class OutboxRelayWorkerTests {
             })
         .when(publisher)
         .deliver(any());
-    return new OutboxConcurrentLane(1, 10, false, Duration.ofSeconds(5));
+    return fast(new OutboxConcurrentLane(1, 10, false, Duration.ofSeconds(5)));
   }
 
   /** Longer than a tenth of a one-second lease. */
@@ -1259,6 +1269,49 @@ class OutboxRelayWorkerTests {
       assertThat(queued.getRelayedOn()).isNotNull();
       verify(repository).lockLeased(2L, claimed); // the guarded renewal
       verify(repository, never()).lockLeased(eq(1L), any()); // handed straight to the slot
+    } finally {
+      gate.countDown();
+      oneSlot.close();
+    }
+  }
+
+  /**
+   * OUTBOX-QUEUED-LEASE-STARVATION-1 (1.8.1): a row this pod still holds queued is never claimed
+   * again - not even once its lease lapsed in the queue. It keeps its place; when the slot frees it
+   * is renewed under its own, untaken lease and sent once. Up to 1.8.0 the next pass claimed it
+   * again and queued it at the tail, and its old place was dropped as lost.
+   */
+  @Test
+  void aQueuedRowWhoseLeaseLapsed_isNeverClaimedAgain_andIsSentOnceInItsPlace() throws Exception {
+    when(publisher.lease(any())) // row 1's send outlasts the test; row 2 has a one-second lease
+        .thenAnswer(
+            inv ->
+                inv.<OutboxEvent>getArgument(0).getId() == 1L
+                    ? Duration.ofMinutes(2)
+                    : Duration.ofSeconds(1));
+    CountDownLatch gate = new CountDownLatch(1);
+    List<Long> delivered = new CopyOnWriteArrayList<>();
+    OutboxConcurrentLane oneSlot = oneSlotHeldBy(gate, delivered);
+    OutboxRelayWorker ahead = workerOn(oneSlot);
+    concurrent(1L, null);
+    concurrent(2L, null);
+    try {
+      ahead.relayBatch(true); // row 1 holds the slot, row 2 waits in the queue
+      OffsetDateTime claimed = table.get(2L).getClaimedUntil();
+      await() // its one-second lease runs out while it waits
+          .atMost(Duration.ofSeconds(5))
+          .until(() -> OffsetDateTime.now(ZoneOffset.UTC).isAfter(claimed.plusNanos(100_000_000)));
+
+      OutboxRelayWorker.Batch again = ahead.relayBatch(true);
+
+      assertThat(again.concurrent()).isZero(); // not claimed a second time
+      assertThat(table.get(2L).getClaimedUntil()).isEqualTo(claimed); // its own lease, untouched
+      assertThat(oneSlot.queued()).isEqualTo(1); // one place in the queue, not two
+      gate.countDown();
+      idle(oneSlot, 1);
+      assertThat(delivered).containsExactly(1L, 2L); // sent once, in its place
+      verify(repository).lockLeased(2L, claimed); // renewed under its own lease first
+      assertThat(table.get(2L).getRelayedOn()).isNotNull();
     } finally {
       gate.countDown();
       oneSlot.close();
