@@ -1357,6 +1357,7 @@ Accepted survivors, each reviewed:
 | `OutboxRelayWorker` | removed `setSendingSince(null)` on the detached mirror, the cancelled release and the failure booking | Equivalent: every claim's stamp clears the column, and a lapse is counted only on a row that carries a lease AND the mark - every booking clears the lease |
 | `OutboxRelayWorker.book` / `giveBackStranded` | removed `addSuppressed`; the released count | Forensics- and log-only |
 | `OutboxRelay.start` / `stop`, `OutboxRelayWorker.send` | removed the send heartbeat's wiring (`onBeat`, `start`, `stop`, `started`, `finished`) | The heartbeat's own tests use it directly; the wiring is the invariants suite's (B1, B4, K1 assert renewals, the bound and the give-back) - PIT runs unit tests only |
+| `OutboxRelayWorker.renew` | a lapsed ORDERED row's `return true` → `false` | Harmless: the booking then renews the NEXT row one turn early - nothing is sent out of turn, and the lapsed row is still counted, never sent |
 | `OutboxSendHeartbeat.finished` | removed `unlock` | Equivalent: a finished row leaves the sending set and is never locked by the heartbeat again |
 | `OutboxSendHeartbeat` thread factory | removed `setDaemon` | As the other factories: asserted where the thread runs, missed by PIT's per-line mapping |
 | `OutboxHttpClients` | the Apache, Jetty and Reactor branches (no coverage); the JDK client's read timeout; `present` → false | None of those clients is on the unit-test classpath, by design (and `present` false is that classpath's own answer); the read timeout is the suite's F4 |
