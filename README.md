@@ -129,9 +129,11 @@ sequenceDiagram
   from before 1.3.0) has no lane and rides ORDERED. An append never fails on
   this account: a row no publisher supports, or whose publisher throws while
   naming its lane, is stored without one and the relay books it as before.
-  The **ORDERED** lane is the single relay thread per pod: rows go one by one
-  in `id` order — the 1.2.x behaviour; the Kafka publisher rides it by default
-  (`opentmf.outbox.kafka.lane`, 1.5.0, below). The **CONCURRENT** lane sends rows
+  The **ORDERED** lane is one thread per pod: rows go one by one in `id`
+  order — the 1.2.x behaviour (its own thread since 1.8.0, so an ORDERED batch
+  never holds back a CONCURRENT claim; the relay thread only claims); the
+  Kafka publisher rides it by default (`opentmf.outbox.kafka.lane`, 1.5.0,
+  below). The **CONCURRENT** lane sends rows
   in parallel, one per thread, at most `concurrent.max-in-flight` (default 8)
   at a time; the HTTP publisher rides it, so a slow subscriber never delays a
   Kafka row again. CONCURRENT rows keep **no order** against ORDERED rows, nor
@@ -386,12 +388,13 @@ key ever had two sends overlapping and that each key's rows went in `id` order.
   `BEGIN` + one guarded `update … returning` + `COMMIT` (no isolation round trip; see the
   ordering bullet above). So **`max-in-flight` is the lever**: one slot moves about
   1 / (send + 2 × statement time) rows a second. Each sending slot holds a database
-  connection while it books, so size the pool above `max-in-flight` + 2 (the relay
-  thread's claim, the gauges).
+  connection while it books, so size the pool above `max-in-flight` + 3 (the relay
+  thread's claim, the ORDERED lane's booking - concurrent with the claim since 1.8.0 - and
+  the gauges).
 - **`batch-size` is the claim-side lever**: a claim tops the queue up to it, so with many
   slots and slow statements a larger batch keeps them fed.
-- The ORDERED lane is unchanged in kind: its rows go one by one on the relay thread, and
-  one send plus its booking sets its pace.
+- The ORDERED lane is unchanged in kind: its rows go one by one on one thread (its own
+  since 1.8.0), and one send plus its booking sets its pace.
 
 ## Requirements
 
@@ -456,7 +459,7 @@ opentmf:
 | `kafka.lane`     | `ORDERED`/`CONCURRENT` | `ORDERED` | The default Kafka publisher's lane (1.5.0). `CONCURRENT` = per-aggregate order across pods (see "Running several relays with Kafka"). Stamped at append. |
 | `kafka.ordering-key` | `AGGREGATE_ID`/`NONE` | `AGGREGATE_ID` | On `CONCURRENT`: what orders a Kafka row. Ignored on `ORDERED`. The record key is the `aggregateId` either way. |
 | `kafka.lease`    | `Duration` | `15s`   | On `CONCURRENT`: a Kafka row's lease. Must exceed `send-timeout` (validated at boot). Ignored on `ORDERED`. |
-| `shutdown-grace` | `Duration` | `10s`   | On stop: the relay thread's and the in-flight sends' time to finish; the rest lapse by lease. |
+| `shutdown-grace` | `Duration` | `10s`   | On stop: the relay thread's, the ORDERED batch's and the in-flight CONCURRENT sends' time to finish (each in turn); the rest lapse by lease. |
 | `metrics-refresh` | `Duration` | `15s`  | How often the gauges are re-read from the database; a scrape reads the last values. |
 | `maintenance.batch-size` | `int`    | `5000`  | Rows per batch of a bulk operation (prune, unpark by filter); each batch is its own transaction, no entity loaded. |
 | `maintenance.time-budget` | `Duration` | `10s` | One bulk call stops after this; the answer says `moreToPrune` / `moreToUnpark` and the caller calls again. |
@@ -792,6 +795,12 @@ reference)` from your own ops code).
 - **What it unparks.** Every parked row of that destination, optionally within a
   `parked_on` range and of one `reference`. The destination is required: there is no
   "unpark everything".
+- **Typed strictly (1.8.0).** The library reads the JSON body itself, not through the
+  consumer's mapper, and never coerces: `destination` and `reference` take a string or null,
+  `parkedFrom` / `parkedTo` an RFC 3339 date-time with an offset or null. A boolean, a number,
+  an object or an array is a 400 naming the field (`destination: expected a string, got a
+  boolean`) - up to 1.7.0 a default mapper turned `{"destination": false}` into the
+  destination "false" and answered 200. Other members are ignored.
 - **What each row looks like after.** Exactly as the single unpark leaves it: parked
   stamp cleared, attempts reset, due now, `last_error` kept. It runs under the same
   guard: a row an ops action holds is waited for and re-checked.
@@ -855,10 +864,10 @@ problem-detail mapper).
 | Code | On | Answered by | Component |
 |---|---|---|---|
 | 400 | the three lists | the toolkit (`Tmf630Error`, application/json) - with its undeclared-query-parameter guard on REJECT also for Spring's `page` / `size`; an unknown state leg: the library, rendered by the consumer (problem) | `outboxBadRequest` |
-| 400 | the three row routes | Spring's binding: digits beyond int64 (problem); on the inspect GET also the toolkit guard on REJECT: an undeclared query parameter (`Tmf630Error`) | `outboxRowIdOutOfRange` on the POSTs, inline on the GET |
-| 400 | the bulk unpark | the library (no destination) or Spring (unreadable body) | inline |
+| 400 | the three row routes | Spring's binding: digits beyond int64 (problem); on the inspect GET also the toolkit guard on REJECT: an undeclared query parameter (`Tmf630Error`) | `outboxRowIdOutOfRange` on the POSTs, `outboxInspectBadRequest` on the GET |
+| 400 | the bulk unpark | the library (no destination) or Spring (unreadable body) | `outboxUnparkFilterBadRequest` |
 | 404 | the three row routes | the library (no such row); an id that is not digits matches no route | `outboxRowNotFound` |
-| 409 | the single unpark and cancel | the library (the row is not in the state the action needs) | inline |
+| 409 | the single unpark and cancel | the library (the row is not in the state the action needs) | `outboxUnparkConflict`, `outboxCancelConflict` |
 | 416 | the three lists | the toolkit (`Tmf630Error`) | `outboxRangeNotSatisfiable` |
 | 401, 403, 503 | every operation | the consumer's security | `outboxUnauthorized`, `outboxForbidden`, `outboxServiceUnavailable` |
 | 405, 406 | every operation | the consumer's web layer (Spring MVC) | `outboxMethodNotAllowed`, `outboxNotAcceptable` |
@@ -875,15 +884,29 @@ guard switched to REJECT (opt-in since 3.5.0) its refusals are `Tmf630Error` too
 and on the inspect GET. The fragment documents that rendering: a
 consumer still on Boot's default error JSON (`application/json`, `{timestamp, status, error,
 path}`) turns problem details on, or renders Spring's `ErrorResponse`s as problems in its own
-advice, rather than editing the library's components.
+advice - or, if its error model is not RFC 9457 at all, refines the content as below.
 
-**Refinable by name.** The six answers of the consumer's security and web layer
-(`outboxUnauthorized`, `outboxForbidden`, `outboxMethodNotAllowed`, `outboxNotAcceptable`,
-`outboxUnsupportedMediaType`, `outboxServiceUnavailable`) and the `OutboxProblem` schema
-are the consumer's own answers, and they are marked `x-opentmf-refinable: true`. A consumer
-may REDEFINE a marked component under the SAME name — its own wording, headers such as
-`Retry-After` or `WWW-Authenticate`, its own problem schema — and the pasted paths stay
-verbatim:
+**Refinable by name.** Every error the paths name is a `$ref` to a component marked
+`x-opentmf-refinable`, so the pasted PATHS are verbatim for every consumer, whatever its error
+model. The marker has two values:
+
+- **`true`** — the consumer's own answers: the six of its security and web layer
+  (`outboxUnauthorized`, `outboxForbidden`, `outboxMethodNotAllowed`, `outboxNotAcceptable`,
+  `outboxUnsupportedMediaType`, `outboxServiceUnavailable`) and the `OutboxProblem` schema. A
+  consumer may REDEFINE such a component under the SAME name — its own wording, headers such
+  as `Retry-After` or `WWW-Authenticate`, its own problem schema.
+- **`content`** (1.8.0) — the library's refusals, which the consumer RENDERS: the 400s, 404,
+  409s and 416 (`outboxBadRequest`, `outboxRangeNotSatisfiable`, `outboxRowIdOutOfRange`,
+  `outboxRowNotFound`, `outboxInspectBadRequest`, `outboxUnparkConflict`,
+  `outboxCancelConflict`, `outboxUnparkFilterBadRequest`). Their `description` (when the
+  answer happens) and `headers` are the library's and stay verbatim; their `content` is the
+  consumer's error rendering, which may replace the media types and the schemas. What ships is
+  the default: Spring's RFC 9457 rendering and the toolkit's own `Tmf630Error`. Their
+  descriptions name no media type, so they stay true under any rendering.
+
+A problem+json consumer typically refines only `true` components; a consumer whose single
+advice answers every error as `application/json` in its own error shape refines the
+`content` of the refusals as well:
 
 ```yaml
 components:
@@ -891,11 +914,20 @@ components:
     OutboxProblem: { $ref: '#/components/schemas/ProblemDetail' }   # the consumer's problem
   responses:
     outboxServiceUnavailable: { $ref: '#/components/responses/SigningKeysUnavailable' }
+    outboxRowNotFound:          # `content`: the library's description, the consumer's body
+      x-opentmf-refinable: content
+      description: >-
+        No row with this id - the library's `ErrorResponse`, rendered by the consumer. ...
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
 ```
 
-Everything unmarked is the library's and is pasted verbatim. Consumers paste the `paths`
-and `components` into their own OAS under their own server URL and security, keep the
-component names, and pin themselves with a drift test that honours the marker:
+Everything unmarked (parameters, request bodies, 2xx, headers, the other schemas) is the
+library's and is pasted verbatim. Consumers paste the `paths` and `components` into their own
+OAS under their own server URL and security, keep the component names, and pin themselves with
+a drift test that honours both values (`OutboxOpsFragmentDriftRuleTests` is this rule as code,
+with a verbatim paste, an every-error-as-JSON consumer and a drifting one):
 
 ```java
 @Test
@@ -904,10 +936,14 @@ void theOpsSurfaceIsPastedAsTheLibraryDescribesIt() {
   Map<String, Object> theirs = new Yaml().load(OutboxOpsOpenApi.fragment());
   assertThat(opsPaths(mine)).isEqualTo(opsPaths(theirs)); // paths starting /ops/outbox
   components(theirs).forEach((kind, name, definition) -> {
-    if (Boolean.TRUE.equals(definition.get("x-opentmf-refinable"))) {
-      assertThat(components(mine, kind)).containsKey(name); // refined, same name
-    } else {
-      assertThat(components(mine, kind)).containsEntry(name, definition); // verbatim
+    Object marker = definition.get("x-opentmf-refinable");
+    Map<String, Object> ours = components(mine, kind).get(name);
+    assertThat(ours).as(name).isNotNull(); // under the library's name, always
+    if ("content".equals(marker)) { // the library's meaning, the consumer's body
+      assertThat(ours.get("description")).isEqualTo(definition.get("description"));
+      assertThat(ours.get("headers")).isEqualTo(definition.get("headers"));
+    } else if (!Boolean.TRUE.equals(marker)) {
+      assertThat(ours).isEqualTo(definition); // verbatim
     }
   });
 }
@@ -915,7 +951,8 @@ void theOpsSurfaceIsPastedAsTheLibraryDescribesIt() {
 
 The library's own guard (`OutboxOpsOpenApiTests`) keeps the fragment equal to the
 controller's mappings and its `OutboxRow` schema equal to `OutboxRowView`'s fields, and pins
-the per-operation error codes, a body on every error, the refinable set and that every
+the per-operation error codes, a body on every error, that every error is a `$ref` to a
+marked component (`true` or `content`, nothing inline), the refinable sets and that every
 `$ref` resolves. `OutboxRoundTripIT` pins the paging behaviour against the real toolkit, and
 `OpsFragmentConformance` (used by `OutboxOpsWireConformanceTests` and
 `OutboxOpsProblemDetailsIT`) checks each provoked answer's status AND media type against
@@ -1005,7 +1042,7 @@ The library is self-contained for consumer testing — no test-jar needed:
    (`if not exists`, so it applies to a library-created table and to an
    onboarded pre-library one alike). Rows pending at the upgrade have no lane
    and ride ORDERED once, including any pending HTTP backlog, which drains on
-   the relay thread as it would have under 1.2.x.
+   one thread as it would have under 1.2.x.
    **What the first start costs on a large table.** Changesets `004` and `005`
    build eight indexes `CONCURRENTLY`, so the appends of pods still running are
    never blocked. Each build still reads the whole table once. Measured: 0.7–1.8 s
@@ -1107,7 +1144,7 @@ Accepted survivors, each reviewed:
 | `OutboxMaintenanceService.pruneExpired` / `unpark` (by filter) | the "anything to log" guard and the "more remain" message ternary (negations, boundaries) | Log-only; the counts and `moreTo…` flags are asserted by the unit tests and the ITs |
 | `OutboxMaintenanceService.pruneExpired` / `unpark` (by filter) | `nanoTime() < deadline` boundary | Equivalent: `<` vs `<=` on a nanosecond clock |
 | `OutboxRelayWorker.truncate` | `<=` vs `<` boundary | Equivalent mutant at exactly 4000 chars |
-| `OutboxRelayWorker.relayBatch` | negated `!lane.submit(...)` | Log-only: a send the closing lane refuses keeps its lease, which lapses |
+| `OutboxRelayWorker.relayBatch` | negated `!lane.submit(...)` and `!orderedLane.submit(...)` | Log-only: a send or a batch the closing lane refuses keeps its leases, which lapse |
 | `OutboxRelayWorker.waitedLong` | `>=` vs `>` boundary | Equivalent: the two differ only when the wait equals a tenth of the lease to the nanosecond |
 | `OutboxRelayWorker.bookRelayed` / `bookFailure` | removed `logLapsed`; negated cancelled check before the WARN | Log-only; the lapse and sent-but-cancelled outcomes are asserted by the worker tests and `OutboxLeaseIT` |
 | `OutboxLaneStamper.stamp` | removed `setOrderingKey(null)` in the failure path | Equivalent: the key is never set before the throw it recovers from |
@@ -1119,6 +1156,8 @@ Accepted survivors, each reviewed:
 | `OutboxRelay.poke` | removed `passQueued.set(false)` after a rejection | Reachable only after shutdown, when no further pass can run anyway |
 | `OutboxRelay` thread factory | removed `setDaemon` | Asserted by `OutboxRelayTests` in every normal run; PIT's per-line selection misses the factory-lambda mapping |
 | `OutboxMetrics` thread factory | removed `setDaemon` | Asserted by `OutboxMetricsTests` (the refresher thread is a daemon); same factory-lambda mapping miss |
+| `OutboxOrderedLane` thread factory | removed `setDaemon` | Asserted by `OutboxOrderedLaneTests` (the ORDERED lane's thread is a daemon); same factory-lambda mapping miss |
+| `OutboxRelay.stop` / `OutboxOrderedLane.close` | removed `interrupt()` after an interrupted wait (no coverage) | Reached only when the stopping thread is itself interrupted mid-wait; restores the flag for the caller |
 
 `NO_COVERAGE` entries (the Kafka publisher bean method) are exercised by the
 Testcontainers ITs, which the posture deliberately keeps out of PIT (unit tests

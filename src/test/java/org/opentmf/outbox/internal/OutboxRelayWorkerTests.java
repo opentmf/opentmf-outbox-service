@@ -17,6 +17,10 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import jakarta.persistence.Column;
@@ -49,6 +53,7 @@ import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.opentmf.outbox.OutboxRelayedListener;
 import org.opentmf.outbox.TerminalOutboxException;
 import org.springframework.beans.BeanUtils;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Limit;
 import org.springframework.transaction.support.TransactionCallback;
 import org.springframework.transaction.support.TransactionOperations;
@@ -72,6 +77,14 @@ class OutboxRelayWorkerTests {
   /** Two slots, a hand-off queue of two: a claim takes at most two CONCURRENT rows. */
   private final OutboxConcurrentLane lane =
       new OutboxConcurrentLane(2, 2, false, Duration.ofSeconds(5));
+  /** The ORDERED lane's one thread (1.8.0): a batch is sent off the calling thread. */
+  private final OutboxOrderedLane orderedLane = new OutboxOrderedLane(Duration.ofSeconds(5));
+
+  /**
+   * What the ORDERED lane logs: a batch that throws is caught and logged on the lane's thread, so
+   * no test would see it otherwise - every test ends with none.
+   */
+  private final ListAppender<ILoggingEvent> orderedLaneLog = new ListAppender<>();
   private int committed;
   private int rolledBack;
   private boolean failCommits;
@@ -110,10 +123,13 @@ class OutboxRelayWorkerTests {
         listeners,
         tx,
         tx,
-        onLane);
+        onLane,
+        orderedLane);
   }
 
   OutboxRelayWorkerTests() {
+    orderedLaneLog.start();
+    ((Logger) LoggerFactory.getLogger(OutboxOrderedLane.class)).addAppender(orderedLaneLog);
     when(publisher.supports(any())).thenReturn(true);
     doThrow(new AssertionError("unstubbed publish")).when(publisher).publish(any());
     doReturn(null).when(publisher).deliver(any()); // delivered, no result - per test overridden
@@ -186,6 +202,11 @@ class OutboxRelayWorkerTests {
   @AfterEach
   void closeLane() {
     lane.close();
+    orderedLane.close();
+    ((Logger) LoggerFactory.getLogger(OutboxOrderedLane.class)).detachAppender(orderedLaneLog);
+    assertThat(orderedLaneLog.list)
+        .as("no ORDERED batch threw on the lane's thread")
+        .noneMatch(event -> event.getLevel() == Level.ERROR);
   }
 
   /** The row under the lease {@code stamp}, as the lease guard reads it. */
@@ -308,11 +329,16 @@ class OutboxRelayWorkerTests {
     return registry.find(name).counters().stream().mapToDouble(Counter::count).sum();
   }
 
-  /** One batch over both lanes, then wait for the CONCURRENT lane to send everything it holds. */
+  /** One batch over both lanes, then wait for both lanes to send everything they hold. */
   private int relay() {
     int claimed = worker.relayBatch(true).claimed();
+    orderedIdle();
     idle(lane, 2);
     return claimed;
+  }
+
+  private void orderedIdle() {
+    await().atMost(Duration.ofSeconds(5)).until(() -> !orderedLane.busy());
   }
 
   private static void idle(OutboxConcurrentLane onLane, int slots) {
@@ -947,7 +973,7 @@ class OutboxRelayWorkerTests {
     await().atMost(Duration.ofSeconds(5)).until(() -> stampedConcurrent.getRelayedOn() != null);
     assertThat(stampedOrdered.getRelayedOn()).isNotNull();
     assertThat(threads)
-        .anyMatch(t -> t.startsWith("1@") && !t.contains("opentmf-outbox-send-"))
+        .anyMatch(t -> t.equals("1@opentmf-outbox-ordered")) // the ORDERED lane's thread
         .anyMatch(t -> t.startsWith("2@opentmf-outbox-send-"));
   }
 
@@ -1056,13 +1082,61 @@ class OutboxRelayWorkerTests {
     pending(3L, 0);
 
     OutboxRelayWorker.Batch full = worker.relayBatch(true);
+    orderedIdle();
     OutboxRelayWorker.Batch rest = worker.relayBatch(true);
+    orderedIdle();
 
     assertThat(full.ordered()).isEqualTo(2);
     assertThat(full.orderedFull()).isTrue();
     assertThat(full.concurrentFull()).isFalse(); // the CONCURRENT claim found nothing
     assertThat(rest.ordered()).isEqualTo(1);
     assertThat(rest.orderedFull()).isFalse();
+  }
+
+  /**
+   * OUTBOX-CONCURRENT-CLAIM-INDEPENDENT-1 (1.8.0): the ORDERED batch is sent on the ORDERED lane's
+   * thread, so the claim returns while it sends - and while it sends, the next batch claims the
+   * CONCURRENT lane and leaves the ORDERED lane alone (one ORDERED batch in flight per pod).
+   */
+  @Test
+  void theOrderedBatch_isSentOffTheClaimingThread_andNotClaimedAgainWhileItSends() {
+    OutboxEvent first = pending(1L, 0);
+    pending(2L, 0);
+    CountDownLatch gate = new CountDownLatch(1);
+    List<String> senders = new CopyOnWriteArrayList<>();
+    doAnswer(
+            inv -> {
+              senders.add(Thread.currentThread().getName());
+              if (inv.<OutboxEvent>getArgument(0).getId() == 1L) {
+                gate.await();
+              }
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+
+    OutboxRelayWorker.Batch batch = worker.relayBatch(true); // returns while row 1 is sending
+
+    assertThat(batch.ordered()).isEqualTo(2);
+    await().atMost(Duration.ofSeconds(5)).until(() -> senders.size() == 1);
+    assertThat(orderedLane.busy()).isTrue();
+    OutboxEvent conc = concurrent(3L, null);
+    OutboxRelayWorker.Batch next = worker.relayBatch(true); // the ORDERED lane is still sending
+    idle(lane, 2);
+    assertThat(next.ordered()).isZero();
+    assertThat(next.concurrent()).isEqualTo(1);
+    assertThat(conc.getRelayedOn()).isNotNull(); // sent while the ORDERED batch waits
+    assertThat(first.getRelayedOn()).isNull();
+    verify(repository, times(1)).claimOrdered(any(), any(), any(Limit.class));
+
+    gate.countDown();
+    orderedIdle();
+    assertThat(table.get(1L).getRelayedOn()).isNotNull();
+    assertThat(table.get(2L).getRelayedOn()).isNotNull();
+    assertThat(senders) // the ORDERED lane's thread, not the caller's
+        .doesNotContain(Thread.currentThread().getName())
+        .first()
+        .isEqualTo("opentmf-outbox-ordered");
   }
 
   @Test
@@ -1329,6 +1403,7 @@ class OutboxRelayWorkerTests {
         .thenThrow(new IllegalStateException("database gone mid-claim"));
 
     worker.relayBatch(true).claimed(); // logged - the pass goes on
+    orderedIdle();
 
     assertThat(lane.available()).isEqualTo(2);
     assertThat(ordered.getRelayedOn()).isNotNull();
@@ -1515,6 +1590,7 @@ class OutboxRelayWorkerTests {
     OutboxEvent ordered = pending(501L, 0);
 
     worker.relayBatch(true).claimed();
+    orderedIdle(); // the ORDERED batch went out while the CONCURRENT slots stay blocked
 
     assertThat(ordered.getRelayedOn()).isNotNull();
     gate.countDown();

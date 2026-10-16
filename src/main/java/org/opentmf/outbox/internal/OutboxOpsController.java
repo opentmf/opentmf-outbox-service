@@ -2,6 +2,7 @@ package org.opentmf.outbox.internal;
 
 import com.querydsl.core.types.Predicate;
 import java.time.OffsetDateTime;
+import java.time.format.DateTimeParseException;
 import java.util.Map;
 import java.util.function.Supplier;
 import lombok.RequiredArgsConstructor;
@@ -84,21 +85,76 @@ public class OutboxOpsController {
    * @param reference only rows of this private correlation
    */
   public record UnparkFilter(
-      String destination, OffsetDateTime parkedFrom, OffsetDateTime parkedTo, String reference) {}
+      String destination, OffsetDateTime parkedFrom, OffsetDateTime parkedTo, String reference) {
+
+    /**
+     * The filter from the request's JSON object, typed STRICTLY (1.8.0) - never coerced, and not
+     * through the consumer's mapper: a string field takes a JSON string or null, a date-time field
+     * an RFC 3339 string with an offset or null. A boolean, a number, an object or an array is
+     * refused with the field's name ({@code false} used to become the destination "false" through
+     * a default mapper's scalar coercion, and a number a date-time in epoch seconds). Other
+     * members are ignored, as before.
+     *
+     * @throws IllegalArgumentException naming the field whose value has the wrong type or shape
+     */
+    static UnparkFilter from(Map<String, ?> body) {
+      return new UnparkFilter(
+          text(body, "destination"),
+          dateTime(body, "parkedFrom"),
+          dateTime(body, "parkedTo"),
+          text(body, "reference"));
+    }
+
+    private static String text(Map<String, ?> body, String field) {
+      Object value = body.get(field);
+      if (value == null || value instanceof String) {
+        return (String) value;
+      }
+      throw new IllegalArgumentException(field + ": expected a string, got " + jsonType(value));
+    }
+
+    private static OffsetDateTime dateTime(Map<String, ?> body, String field) {
+      Object value = body.get(field);
+      if (value == null) {
+        return null;
+      }
+      if (value instanceof String text) {
+        try {
+          return OffsetDateTime.parse(text);
+        } catch (DateTimeParseException ex) {
+          throw new IllegalArgumentException(
+              field + ": expected an RFC 3339 date-time with an offset", ex);
+        }
+      }
+      throw new IllegalArgumentException(
+          field + ": expected an RFC 3339 date-time string, got " + jsonType(value));
+    }
+
+    private static String jsonType(Object value) {
+      if (value instanceof Boolean) {
+        return "a boolean";
+      }
+      if (value instanceof Number) {
+        return "a number";
+      }
+      return value instanceof Map ? "an object" : "an array";
+    }
+  }
 
   /**
    * Unparks by FILTER - every parked row of one destination (optionally within a parked-on range,
    * optionally of one reference), BOUNDED: answers {@code {"outboxRowsUnparked": n,
-   * "moreToUnpark": bool}}; call again while more remain. A missing destination is a 400. Gate it
-   * like the single unpark.
+   * "moreToUnpark": bool}}; call again while more remain. A missing destination, or a field of the
+   * wrong JSON type ({@link UnparkFilter#from}), is a 400. Gate it like the single unpark.
    */
   @PostMapping(
       path = "/outbox/unpark",
       consumes = MediaType.APPLICATION_JSON_VALUE,
       produces = MediaType.APPLICATION_JSON_VALUE)
-  public Map<String, Object> unparkByFilter(@RequestBody UnparkFilter filter) {
+  public Map<String, Object> unparkByFilter(@RequestBody Map<String, Object> body) {
     OutboxUnparkResult result;
     try {
+      UnparkFilter filter = UnparkFilter.from(body); // typed here, never by the consumer's mapper
       result =
           maintenance.unpark(
               filter.destination(), filter.parkedFrom(), filter.parkedTo(), filter.reference());

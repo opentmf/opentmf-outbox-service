@@ -16,7 +16,7 @@ import java.time.Duration;
  * publisher MUST attach it.
  *
  * <p><strong>Lanes and the lease (1.3.0).</strong> Each row rides the {@link #lane} its publisher
- * names. {@link Lane#ORDERED} (the default) is the single relay thread, rows in {@code id} order;
+ * names. {@link Lane#ORDERED} (the default) is one thread per pod, rows in {@code id} order;
  * {@link Lane#CONCURRENT} sends rows in parallel under {@code opentmf.outbox.concurrent
  * .max-in-flight}, independent of each other except where {@link #orderingKey} ties them. Either
  * way the row is CLAIMED BY LEASE: a short claim transaction stamps {@code claimed_until}, the
@@ -43,15 +43,17 @@ public interface OutboxPublisher {
   /** The relay lane a row rides. */
   enum Lane {
     /**
-     * The single relay thread, rows in {@code id} order (a failed row backs off and does not
-     * stop the rows behind it) - the 1.2.x behaviour, the default.
+     * One thread per pod, rows in {@code id} order (a failed row backs off and does not stop the
+     * rows behind it) - the 1.2.x behaviour, the default. Since 1.8.0 it is the ORDERED lane's own
+     * thread, so its sends never hold back the CONCURRENT lane's claims.
      */
     ORDERED,
     /**
      * Rows sent in parallel, one per (virtual, where enabled) thread, at most
      * {@code opentmf.outbox.concurrent.max-in-flight} at a time. The library promises NO order
      * between them, nor against ORDERED rows - except that rows sharing an {@link #orderingKey}
-     * are never in flight together and are taken in {@code id} order.
+     * are never in flight together and are taken in {@code id} order on the happy path (a row in
+     * backoff, parked or held lets later rows of its key pass it).
      */
     CONCURRENT
   }

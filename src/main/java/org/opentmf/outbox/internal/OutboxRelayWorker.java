@@ -34,7 +34,9 @@ import org.springframework.transaction.support.TransactionOperations;
  * lane's due rows over its own query ({@code FOR UPDATE SKIP LOCKED}), resolves each row's
  * publisher, stamps {@code claimed_until} on the rows it takes and COMMITS. The sends then run
  * in NO transaction - CONCURRENT rows on the lane's threads, ORDERED rows one after another on
- * the calling relay thread - and each outcome is written by its own short booking transaction,
+ * the ORDERED lane's one thread (1.8.0; the calling relay thread before, which held back the next
+ * CONCURRENT claim for a whole ORDERED batch) - and each outcome is written by its own short
+ * booking transaction,
  * guarded on the lease value this holder stamped: a holder whose lease lapsed (and whose row
  * another holder may own now) books nothing. At-least-once holds - a crash between delivery and
  * booking redelivers once the lease lapses, and the {@code x-idempotency-key} makes the
@@ -42,7 +44,8 @@ import org.springframework.transaction.support.TransactionOperations;
  *
  * <p>The lane is the one STAMPED on the row at append (null = ORDERED) - it wins even if the
  * publisher would now name another. The CLAIM takes: ORDERED rows up to {@code batch-size} (when
- * the relay says ORDERED rows may be due); CONCURRENT rows up to the lane's ROOM - ahead of its
+ * the relay says ORDERED rows may be due and the ORDERED lane is idle - one batch in flight per
+ * pod); CONCURRENT rows up to the lane's ROOM - ahead of its
  * slots, into its hand-off queue of at most {@code batch-size} rows (1.6.0) - the query itself
  * keeping a key from going into flight twice. Neither lane's query reads the other lane's rows, so
  * no backlog of one can hide a row of the other. A claim's cost on the relay thread does not grow
@@ -95,6 +98,9 @@ class OutboxRelayWorker {
 
   private final OutboxConcurrentLane lane;
 
+  /** The ORDERED lane's one thread (1.8.0): sends a claimed ORDERED batch off the relay thread. */
+  private final OutboxOrderedLane orderedLane;
+
   /** The CONCURRENT claim's round-robin key cursor - read and moved on the relay thread only. */
   private String keyCursor = "";
 
@@ -144,13 +150,15 @@ class OutboxRelayWorker {
   private record Attempt(Object result, RuntimeException failure) {}
 
   /**
-   * Claims one batch, hands its CONCURRENT rows to the lane and relays its ORDERED rows.
+   * Claims one batch and hands each lane its rows: the CONCURRENT rows to the lane's queue, the
+   * ORDERED batch to the ORDERED lane's thread. Neither send runs on the calling thread, so the
+   * caller's next claim never waits for one (1.8.0).
    *
    * @param withOrdered whether to claim the ORDERED lane - the relay's word that ORDERED rows may
-   *     be due
+   *     be due; ignored while the ORDERED lane still sends its previous batch
    */
   public Batch relayBatch(boolean withOrdered) {
-    Claimed ordered = withOrdered ? claimOrdered() : Claimed.NONE;
+    Claimed ordered = withOrdered && !orderedLane.busy() ? claimOrdered() : Claimed.NONE;
     Claimed concurrent = claimConcurrent();
     for (Leased row : concurrent.rows()) {
       if (!lane.submit(() -> relayConcurrent(row))) {
@@ -159,9 +167,14 @@ class OutboxRelayWorker {
             row.event.getId());
       }
     }
-    relayOrdered(ordered.rows());
+    List<Leased> orderedRows = ordered.rows();
+    if (!orderedRows.isEmpty() && !orderedLane.submit(() -> relayOrdered(orderedRows))) {
+      log.info(
+          "Outbox ORDERED batch of {} rows not sent - the relay is stopping; their leases lapse",
+          orderedRows.size());
+    }
     return new Batch(
-        ordered.rows().size(), concurrent.rows().size(), ordered.full(), concurrent.full());
+        orderedRows.size(), concurrent.rows().size(), ordered.full(), concurrent.full());
   }
 
   // ---------------------------------------------------------------- claim

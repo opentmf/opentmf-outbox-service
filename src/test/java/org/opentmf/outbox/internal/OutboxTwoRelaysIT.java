@@ -68,8 +68,8 @@ class OutboxTwoRelaysIT {
   static final Set<Long> KEYED_SENT = ConcurrentHashMap.newKeySet();
   static final CountDownLatch KEYED_GATE = new CountDownLatch(1);
 
-  /** The threads ORDERED rows were sent on - one per "pod" driver. */
-  static final Set<String> ORDERED_SENDERS = ConcurrentHashMap.newKeySet();
+  /** The threads ORDERED rows were sent on - each pod's ORDERED lane has its own (1.8.0). */
+  static final Set<Thread> ORDERED_SENDERS = ConcurrentHashMap.newKeySet();
 
   @TestConfiguration
   static class Publishers {
@@ -94,7 +94,7 @@ class OutboxTwoRelaysIT {
         public void publish(OutboxEvent event) {
           DELIVERED.computeIfAbsent(event.getId(), id -> new AtomicInteger()).incrementAndGet();
           if (event.getDestination().startsWith("ord:")) {
-            ORDERED_SENDERS.add(Thread.currentThread().getName());
+            ORDERED_SENDERS.add(Thread.currentThread());
           }
           try { // the receiver's response time: a timed wait on a latch nobody opens
             assertThat(new CountDownLatch(1).await(20, TimeUnit.MILLISECONDS)).isFalse();
@@ -294,6 +294,7 @@ class OutboxTwoRelaysIT {
     rows.addAll(seed("ord:race", 30));
     OutboxConcurrentLane secondLane =
         new OutboxConcurrentLane(4, properties.getBatchSize(), false, Duration.ofSeconds(5));
+    OutboxOrderedLane secondOrderedLane = new OutboxOrderedLane(Duration.ofSeconds(5));
     OutboxRelayWorker secondPod =
         new OutboxRelayWorker(
             repository,
@@ -304,7 +305,8 @@ class OutboxTwoRelaysIT {
             listeners,
             new TransactionTemplate(txManager),
             new TransactionTemplate(txManager),
-            secondLane);
+            secondLane,
+            secondOrderedLane);
     ExecutorService pods = Executors.newFixedThreadPool(2);
     try {
       long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
@@ -317,9 +319,10 @@ class OutboxTwoRelaysIT {
     } finally {
       pods.shutdownNow();
       secondLane.close();
+      secondOrderedLane.close();
     }
 
-    // the pods really raced: ORDERED rows went out from more than one relay thread (the
+    // the pods really raced: ORDERED rows went out from more than one ORDERED lane (the
     // context's own relay may join in too - a freed lane slot nudges it)
     assertThat(ORDERED_SENDERS).hasSizeGreaterThanOrEqualTo(2);
     assertThat(rows)
@@ -403,9 +406,20 @@ class OutboxTwoRelaysIT {
         new OutboxConcurrentLane(4, properties.getBatchSize(), false, Duration.ofSeconds(5));
     OutboxConcurrentLane laneB =
         new OutboxConcurrentLane(4, properties.getBatchSize(), false, Duration.ofSeconds(5));
+    OutboxOrderedLane orderedLaneA = new OutboxOrderedLane(Duration.ofSeconds(5));
+    OutboxOrderedLane orderedLaneB = new OutboxOrderedLane(Duration.ofSeconds(5));
     OutboxRelayWorker podA =
         new OutboxRelayWorker(
-            repository, router, backoff, metrics, properties, listeners, podATx, podATx, laneA);
+            repository,
+            router,
+            backoff,
+            metrics,
+            properties,
+            listeners,
+            podATx,
+            podATx,
+            laneA,
+            orderedLaneA);
     OutboxRelayWorker podB =
         new OutboxRelayWorker(
             repository,
@@ -416,7 +430,8 @@ class OutboxTwoRelaysIT {
             listeners,
             new TransactionTemplate(txManager),
             new TransactionTemplate(txManager),
-            laneB);
+            laneB,
+            orderedLaneB);
     ExecutorService pods = Executors.newSingleThreadExecutor();
     try {
       podATx.armed = true;
@@ -443,6 +458,8 @@ class OutboxTwoRelaysIT {
       pods.shutdownNow();
       laneA.close();
       laneB.close();
+      orderedLaneA.close();
+      orderedLaneB.close();
     }
   }
 

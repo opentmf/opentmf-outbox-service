@@ -1,5 +1,77 @@
 # Changelog
 
+## 1.8.0 - 2026-10-16
+
+A slow ORDERED receiver no longer stalls the CONCURRENT lane, the unpark by filter no longer
+coerces a wrongly typed field, and a consumer whose error model is not RFC 9457 can paste the ops
+fragment's paths verbatim.
+
+### Fixed
+
+- **The CONCURRENT lane no longer waits behind an ORDERED batch**
+  (OUTBOX-CONCURRENT-CLAIM-INDEPENDENT-1). Since 1.3.0 the relay thread claimed both lanes and
+  then sent the ORDERED batch itself, row after row. The CONCURRENT rows already handed over
+  went on sending, but the lane's next claim waited until the last ORDERED row of the batch was
+  booked. With a slow ORDERED receiver that is a long stall: in an end-to-end run, the
+  CONCURRENT lane relayed nothing for 26 s while ORDERED HTTP legs went out at about one a
+  second, then sent over 200 rows in two seconds.
+  - The ORDERED batch now goes to the **ORDERED lane's own thread** (`opentmf-outbox-ordered`),
+    and the relay thread only claims. A CONCURRENT row appended while an ORDERED batch sends is
+    claimed at once.
+  - The ORDERED lane keeps its guarantees: one batch in flight per pod (the relay claims it
+    only while the lane is idle, and the lane nudges the relay when a batch is done), rows one
+    at a time in `id` order, each under its short lease renewed by the booking of the row
+    before it.
+  - Measured by `OutboxLaneIndependenceIT`: 100 ORDERED rows to a receiver answering in 150 ms
+    (a 15 s batch) are sending when a CONCURRENT row is appended. It is delivered within two
+    seconds, while the ORDERED batch is still going. On 1.7.0 it waited for the batch.
+- **The unpark by filter types its body strictly** (OUTBOX-UNPARK-FILTER-STRICT-TYPES-1). It
+  bound `destination` as a plain string through the consumer's mapper, and a default mapper
+  coerces scalars: `{"destination": false}` became the destination "false", passed the blank
+  check and answered 200 (a black-box suite's negative test found it). The library now reads
+  the JSON object itself, whatever the consumer's mapper does, and never coerces: `destination`
+  and `reference` take a string or null, `parkedFrom` / `parkedTo` an RFC 3339 date-time with
+  an offset or null. A boolean, a number, an object or an array - and a date-time without an
+  offset, or a number read as epoch seconds - is a 400 naming the field; nothing is unparked.
+  A sent offset is now kept as sent rather than normalised to UTC (the instant is the same).
+  `OutboxOpsUnparkFilterStrictTypesTests` sends `false`, `true`, `0`, `1`, `1.5`, `{}` and
+  arrays on every field; `OutboxOpsProblemDetailsIT` shows the 400 through the application's
+  own mapper (it was a 200).
+- **Pool sizing:** the relay thread's claim and an ORDERED booking can now hold a connection at
+  the same moment. Size the pool above `concurrent.max-in-flight` + 3 (was + 2).
+- **Shutdown:** the relay thread, then the ORDERED batch, then the CONCURRENT sends each get
+  `shutdown-grace` in turn; what is not booked by then is redelivered once its lease lapses, as
+  before.
+
+### Changed (the OAS fragment - re-paste it)
+
+- **Every error is a refinable component; the paths are verbatim for every error model**
+  (OUTBOX-FRAGMENT-ERROR-MEDIA-TYPE-REFINABLE-1). The 1.7.0 fragment documented the library's
+  own refusals - which the consumer renders - as `application/problem+json`, in four inline
+  path responses and three unmarked components. A consumer whose single advice answers every
+  error as `application/json` in its own error shape could not paste it without promising a
+  wrong media type. Now:
+  - the four inline responses are components: `outboxInspectBadRequest` (the inspect GET's
+    400), `outboxUnparkConflict` and `outboxCancelConflict` (the 409s), and
+    `outboxUnparkFilterBadRequest` (the bulk unpark's 400). Every error in the paths is a
+    `$ref`, so the paths are pasted verbatim, whatever the consumer's error model;
+  - the library's refusals are marked **`x-opentmf-refinable: content`**: `outboxBadRequest`,
+    `outboxRangeNotSatisfiable`, `outboxRowIdOutOfRange`, `outboxRowNotFound` and the four
+    new ones. Their `description` (when the answer happens) and `headers` are the library's and
+    stay verbatim; their `content` is the consumer's rendering, media types and schemas alike.
+    What ships is the default (Spring's RFC 9457 rendering and the toolkit's `Tmf630Error`),
+    and no such description names a media type any more;
+  - `x-opentmf-refinable: true` is unchanged: exactly the six consumer answers and
+    `OutboxProblem`, redefinable whole.
+  - A drift test compares the paths exactly, `content` components by description and headers,
+    `true` components by name, and everything else exactly (README "OAS fragment").
+    `OutboxOpsFragmentDriftRuleTests` is that rule as code: a verbatim paste and a consumer
+    that answers every error as its own JSON both pass with the paths untouched.
+- **Consumers:** re-paste the fragment (the paths changed: four inline error responses are
+  `$ref`s now). A drift test written for 1.7.0 keeps passing after the re-paste for a consumer
+  that refines only the `true` components; a consumer that refines a refusal's content adds
+  the `content` rule.
+
 ## 1.7.0 - 2026-10-15
 
 The ops surface's contract, as the first black-box suites run against a pasted fragment found
