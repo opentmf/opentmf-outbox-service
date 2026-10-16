@@ -8,7 +8,13 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -107,6 +113,7 @@ class DatabaseIT {
       Receiver.script("inv:d3/", Script.concurrent());
       s.startPod("pod-a", "opentmf.outbox.concurrent.max-in-flight=1"); // migrate, barely relay
       Scenario.insertConcurrent("inv:d3/", 20000, 10);
+      Instant eligible = Instant.now(); // every row due from here on
       Scenario.sql("analyze outbox");
       long buffers = claimBuffers();
       Set<Long> before = ids();
@@ -134,10 +141,16 @@ class DatabaseIT {
         pruning.set(false);
         pruner.get();
       }
-      // a 200,000-row drain is bound by the claim's pace, not by slots: a row waits its turn in
-      // claim order while slots sit free (88-135 s measured on 1.8.0 and 1.9.0 alike) - that is
-      // the drain, not starvation, so I3 is reported as a figure, not checked
+      // I3 (no row waits with a free slot longer than a sweep plus its lease) over-fires on a
+      // 200,000-row drain: the sends answer at once, so every slot of both pods is free nearly
+      // all the time - momentarily, between one claim and the next - while each pod's single
+      // relay thread claims, stamps and books (and the prune competes for the database). The
+      // drain is bound by the claim's pace, not by slots, and a row legitimately waits its TURN
+      // in claim order (88-135 s measured on 1.8.0 and 1.9.0 alike). The starvation check this
+      // scenario keeps is the drain's own: no row may wait longer than its share of the drain in
+      // claim order allows - see starvedInClaimOrder.
       Findings f = s.finish(Duration.ofMinutes(1), Expect.strict().pruned().skipStarvation());
+      starvedInClaimOrder(f, eligible);
       f.figure(
           "claim over 200k pending rows read %d buffers; the prune deleted %d rows while relaying"
               .formatted(buffers, pruned.get()));
@@ -163,6 +176,65 @@ class DatabaseIT {
       }
       f.assertNone();
     }
+  }
+
+  /** The factor over a fair share of the drain that a row's wait may reach. */
+  private static final double TURN_FACTOR = 1.5;
+
+  /** Pod-b's start, the first claims, the prune's first batches: the drain's warm-up. */
+  private static final Duration TURN_SLACK = Duration.ofSeconds(10);
+
+  /**
+   * The drain's starvation bound. The CONCURRENT claim takes keys round-robin and a key's rows in
+   * {@code id} order, so its ORDER is round by round (a key's first row, then its second, ...),
+   * keys in string order within a round. A row with {@code r} rows ahead of it in that order, on
+   * a drain of {@code N} rows that took {@code T}, gets its turn at about {@code T x r / N}; it
+   * may wait {@value #TURN_FACTOR} times that (two pods walk with their own cursors, the pace
+   * is not uniform) plus {@link #TURN_SLACK} - never more. A row passed over for good would
+   * exceed it; a drain that merely takes its time does not.
+   */
+  private static void starvedInClaimOrder(Findings f, Instant eligible) {
+    Map<Long, Delivery> first = new HashMap<>();
+    Instant drained = eligible;
+    for (Delivery d : Receiver.deliveries()) {
+      if (!d.destination().startsWith("inv:d3/")) {
+        continue;
+      }
+      first.merge(d.rowId(), d, (a, b) -> a.start().isBefore(b.start()) ? a : b);
+      drained = d.end().isAfter(drained) ? d.end() : drained;
+    }
+    Map<String, List<Long>> byKey = new HashMap<>();
+    first.values().forEach(d -> byKey.computeIfAbsent(d.destination(), k -> new ArrayList<>()).add(d.rowId()));
+    record Turn(long rowId, int round, String key) {}
+    List<Turn> order = new ArrayList<>();
+    byKey.forEach(
+        (key, ids) -> {
+          Collections.sort(ids);
+          for (int round = 0; round < ids.size(); round++) {
+            order.add(new Turn(ids.get(round), round, key));
+          }
+        });
+    order.sort(Comparator.comparingInt(Turn::round).thenComparing(Turn::key));
+    double drain = Duration.between(eligible, drained).toMillis();
+    int n = order.size();
+    double worst = 0;
+    int late = 0;
+    for (int rank = 0; rank < n; rank++) {
+      Turn turn = order.get(rank);
+      double waited = Duration.between(eligible, first.get(turn.rowId()).start()).toMillis();
+      double share = drain * (rank + 1) / n;
+      worst = Math.max(worst, (waited - TURN_SLACK.toMillis()) / share);
+      if (waited > TURN_FACTOR * share + TURN_SLACK.toMillis()) {
+        if (late++ < 10) {
+          f.add("S", "row %d (claim-order rank %d of %d) waited %.0f ms - past %.1f x its share of the %.0f ms drain (%.0f ms) + %s".formatted(turn.rowId(), rank, n, waited, TURN_FACTOR, drain, share, TURN_SLACK));
+        }
+      }
+    }
+    String figure =
+        "drain of %d rows in %.0f s; the worst wait was %.2f x its claim-order share (bound %.1f x + %s); %d rows past it"
+            .formatted(n, drain / 1000, worst, TURN_FACTOR, TURN_SLACK, late);
+    f.figure(figure);
+    System.out.println("INVARIANTS: D3 " + figure); // the evidence, pass or fail
   }
 
   private static Set<Long> ids() throws SQLException {
