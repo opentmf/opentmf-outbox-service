@@ -85,6 +85,9 @@ before upgrading.
   it is booked" - instead of "its send may be delivering now"; the inspect's `inFlight` and the
   OAS fragment's cancel description read the same way.
 
+- **Sonar:** the relay's catch-alls (an `Error` is a failed attempt, nothing leaves a relay
+  thread) suppress `java:S1181` at nine sites by decision of Gökhan, 2026-10-16 - listed with
+  their reason in the README's "Sonar suppressions".
 - **Throughput:** unchanged at 8 slots (`OutboxRelayThroughputIT`, alternating A/B on a quiet
   box: 548-559 rows/s against 526-569 for 1.8.0's code); at 64 slots 7.6 % lower (1,449 against
   1,568 rows/s; 10,000 rows in 6.8 s, the bar 15 s) - the per-send bookkeeping of the heartbeat

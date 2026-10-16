@@ -1317,6 +1317,15 @@ Quality gates on this repo:
   `withHistory` behind the commercial arcmutate plugin). No mutation threshold:
   survivor review is the unit of work.
 
+### Sonar suppressions
+
+One rule is suppressed, at nine sites, by decision - **decided by Gökhan 2026-10-16** (decision
+#254), never a quiet workaround:
+
+| Rule | Where | Why |
+|---|---|---|
+| `java:S1181` (catch `Exception` instead of `Throwable`) | `OutboxRelayWorker.route`, `relayConcurrent`, `relayOrdered`, `send`, `book`; `OutboxConcurrentLane.work`; `OutboxOrderedLane.run`; `OutboxRelay.relayPass` | Ruling F-4 (1.9.0): an `Error` a publisher, a booking hook or a relayed listener throws is a failed attempt like any exception, and nothing may leave a relay, lane or heartbeat thread - up to 1.8.0 an `Error` killed the sending thread, booked nothing, and the row was re-sent every lease, forever (`PoliciesIT` C5). Each method carries `@SuppressWarnings("java:S1181")` with the reason on its line. |
+
 ### PIT survivor review
 
 Run PIT locally for the current figures (the report is not committed).
