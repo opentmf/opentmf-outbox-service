@@ -226,9 +226,9 @@ paths:
       operationId: cancelOutboxRow
       summary: Withdraw one unreleased row — never relayed from now on, retained for audit
       description: >-
-        A row whose send is IN FLIGHT (a live lease) is refused at once with a 409 — the
-        send may be delivering now; cancel again once it is booked (a failed send in backoff
-        is cancellable, a delivered one is relayed). A row whose lease has lapsed is
+        A row IN FLIGHT — claimed by a relay under a live lease: queued for its send (about a
+        second at most) or sending — is refused at once with a 409; it is cancellable once it
+        is booked (a failed send in backoff is cancellable, a delivered one is relayed). A row whose lease has lapsed is
         cancellable; should its stale send still succeed, the row is booked
         sent-but-cancelled (both `relayedOn` and `cancelledOn` stamped).
       parameters:

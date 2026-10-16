@@ -36,6 +36,11 @@ public record OutboxRowView(
     String payload) {
 
   static OutboxRowView of(OutboxEvent event, boolean withPayload) {
+    return of(event, withPayload, OffsetDateTime.now(ZoneOffset.UTC));
+  }
+
+  /** The view as of {@code now} - the outbox's time, which decides whether a lease is live. */
+  static OutboxRowView of(OutboxEvent event, boolean withPayload, OffsetDateTime now) {
     return new OutboxRowView(
         event.getId(),
         event.getAggregateType(),
@@ -48,7 +53,7 @@ public record OutboxRowView(
         event.getParkedOn() != null && event.getCancelledOn() == null,
         event.getRelayedOn() == null
             && event.getClaimedUntil() != null
-            && event.getClaimedUntil().isAfter(OffsetDateTime.now(ZoneOffset.UTC)),
+            && event.getClaimedUntil().isAfter(now),
         event.getCreatedOn(),
         event.getNextAttemptOn(),
         event.getReleaseAt(),

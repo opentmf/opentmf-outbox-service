@@ -16,7 +16,7 @@ import org.junit.jupiter.api.Test;
 /**
  * The hand-off queue in front of the slots: the permits bound the sends while the queue holds the
  * rest; queued sends run in claim order; the room the relay may claim - as deep as the sends allow
- * (1.8.1) - and the nudge half-way down;
+ * (1.9.0) - and the nudge half-way down;
  * no queued send is ever stranded; threads are daemons; close drops the queue and waits up to the
  * grace for the sends in flight.
  */
@@ -82,7 +82,7 @@ class OutboxConcurrentLaneTests {
   }
 
   /**
-   * OUTBOX-QUEUED-LEASE-STARVATION-1 (1.8.1): the depth follows the sends - fast sends claim ahead
+   * OUTBOX-QUEUED-LEASE-STARVATION-1 (1.9.0): the depth follows the sends - fast sends claim ahead
    * up to the capacity, as since 1.6.0; sends slower than the horizon per slot claim nothing ahead:
    * only the free slots, so no row waits behind a busy one while its lease runs.
    */
@@ -106,6 +106,100 @@ class OutboxConcurrentLaneTests {
     lane.close();
     slow.close();
     between.close();
+  }
+
+  /**
+   * 1.9.0 (K1, the flow shape): a slot busy with a send older than the horizon starts nothing
+   * soon, whatever the average says - a lane whose average is fast queues nothing behind it.
+   */
+  @Test
+  void aSlotBusyWithASendOlderThanTheHorizon_isNotLive_andTheDepthLeavesItOut() throws Exception {
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(2, 100, false, Duration.ofSeconds(5));
+    lane.sendTook(Duration.ofMillis(1).toNanos()); // fast on average: 2 x 1 s / 1 ms - capacity
+    assertThat(lane.liveSlots()).isEqualTo(2);
+    assertThat(lane.depth()).isEqualTo(100);
+    CountDownLatch release = new CountDownLatch(1);
+    lane.submit(
+        () -> {
+          try {
+            release.await(10, TimeUnit.SECONDS); // a slow send in one slot
+          } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+          }
+        });
+    await()
+        .pollDelay(OutboxConcurrentLane.HORIZON.plusMillis(100))
+        .atMost(Duration.ofSeconds(5))
+        .untilAsserted(() -> assertThat(lane.liveSlots()).isEqualTo(1));
+    assertThat(lane.depth()).isEqualTo(100); // one live slot still covers the capacity
+
+    lane.sendTook(Duration.ofMillis(500).toNanos()); // the average now 63 ms: 1 x 1 s / 63 ms
+    assertThat(lane.depth()).isEqualTo(15);
+    release.countDown();
+    await().atMost(Duration.ofSeconds(5)).until(() -> lane.liveSlots() == 2);
+    lane.close();
+  }
+
+  @Test
+  void everySlotBusyWithAnOldSend_queuesNothingAhead() {
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(2, 100, false, Duration.ofSeconds(5));
+    lane.sendTook(Duration.ofMillis(1).toNanos());
+    CountDownLatch release = new CountDownLatch(1);
+    for (int i = 0; i < 2; i++) {
+      lane.submit(
+          () -> {
+            try {
+              release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException ex) {
+              Thread.currentThread().interrupt();
+            }
+          });
+    }
+    await()
+        .pollDelay(OutboxConcurrentLane.HORIZON.plusMillis(100))
+        .atMost(Duration.ofSeconds(5))
+        .untilAsserted(() -> assertThat(lane.liveSlots()).isZero());
+    assertThat(lane.depth()).isZero();
+    assertThat(lane.room()).isZero(); // no free slot, nothing ahead: the rows stay for other pods
+    release.countDown();
+    lane.close();
+  }
+
+  /**
+   * 1.9.0 (K1): rows queued in the second before the slots turned slow are given back once no slot
+   * is live - unsent - and only then; a send without a row is never given back.
+   */
+  @Test
+  void theQueue_isGivenBack_onlyWhileNoSlotIsLive() {
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(1, 100, false, Duration.ofSeconds(5));
+    lane.sendTook(Duration.ofMillis(1).toNanos());
+    CountDownLatch release = new CountDownLatch(1);
+    AtomicInteger sent = new AtomicInteger();
+    lane.submit(
+        1L,
+        () -> {
+          try {
+            release.await(10, TimeUnit.SECONDS); // the one slot, a slow send
+          } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+          }
+        });
+    await().atMost(Duration.ofSeconds(5)).until(() -> lane.available() == 0);
+    lane.submit(2L, sent::incrementAndGet);
+    lane.submit(sent::incrementAndGet); // no row: never given back
+    assertThat(lane.evictStranded()).isEmpty(); // the slot is live: its send is young
+
+    await()
+        .pollDelay(OutboxConcurrentLane.HORIZON.plusMillis(100))
+        .atMost(Duration.ofSeconds(5))
+        .until(() -> lane.liveSlots() == 0);
+    assertThat(lane.evictStranded()).containsExactly(2L);
+    assertThat(lane.queued()).isEqualTo(1);
+    assertThat(lane.evictStranded()).isEmpty(); // nothing left to give back
+
+    release.countDown();
+    await().atMost(Duration.ofSeconds(5)).until(() -> sent.get() == 1); // only the row-less one
+    lane.close();
   }
 
   @Test

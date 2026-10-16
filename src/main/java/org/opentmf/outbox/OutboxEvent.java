@@ -144,6 +144,15 @@ public class OutboxEvent {
   private OffsetDateTime claimedUntil;
 
   /**
+   * When the current holder's SEND was known to be under way (1.9.0): set by the lease renewal
+   * right before a send, else by the send heartbeat a third of the lease in; cleared by every
+   * booking and by every claim. A lease that lapses while it is set counts as a failed attempt; a
+   * lease that lapses on a row held unsent (claimed into a queue, behind an ORDERED head) costs
+   * the row nothing.
+   */
+  private OffsetDateTime sendingSince;
+
+  /**
    * The relay lane the row's publisher named at APPEND (1.3.0), frozen - the stamped lane wins
    * at claim even if the publisher would now say otherwise. Null = written before 1.3.0 or not
    * through {@link OutboxWriter}: the row rides ORDERED.

@@ -191,13 +191,48 @@ final class OutboxClaimSql {
   /**
    * Writes the lease of every claimed row that shares one lease end, in ONE statement (1.6.0; one
    * flushed update per row before): {@code claimed_until} and {@code next_attempt_on} - the latter
-   * so a pre-1.3.0 relay sees a leased row as not due. The rows are already locked by the claim
-   * ({@code FOR UPDATE}); {@code id = any(...)} reads by primary key.
+   * so a pre-1.3.0 relay sees a leased row as not due - and clears {@code sending_since} (1.9.0):
+   * a new holder's send has not started yet. The rows are already locked by the claim ({@code FOR
+   * UPDATE}); {@code id = any(...)} reads by primary key.
    */
   static final String STAMP =
       """
-      update outbox set claimed_until = :stamp, next_attempt_on = :stamp
+      update outbox set claimed_until = :stamp, next_attempt_on = :stamp, sending_since = null
       where id = any (cast(:ids as bigint[]))""";
+
+  /**
+   * The SEND HEARTBEAT (1.9.0): renews, in ONE statement, the lease of every row this pod is
+   * sending whose renewal is due - each guarded on the lease value this holder stamped, so a row
+   * another holder took (or a booking cleared) is not touched - and marks each send as under way
+   * ({@code sending_since}, kept once set). The rows come as four parallel arrays, unnested
+   * together: the ids, the stamps the guard compares, the new lease ends, and the instants the
+   * sends started. Returns the ids it renewed; a row missing is lost to this holder. The unnested
+   * ids join the table by primary key.
+   */
+  static final String RENEW_SENDING =
+      """
+      with renewed as (
+        update outbox o set claimed_until = v.renewed, next_attempt_on = v.renewed,
+          sending_since = coalesce(o.sending_since, v.since)
+        from unnest(cast(:ids as bigint[]), cast(:stamps as timestamptz[]),
+            cast(:renewed as timestamptz[]), cast(:since as timestamptz[]))
+          as v (id, stamp, renewed, since)
+        where o.id = v.id and o.claimed_until = v.stamp
+        returning o.id)
+      select id from renewed""";
+
+  /**
+   * Gives queued rows BACK (1.9.0), in ONE statement: every slot of the pod is busy with a send
+   * older than a second, so the rows it claimed into its hand-off queue in the second before would
+   * only wait behind them. Each row's lease is cleared - guarded on the stamp this holder wrote, so
+   * a row another holder took is not touched - and it is due at once, for any pod with a free slot.
+   * The rows come as two parallel arrays, unnested together; they join the table by primary key.
+   */
+  static final String RELEASE =
+      """
+      update outbox o set claimed_until = null, next_attempt_on = :now
+      from unnest(cast(:ids as bigint[]), cast(:stamps as timestamptz[])) as v (id, stamp)
+      where o.id = v.id and o.claimed_until = v.stamp""";
 
   /**
    * The RELAYED booking in ONE statement (1.6.0; a locking read plus a flushed update before),
@@ -211,7 +246,7 @@ final class OutboxClaimSql {
   static final String BOOK_RELAYED =
       """
       with booked as (
-        update outbox set claimed_until = null, relayed_on = :relayedOn,
+        update outbox set claimed_until = null, sending_since = null, relayed_on = :relayedOn,
           next_attempt_on = :relayedOn
         where id = :id and claimed_until = :stamp
         returning *)

@@ -1,10 +1,10 @@
 package org.opentmf.outbox;
 
 import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
 import java.util.Map;
 import java.util.function.Supplier;
 import org.opentmf.outbox.internal.OutboxAppended;
+import org.opentmf.outbox.internal.OutboxClock;
 import org.opentmf.outbox.internal.OutboxEventRepository;
 import org.opentmf.outbox.internal.OutboxLaneStamper;
 import org.springframework.context.ApplicationEventPublisher;
@@ -30,6 +30,7 @@ public class OutboxWriter {
   private final ApplicationEventPublisher eventPublisher;
   private final ObjectMapper objectMapper;
   private final Supplier<OutboxLaneStamper> laneStamper;
+  private final OutboxClock clock;
 
   /** A writer that stamps no lane - every row it appends rides ORDERED. */
   public OutboxWriter(
@@ -45,10 +46,24 @@ public class OutboxWriter {
       ApplicationEventPublisher eventPublisher,
       ObjectMapper objectMapper,
       Supplier<OutboxLaneStamper> laneStamper) {
+    this(repository, eventPublisher, objectMapper, laneStamper, OutboxClock.system());
+  }
+
+  /**
+   * The library's writer on the outbox's time (1.9.0): {@code created_on} and the first due time
+   * come from the database's clock, as every lease and retry does - never the pod's own.
+   */
+  public OutboxWriter(
+      OutboxEventRepository repository,
+      ApplicationEventPublisher eventPublisher,
+      ObjectMapper objectMapper,
+      Supplier<OutboxLaneStamper> laneStamper,
+      OutboxClock clock) {
     this.repository = repository;
     this.eventPublisher = eventPublisher;
     this.objectMapper = objectMapper;
     this.laneStamper = laneStamper;
+    this.clock = clock;
   }
 
   /**
@@ -125,8 +140,9 @@ public class OutboxWriter {
     event.setPayload(objectMapper.writeValueAsString(request.payload()));
     Map<String, String> headers = request.headers();
     event.setHeaders(headers.isEmpty() ? null : objectMapper.writeValueAsString(headers));
-    event.setCreatedOn(OffsetDateTime.now(ZoneOffset.UTC));
-    event.setNextAttemptOn(OffsetDateTime.now(ZoneOffset.UTC));
+    OffsetDateTime now = clock.now();
+    event.setCreatedOn(now);
+    event.setNextAttemptOn(now);
     event.setReleaseAt(request.releaseAt());
     event.setReference(request.reference());
     OutboxLaneStamper stamper = laneStamper.get();

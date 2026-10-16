@@ -79,7 +79,10 @@ class OutboxClaimPlanIT {
           Map.entry("ids", "varchar"),
           Map.entry("id", "bigint"),
           Map.entry("stamp", "timestamptz"),
-          Map.entry("relayedOn", "timestamptz"));
+          Map.entry("relayedOn", "timestamptz"),
+          Map.entry("stamps", "varchar"),
+          Map.entry("renewed", "varchar"),
+          Map.entry("since", "varchar"));
 
   private static final List<String> PLAN_MODES = List.of("force_custom_plan", "force_generic_plan");
 
@@ -618,18 +621,22 @@ class OutboxClaimPlanIT {
   /**
    * The two set-based writes of 1.6.0, under both plan modes: the STAMP of a full batch's leases
    * and the one-statement RELAYED booking reach their rows by primary key alone - never a scan,
-   * never another index.
+   * never another index; so do the send heartbeat's renewal and the give-back of a stranded queue
+   * (1.9.0), each over a full batch of unnested ids.
    */
   @Test
   @Order(8)
   void theStampAndTheRelayedBooking_writeByPrimaryKeyOnly() throws Exception {
     String ids;
     String oneId;
+    String stamps;
     try (Connection c = connect();
         Statement st = c.createStatement();
         ResultSet rs =
             st.executeQuery(
-                "select '{' || string_agg(id::text, ',') || '}', min(id) from (select min(id) id"
+                "select '{' || string_agg(id::text, ',') || '}', min(id),"
+                    + " '{' || string_agg('\"2100-01-01T00:00:00.000000Z\"', ',') || '}'"
+                    + " from (select min(id) id"
                     + " from outbox where relayed_on is null and lane = 'CONCURRENT'"
                     + " group by ordering_key order by ordering_key limit "
                     + FULL_BATCH
@@ -637,6 +644,7 @@ class OutboxClaimPlanIT {
       rs.next();
       ids = rs.getString(1);
       oneId = rs.getString(2);
+      stamps = rs.getString(3);
     }
     execute(
         "update outbox set claimed_until = timestamptz '2100-01-01 00:00:00+00' where id = "
@@ -653,6 +661,21 @@ class OutboxClaimPlanIT {
             "id", oneId,
             "stamp", "timestamptz '2100-01-01 00:00:00+00'",
             "relayedOn", "now()"),
+        List.of("outbox_pkey"));
+    // 1.9.0: the send heartbeat and the give-back - a full batch of rows, by primary key alone
+    assertIndexedOnly(
+        "send heartbeat of a full batch",
+        OutboxClaimSql.RENEW_SENDING,
+        Map.of(
+            "ids", "'" + ids + "'",
+            "stamps", "'" + stamps + "'",
+            "renewed", "'" + stamps + "'",
+            "since", "'" + stamps + "'"),
+        List.of("outbox_pkey"));
+    assertIndexedOnly(
+        "give-back of a full batch",
+        OutboxClaimSql.RELEASE,
+        Map.of("ids", "'" + ids + "'", "stamps", "'" + stamps + "'", "now", "now()"),
         List.of("outbox_pkey"));
   }
 }

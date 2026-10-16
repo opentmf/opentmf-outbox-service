@@ -24,7 +24,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * OUTBOX-QUEUED-LEASE-STARVATION-1 (1.8.1): a CONCURRENT row never waits in the hand-off queue
+ * OUTBOX-QUEUED-LEASE-STARVATION-1 (1.9.0): a CONCURRENT row never waits in the hand-off queue
  * behind slow sends while its lease runs out. Up to 1.8.0 the claim ran up to {@code batch-size}
  * rows ahead of the slots, so with every slot held by a slow send a short-lease row waited in the
  * queue, its lease lapsed, the next pass claimed it AGAIN and queued it at the tail - measured on a

@@ -6,8 +6,6 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
 import java.util.Locale;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -89,14 +87,24 @@ class OutboxMetrics {
   private final MeterRegistry registry;
   private final OutboxEventRepository repository;
   private final Duration refreshEvery;
+  private final OutboxClock clock;
   private final AtomicReference<Snapshot> snapshot = new AtomicReference<>(Snapshot.NONE);
   private final AtomicReference<Instant> lastRefreshed = new AtomicReference<>();
   private ScheduledExecutorService refresher;
 
   OutboxMetrics(MeterRegistry registry, OutboxEventRepository repository, Duration refreshEvery) {
+    this(registry, repository, refreshEvery, OutboxClock.system());
+  }
+
+  OutboxMetrics(
+      MeterRegistry registry,
+      OutboxEventRepository repository,
+      Duration refreshEvery,
+      OutboxClock clock) {
     this.registry = registry;
     this.repository = repository;
     this.refreshEvery = refreshEvery;
+    this.clock = clock;
     for (Lane lane : Lane.values()) {
       String tag = laneTag(lane);
       Gauge.builder(PENDING, this, m -> m.snapshot.get().of(lane).pending())
@@ -156,7 +164,7 @@ class OutboxMetrics {
     try {
       LaneCounts parked = repository.countParked();
       LaneCounts openNotParked = repository.countOpenNotParked();
-      LaneCounts inFlight = repository.countInFlight(OffsetDateTime.now(ZoneOffset.UTC));
+      LaneCounts inFlight = repository.countInFlight(clock.now());
       LaneSince openSince = repository.findOldestOpenSince();
       snapshot.set(
           new Snapshot(
@@ -213,6 +221,6 @@ class OutboxMetrics {
     if (since == null) {
       return 0d;
     }
-    return Math.max(0d, Duration.between(since, Instant.now()).toMillis() / 1000d);
+    return Math.max(0d, Duration.between(since, clock.instant()).toMillis() / 1000d);
   }
 }

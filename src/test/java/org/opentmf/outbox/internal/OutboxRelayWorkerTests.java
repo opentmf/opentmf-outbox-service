@@ -8,6 +8,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
@@ -43,14 +44,17 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.opentmf.outbox.OutboxBooking;
 import org.opentmf.outbox.OutboxBooking.Outcome;
 import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxLeaseLapsedException;
 import org.opentmf.outbox.OutboxProperties;
 import org.opentmf.outbox.OutboxPublisher;
 import org.opentmf.outbox.OutboxPublisher.ExhaustionOutcome;
 import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.opentmf.outbox.OutboxRelayedListener;
+import org.opentmf.outbox.OutboxSendError;
 import org.opentmf.outbox.TerminalOutboxException;
 import org.springframework.beans.BeanUtils;
 import org.slf4j.LoggerFactory;
@@ -103,7 +107,7 @@ class OutboxRelayWorkerTests {
             }
             committed++;
             return result;
-          } catch (RuntimeException ex) {
+          } catch (RuntimeException | Error ex) { // as TransactionTemplate: an Error rolls back too
             rolledBack++;
             before.forEach((id, row) -> BeanUtils.copyProperties(row, table.get(id)));
             throw ex;
@@ -114,7 +118,7 @@ class OutboxRelayWorkerTests {
   private final OutboxRelayWorker worker = workerOn(lane);
 
   /**
-   * A lane that has measured a fast send (1.8.1): it claims ahead of its slots up to its capacity,
+   * A lane that has measured a fast send (1.9.0): it claims ahead of its slots up to its capacity,
    * as every lane did before - these tests are about that regime.
    */
   private static OutboxConcurrentLane fast(OutboxConcurrentLane lane) {
@@ -123,8 +127,7 @@ class OutboxRelayWorkerTests {
   }
 
   private OutboxRelayWorker workerOn(OutboxConcurrentLane onLane) {
-    return new OutboxRelayWorker(
-        repository,
+    return new OutboxRelayWorker(repository,
         new OutboxPublisherRouter(List.of(publisher)),
         new OutboxBackoff(properties),
         new OutboxMetrics(registry, repository, Duration.ofSeconds(15)),
@@ -133,7 +136,9 @@ class OutboxRelayWorkerTests {
         tx,
         tx,
         onLane,
-        orderedLane);
+        orderedLane,
+            OutboxClock.system(),
+            OutboxSendHeartbeatFixture.idle());
   }
 
   OutboxRelayWorkerTests() {
@@ -178,6 +183,7 @@ class OutboxRelayWorkerTests {
                   id -> {
                     table.get(id).setClaimedUntil(stamp);
                     table.get(id).setNextAttemptOn(stamp);
+                    table.get(id).setSendingSince(null);
                   });
               return ids.size();
             });
@@ -188,6 +194,7 @@ class OutboxRelayWorkerTests {
               held.ifPresent(
                   row -> {
                     row.setClaimedUntil(null);
+                    row.setSendingSince(null);
                     row.setRelayedOn(inv.getArgument(2));
                     row.setNextAttemptOn(inv.getArgument(2));
                   });
@@ -612,8 +619,13 @@ class OutboxRelayWorkerTests {
     assertThat(order).containsExactly("hook", "listener");
   }
 
+  /**
+   * 1.9.0 (C5): a hook that refuses the failure booking as well - the failure is booked once more
+   * WITHOUT the hook, so the attempt counts and the row's budget ends it. Up to 1.8.0 nothing was
+   * booked and the row was re-sent every lease, forever.
+   */
   @Test
-  void aRefusingHookOnAFailure_booksNothing_theLeaseLapses() {
+  void aRefusingHookOnAFailure_isBookedWithoutTheHook_theAttemptCounts() {
     OutboxEvent event = pending(1L, 0);
     doThrow(new RuntimeException("receiver 503")).when(publisher).deliver(event);
     doThrow(new IllegalStateException("hook refused"))
@@ -622,24 +634,201 @@ class OutboxRelayWorkerTests {
 
     relay(); // logged, never thrown out of the pass
 
-    assertThat(event.getAttempts()).isZero(); // rolled back
-    assertThat(event.getClaimedUntil()).isNotNull(); // still leased: it lapses, then repeats
-    assertThat(rolledBack).isEqualTo(1);
+    assertThat(event.getAttempts()).isEqualTo(1);
+    assertThat(event.getLastError()).contains("receiver 503");
+    assertThat(event.getClaimedUntil()).isNull(); // booked: retried after its backoff
+    assertThat(rolledBack).isEqualTo(1); // the booking with the hook
   }
 
   @Test
-  void aRefusingHookOnTheFirstOrderedRow_stopsTheBatch_theRestLapse() {
+  void aRefusingHookOnTheFirstOrderedRow_isBookedWithoutIt_theBatchGoesOn() {
     OutboxEvent first = pending(1L, 0);
     OutboxEvent second = pending(2L, 0);
     doThrow(new RuntimeException("down")).when(publisher).deliver(first);
     doThrow(new IllegalStateException("hook refused"))
         .when(publisher)
-        .onBooked(any(), any());
+        .onBooked(eq(first), any());
 
     relay();
 
-    verify(publisher, never()).deliver(second); // the relay thread stopped the batch
-    assertThat(second.getClaimedUntil()).isNotNull();
+    assertThat(first.getAttempts()).isEqualTo(1);
+    verify(publisher).deliver(second); // the batch went on
+    assertThat(second.getRelayedOn()).isNotNull();
+  }
+
+  // ------------------------------------------------------------ a lapse counts (1.9.0)
+
+  /** A row whose previous lease lapsed while its send was under way (its pod died, or it hung). */
+  private OutboxEvent lapsedWhileSending(long id, int attempts, Lane rowLane) {
+    OutboxEvent event = pending(id, attempts);
+    event.setLane(rowLane);
+    event.setClaimedUntil(OffsetDateTime.now().minusSeconds(1));
+    event.setSendingSince(OffsetDateTime.now().minusSeconds(20));
+    return event;
+  }
+
+  @Test
+  void aLeaseThatLapsedWhileItsSendWasUnderWay_isCountedAsAFailedAttempt_notSent() {
+    for (Lane rowLane : Lane.values()) {
+      table.clear();
+      bookings.clear();
+      OutboxEvent event = lapsedWhileSending(1L, 0, rowLane);
+
+      relay();
+
+      verify(publisher, never()).deliver(event);
+      assertThat(event.getAttempts()).as(rowLane.name()).isEqualTo(1);
+      assertThat(event.getLastError())
+          .as(rowLane.name())
+          .startsWith("OutboxLeaseLapsedException")
+          .contains("lapsed unbooked");
+      assertThat(event.getClaimedUntil()).as(rowLane.name()).isNull();
+      assertThat(event.getSendingSince()).as(rowLane.name()).isNull();
+      assertThat(event.getNextAttemptOn()).as(rowLane.name()).isAfter(OffsetDateTime.now());
+      assertThat(bookings)
+          .as(rowLane.name())
+          .singleElement()
+          .satisfies(
+              booking -> {
+                assertThat(booking.outcome()).isEqualTo(OutboxBooking.Outcome.RETRY);
+                assertThat(booking.failure()).isInstanceOf(OutboxLeaseLapsedException.class);
+              });
+    }
+  }
+
+  @Test
+  void aLapseOnTheLastAttempt_exhaustsTheRow_byItsPolicy() {
+    OutboxEvent event = lapsedWhileSending(1L, properties.getMaxAttempts() - 1, Lane.CONCURRENT);
+
+    relay();
+
+    verify(publisher, never()).deliver(event);
+    assertThat(event.getAttempts()).isEqualTo(properties.getMaxAttempts());
+    assertThat(event.getParkedOn()).isNotNull(); // PARK, the default policy
+    assertThat(bookings).singleElement().extracting(OutboxBooking::outcome).isEqualTo(OutboxBooking.Outcome.EXHAUSTED);
+  }
+
+  /** A lease that lapsed on a row held UNSENT (queued, behind an ORDERED head) costs nothing. */
+  @Test
+  void aLeaseThatLapsedOnARowHeldUnsent_costsItNothing() {
+    for (Lane rowLane : Lane.values()) {
+      table.clear();
+      OutboxEvent event = pending(1L, 0);
+      event.setLane(rowLane);
+      event.setClaimedUntil(OffsetDateTime.now().minusSeconds(1)); // no sending_since
+
+      relay();
+
+      verify(publisher, atLeastOnce()).deliver(event);
+      assertThat(event.getAttempts()).as(rowLane.name()).isZero();
+      assertThat(event.getRelayedOn()).as(rowLane.name()).isNotNull();
+    }
+  }
+
+  /** Every claim clears the mark: a new holder's send has not started. */
+  @Test
+  void theClaim_clearsTheSendingMark_onTheRowsItTakes() {
+    OutboxEvent first = pending(1L, 0);
+    OutboxEvent second = pending(2L, 0);
+    first.setSendingSince(OffsetDateTime.now().minusMinutes(5)); // a stale mark, no lease
+    doAnswer(
+            inv -> {
+              assertThat(first.getSendingSince()).isNull(); // cleared by the claim
+              return null;
+            })
+        .when(publisher)
+        .deliver(first);
+
+    relay();
+
+    assertThat(first.getAttempts()).isZero(); // no lease: nothing lapsed, nothing counted
+    assertThat(second.getRelayedOn()).isNotNull();
+  }
+
+  /** The renewal right before an ORDERED send marks the send as under way. */
+  @Test
+  void theRenewalBeforeAnOrderedSend_marksTheSendUnderWay() {
+    OutboxEvent first = pending(1L, 0);
+    OutboxEvent second = pending(2L, 0);
+    List<OffsetDateTime> markAtSend = new ArrayList<>();
+    doAnswer(
+            inv -> {
+              markAtSend.add(second.getSendingSince());
+              return null;
+            })
+        .when(publisher)
+        .deliver(second);
+
+    relay();
+
+    assertThat(first.getRelayedOn()).isNotNull();
+    assertThat(markAtSend).singleElement().isNotNull(); // renewed and marked, then sent
+    assertThat(second.getSendingSince()).isNull(); // the booking cleared it
+  }
+
+  // ------------------------------------------------------------ anything thrown (1.9.0)
+
+  @Test
+  void anErrorFromThePublisher_isAFailedAttempt_onBothLanes() {
+    for (Lane rowLane : Lane.values()) {
+      table.clear();
+      bookings.clear();
+      OutboxEvent event = pending(1L, 0);
+      event.setLane(rowLane);
+      doThrow(new StackOverflowError("deep")).when(publisher).deliver(event);
+
+      relay();
+
+      assertThat(event.getAttempts()).as(rowLane.name()).isEqualTo(1);
+      assertThat(event.getLastError()).as(rowLane.name()).contains("StackOverflowError: deep");
+      assertThat(event.getClaimedUntil()).as(rowLane.name()).isNull();
+      assertThat(bookings)
+          .as(rowLane.name())
+          .singleElement()
+          .satisfies(
+              booking ->
+                  assertThat(booking.failure())
+                      .isInstanceOf(OutboxSendError.class)
+                      .hasCauseInstanceOf(StackOverflowError.class));
+    }
+  }
+
+  @Test
+  void anErrorFromARelayedListener_isAFailedAttempt() {
+    OutboxEvent event = pending(1L, 0);
+    listeners.add(
+        e -> {
+          throw new AssertionError("listener broke");
+        });
+
+    relay();
+
+    assertThat(event.getRelayedOn()).isNull(); // the RELAYED booking rolled back
+    assertThat(event.getAttempts()).isEqualTo(1);
+    assertThat(event.getLastError()).contains("AssertionError: listener broke");
+  }
+
+  @Test
+  void aRouterThatThrowsAnError_isBookedByTheLibraryPolicy() {
+    OutboxEvent event = pending(1L, 0);
+    doThrow(new LinkageError("missing class")).when(publisher).supports(event);
+
+    relay();
+
+    assertThat(event.getAttempts()).isEqualTo(1);
+    assertThat(event.getLastError()).contains("LinkageError: missing class");
+  }
+
+  /** The bridge from a thrown {@link Throwable} to a booking's failure. */
+  @Test
+  void asFailure_keepsARuntimeException_wrapsAnythingElse() {
+    IllegalStateException runtime = new IllegalStateException("x");
+    assertThat(OutboxRelayWorker.asFailure(runtime)).isSameAs(runtime);
+    Error error = new OutOfMemoryError("heap");
+    assertThat(OutboxRelayWorker.asFailure(error))
+        .isInstanceOf(OutboxSendError.class)
+        .hasMessage("OutOfMemoryError: heap")
+        .hasCause(error);
   }
 
   // ------------------------------------------------------------ the lease guard
@@ -1276,7 +1465,7 @@ class OutboxRelayWorkerTests {
   }
 
   /**
-   * OUTBOX-QUEUED-LEASE-STARVATION-1 (1.8.1): a row this pod still holds queued is never claimed
+   * OUTBOX-QUEUED-LEASE-STARVATION-1 (1.9.0): a row this pod still holds queued is never claimed
    * again - not even once its lease lapsed in the queue. It keeps its place; when the slot frees it
    * is renewed under its own, untaken lease and sent once. Up to 1.8.0 the next pass claimed it
    * again and queued it at the tail, and its old place was dropped as lost.
@@ -1312,6 +1501,57 @@ class OutboxRelayWorkerTests {
       assertThat(delivered).containsExactly(1L, 2L); // sent once, in its place
       verify(repository).lockLeased(2L, claimed); // renewed under its own lease first
       assertThat(table.get(2L).getRelayedOn()).isNotNull();
+    } finally {
+      gate.countDown();
+      oneSlot.close();
+    }
+  }
+
+  /**
+   * 1.9.0 (K1): once no slot is live - the one slot busy with a send older than a second - the
+   * row waiting behind it is given back: its lease released in one guarded statement, due at
+   * once, the row out of the queue unsent; this pod may claim it again later, any pod now.
+   */
+  @Test
+  void aQueueBehindSlotsThatTurnedSlow_isGivenBack_unsent() {
+    CountDownLatch gate = new CountDownLatch(1);
+    List<Long> delivered = new CopyOnWriteArrayList<>();
+    OutboxConcurrentLane oneSlot = oneSlotHeldBy(gate, delivered);
+    OutboxRelayWorker ahead = workerOn(oneSlot);
+    concurrent(1L, null);
+    concurrent(2L, null);
+    when(repository.releaseLeases(any(), any(), any()))
+        .thenAnswer(
+            inv -> {
+              List<Long> ids = idsOf(inv.getArgument(0));
+              ids.forEach(
+                  id -> {
+                    table.get(id).setClaimedUntil(null);
+                    table.get(id).setNextAttemptOn(inv.getArgument(2));
+                  });
+              return ids.size();
+            });
+    try {
+      ahead.relayBatch(true); // row 1 holds the slot, row 2 waits in the queue
+      OffsetDateTime stamp = table.get(2L).getClaimedUntil();
+      ahead.giveBackStranded(); // the slot's send is young: nothing given back
+      verify(repository, never()).releaseLeases(any(), any(), any());
+
+      await()
+          .pollDelay(OutboxConcurrentLane.HORIZON.plusMillis(100))
+          .atMost(Duration.ofSeconds(5))
+          .until(() -> oneSlot.liveSlots() == 0);
+      ahead.giveBackStranded();
+
+      ArgumentCaptor<String> stamps = ArgumentCaptor.forClass(String.class);
+      verify(repository).releaseLeases(eq("{2}"), stamps.capture(), any());
+      assertThat(stamps.getValue()).startsWith("{\"" + stamp.toLocalDate());
+      assertThat(table.get(2L).getClaimedUntil()).isNull(); // due at once, for any pod
+      assertThat(oneSlot.queued()).isZero();
+      gate.countDown();
+      idle(oneSlot, 1);
+      assertThat(delivered).containsExactly(1L); // row 2 was not sent from the queue
+      assertThat(ahead.relayBatch(true).concurrent()).isEqualTo(1); // claimable again, here too
     } finally {
       gate.countDown();
       oneSlot.close();

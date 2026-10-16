@@ -1,6 +1,103 @@
 # Changelog
 
-## 1.8.1 - 2026-10-16
+## 1.9.0 - 2026-10-16
+
+The release of the relay invariants suite (OUTBOX-RELAY-INVARIANTS-IT-1): 39 scenarios that
+drive two or three real pods, a database behind a toxic proxy and a real broker through lane,
+lease, policy, outage, lifecycle and production shapes, and check six invariants against the
+table and the receiver at the end of every one (README "The invariants suite"). Everything the
+suite found is fixed here. Several fixes CHANGE BEHAVIOUR a consumer can see - read "Changed"
+before upgrading.
+
+### Changed
+
+- **A lease is a liveness lease; a running send renews it** (`LeasesIT` B4). Up to 1.8.0 nothing renewed a running send, so the lease had to exceed the publisher's
+  longest call, and a send of three times its lease on a live pod was taken over and delivered
+  twice. Now a heartbeat thread per pod (`opentmf-outbox-heartbeat`) renews the lease of every
+  send in flight once a third of it has run - one guarded statement for every renewal due - up
+  to the send's BOUND: the larger of its lease and its send timeout (`send-timeout`, or the
+  publisher's new `sendTimeout(event)`). A pod that dies stops renewing, and its rows are
+  taken over once their leases lapse, as before. A send still running at its bound is presumed
+  hung: the heartbeat interrupts its thread once (best effort) and leaves the lease to lapse.
+- **A lapsed lease counts as a failed attempt - when its send was under way**
+  (`LanesIT` A2b, A4b). Up to 1.8.0 a lapse was never counted: a send that always outlived its
+  lease was re-sent every lease, forever (35 sends in a minute, attempts 0), and its ORDERED
+  lane or its ordering key stalled behind it (0 of 6 rows behind it sent). The row now carries
+  `sending_since` (changeset 007) once its send is known to be under way - set by the renewal
+  right before the send, or by the heartbeat a third of the lease in; every booking and every
+  claim clears it. The next claim of a row whose lease lapsed while it was set books the lapse
+  like any failure - `OutboxLeaseLapsedException`, the publisher's backoff, then its budget
+  parks or drops the row, the booking hook sees it - and does not send on that claim. A lease
+  that lapses on a row held UNSENT (queued for a slot, behind an ORDERED head, dropped by a
+  graceful stop) costs the row nothing.
+- **Leases, retries and holds keep the database's time, never a pod's own clock**
+  (OutboxClock, `LeasesIT` B5). Up to 1.8.0 every pod used its JVM clock: a pod 5 min ahead took
+  rows under another pod's live lease, a pod 5 min behind stamped leases that had already
+  lapsed for every other pod, and a row appended by a pod ahead was not due for 5 min. The
+  library now keeps time as the JVM clock plus an offset measured against the database
+  (`select clock_timestamp()`, half a round trip's accuracy) at relay start and every 30 s - for
+  every lease, due time, booking instant, cancel test and the append's `created_on`. A skew
+  above a second is logged as a WARN. Not a literal `now()` in each statement: the holder must
+  know the exact stamp it guards on, which would cost a round trip on every stamp, renewal and
+  booking.
+- **Anything a publisher, a booking hook or a relayed listener throws is a failed attempt**
+  (`PoliciesIT` C5). Up to 1.8.0 an `Error` (a `StackOverflowError`, a `LinkageError`) escaped
+  the relay: it killed the ORDERED lane's thread or a CONCURRENT worker on every attempt,
+  booked nothing, and the row was re-sent every lease, forever. A booking hook that threw on
+  every booking was redelivered forever too: the failure booking called the hook again and
+  booked nothing. Now an `Error` is booked as the cause of an `OutboxSendError`, under the
+  publisher's policy; a failure booking whose hook throws again is booked once more WITHOUT
+  the hook, so the attempt counts. No throwable leaves a relay, lane or heartbeat thread, and
+  the sweep can no longer be cancelled by one.
+- **The HTTP publisher's plain client has timeouts** (`HttpIT` F4): `opentmf.outbox.http
+  .connect-timeout` (default 10 s) and `opentmf.outbox.http.read-timeout` (default: the larger
+  of `lease` and `send-timeout`, less a tenth - 108 s with the defaults; when set it must be
+  below that larger value, validated at startup). Up to 1.8.0 it had none: a receiver that
+  never answered held the send - and its lease - for as long as it liked, and the row was taken
+  over unbooked. The client is the one `RestClient.create()` picks from the classpath (Apache
+  HttpClient 5, Jetty, Reactor Netty, else the JDK's), its timeouts set; Apache takes the read
+  timeout only. A profile's client keeps its own timeouts - set them below its rows' lease.
+- **Only a 2xx relays an HTTP row** (`HttpIT` F5). A 3xx was booked RELAYED although the
+  receiver never processed the request; it now fails the attempt (`RestClientResponseException`
+  naming the status and the `Location`) and is never followed into a second POST.
+- **A row naming an unknown client profile parks** (`HttpIT` F1). It went out through the plain
+  client, without the profile's authentication. A row that names a profile the resolver does
+  not know - or names one while no `OutboxClientProfileResolver` exists - is refused with a
+  `TerminalOutboxException` naming the profile and parks at once. A row that names no profile
+  keeps the base-url match and the plain fallback.
+- **The Kafka publisher waits for its producer's own verdict** (`KafkaIT` E1b). Up to 1.8.0 the
+  wait for the acknowledgement ended at `send-timeout` while the record stayed in the
+  producer's buffer: the row backed off, its key's next row passed it from another pod's
+  producer, and the buffered record landed later - after a 20 s broker outage one aggregate
+  reached the topic as `[..60, 90, 75..]` on `kafka.lane: CONCURRENT`, and "never in flight
+  together" was not true. The acknowledgement is now awaited for the producer's
+  `delivery.timeout.ms` plus `linger.ms` (at least `send-timeout`), and the publisher declares
+  the whole send - `max.block.ms` included - as its `sendTimeout`, which the heartbeat keeps the
+  lease for: the key stays in flight until the broker or the producer answers. **The cost:**
+  during a broker outage each Kafka send holds its slot up to the producer's delivery timeout
+  (120 s by default, plus 60 s of `max.block.ms`) - lower them on the producer to fail faster.
+- **"In flight" means claimed** (`PoliciesIT` C3, `OpsIT` H1). Since 1.6.0's hand-off queue a
+  live lease covers a row waiting for a slot (about a second at most) as well as a row being
+  sent, and the database cannot tell them apart. The cancel refusal (`OutboxRowInFlightException`,
+  409) now says so - "claimed by a relay ... queued for its send or sending; cancellable once
+  it is booked" - instead of "its send may be delivering now"; the inspect's `inFlight` and the
+  OAS fragment's cancel description read the same way.
+
+- **Pool sizing:** the send heartbeat's renewal (or a give-back) can hold a connection beside
+  the claim, an ORDERED booking, the gauges and every slot's booking. Size the pool above
+  `concurrent.max-in-flight` + 4 (was + 3).
+
+### Added
+
+- **Changeset 007** (`sending_since`, nullable, no index - read only on rows a claim holds).
+- **`OutboxPublisher.sendTimeout(event)`** (default null = `send-timeout`): how long one send
+  may run before it is presumed hung.
+- **`OutboxLeaseLapsedException`** and **`OutboxSendError`** - the failures a booking hook sees
+  for a counted lapse and for an `Error`.
+- **`OutboxClock`** - the outbox's time as a bean; a consumer's own bean replaces it (the
+  invariants suite skews a pod's clock through it).
+- **`opentmf.outbox.http.connect-timeout`, `opentmf.outbox.http.read-timeout`.**
+- **The invariants suite** (`org.opentmf.outboxinvariants`, failsafe; about 45 min).
 
 ### Fixed
 
@@ -11,11 +108,18 @@
   next pass claimed it AGAIN and queued it at the tail, and its old place was dropped as lost.
   On a flow service no Kafka row (15 s lease) went out for six minutes behind HTTP sends of
   about 36 s; one urgent row waited 256 s. Now:
-  - **the queue runs only as deep as the slots start within about a second**:
-    `max-in-flight` × 1 s / the moving average of a send, at most `batch-size`. With fast sends
-    that is the 1.6.0 queue; with sends slower than a second per slot it is none - the claim
-    takes only the free slots, and no row waits behind a busy one. Nothing is claimed ahead
-    before a send has been measured;
+  - **the queue runs only as deep as the slots start within about a second**: the LIVE slots
+    × 1 s / the moving average of a send, at most `batch-size` - a slot busy with a send older
+    than a second is not live, whatever the average says. With fast sends that is the 1.6.0
+    queue; with sends slower than a second per slot it is none - the claim takes only the free
+    slots, and no row waits behind a busy one. Nothing is claimed ahead before a send has been
+    measured;
+  - **a queue stranded behind slots that turned slow is given back**: rows claimed in the second
+    before every slot became busy with a send older than a second leave the queue unsent, their
+    leases released in one guarded statement, due at once for any pod with a free slot. A lane
+    that mixes fast Kafka rows with 30-40 s HTTP legs (`ProductionShapesIT` K1, the flow's
+    shape) thus never parks a row behind its slow sends while another pod is idle: the longest
+    wait with a free slot anywhere fell from 32 s to under half a second;
   - **a pod never claims a row it still holds queued**, not even once its lease lapsed there:
     the row keeps its place, and it is leased again when it leaves the queue (guarded on its
     stamp, as before for a row that waited a tenth of its lease).

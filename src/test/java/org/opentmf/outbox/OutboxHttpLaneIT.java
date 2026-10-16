@@ -286,7 +286,7 @@ class OutboxHttpLaneIT {
 
   /**
    * The cap under a burst: 20 rows to 20 receivers, every receiver holding its request - exactly
-   * {@code max-in-flight} (8) SENDS are ever in flight. Since 1.8.1 nothing waits leased behind the
+   * {@code max-in-flight} (8) SENDS are ever in flight. Since 1.9.0 nothing waits leased behind the
    * held sends: the queue's depth follows the sends, and no send has completed - so the other 12
    * stay unclaimed in the table (the in-flight gauge counts the 8 sending) until a slot frees, and
    * all 20 relay once the receivers answer. (1.6.0 to 1.8.0 leased all 20 and queued 12 behind the

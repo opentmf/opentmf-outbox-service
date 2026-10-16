@@ -3,10 +3,9 @@ package org.opentmf.outbox;
 import com.querydsl.core.BooleanBuilder;
 import com.querydsl.core.types.Predicate;
 import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.opentmf.outbox.internal.OutboxAppended;
+import org.opentmf.outbox.internal.OutboxClock;
 import org.opentmf.outbox.internal.OutboxEventRepository;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.Page;
@@ -30,7 +29,6 @@ import org.springframework.transaction.annotation.Transactional;
  * never meets a live lease: only a booking parks a row, and the booking clears the lease.
  */
 @Slf4j
-@RequiredArgsConstructor
 public class OutboxMaintenanceService {
 
   /** The open ends of an unpark range: before any row was parked, after any will be. */
@@ -41,6 +39,26 @@ public class OutboxMaintenanceService {
   private final OutboxEventRepository repository;
   private final OutboxProperties properties;
   private final ApplicationEventPublisher eventPublisher;
+  private final OutboxClock clock;
+
+  public OutboxMaintenanceService(
+      OutboxEventRepository repository,
+      OutboxProperties properties,
+      ApplicationEventPublisher eventPublisher) {
+    this(repository, properties, eventPublisher, OutboxClock.system());
+  }
+
+  /** On the outbox's time (1.9.0): the cancel's in-flight test, the prune cutoff, an unpark. */
+  public OutboxMaintenanceService(
+      OutboxEventRepository repository,
+      OutboxProperties properties,
+      ApplicationEventPublisher eventPublisher,
+      OutboxClock clock) {
+    this.repository = repository;
+    this.properties = properties;
+    this.eventPublisher = eventPublisher;
+    this.clock = clock;
+  }
 
   /**
    * Prunes the TERMINAL rows older than {@code opentmf.outbox.retention} (default 7 days):
@@ -56,7 +74,7 @@ public class OutboxMaintenanceService {
    * multi-million row table, never finished.
    */
   public OutboxPruneResult pruneExpired() {
-    OffsetDateTime cutoff = OffsetDateTime.now(ZoneOffset.UTC).minus(properties.getRetention());
+    OffsetDateTime cutoff = clock.now().minus(properties.getRetention());
     long deadline = System.nanoTime() + properties.getMaintenance().getTimeBudget().toNanos();
     int batch = properties.getMaintenance().getBatchSize();
     long relayed = 0;
@@ -112,8 +130,9 @@ public class OutboxMaintenanceService {
    * is by name:
    *
    * @throws IllegalArgumentException when no row has the given id
-   * @throws OutboxRowInFlightException when a relay holds a live lease on the row - its send may
-   *     be delivering now (1.4.0); cancel again once it is booked
+   * @throws OutboxRowInFlightException when a relay holds a live lease on the row - it is claimed:
+   *     queued for its send or sending, which the database cannot tell apart (1.4.0); cancellable
+   *     once it is booked
    * @throws IllegalStateException when the row is already relayed (the effect has left - a
    *     cancel cannot recall it) or already cancelled
    */
@@ -126,7 +145,7 @@ public class OutboxMaintenanceService {
     if (event.getCancelledOn() != null) {
       throw new IllegalStateException("Outbox row %d is already cancelled".formatted(outboxId));
     }
-    OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+    OffsetDateTime now = clock.now();
     if (event.getClaimedUntil() != null && event.getClaimedUntil().isAfter(now)) {
       // a LIVE lease: the publisher may be delivering right now - "cancelled" would be a lie
       throw new OutboxRowInFlightException(outboxId, event.getClaimedUntil());
@@ -160,7 +179,7 @@ public class OutboxMaintenanceService {
     }
     event.setParkedOn(null);
     event.setAttempts(0);
-    event.setNextAttemptOn(OffsetDateTime.now(ZoneOffset.UTC));
+    event.setNextAttemptOn(clock.now());
     eventPublisher.publishEvent(new OutboxAppended(outboxId, event.getLane()));
     log.info("Outbox row {} unparked - delivery will be retried", outboxId);
   }
@@ -201,7 +220,7 @@ public class OutboxMaintenanceService {
     long unparked = 0;
     boolean left = true;
     while (left && System.nanoTime() < deadline) {
-      OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+      OffsetDateTime now = clock.now();
       int done =
           reference == null
               ? repository.unparkBatch(now, destination, from, to, batch)
@@ -252,7 +271,7 @@ public class OutboxMaintenanceService {
     }
     return repository
         .findAll(composed, pageable)
-        .map(event -> OutboxRowView.of(event, false));
+        .map(event -> OutboxRowView.of(event, false, clock.now()));
   }
 
   /**
@@ -265,7 +284,7 @@ public class OutboxMaintenanceService {
   public OutboxRowView inspect(long outboxId) {
     return repository
         .findById(outboxId)
-        .map(event -> OutboxRowView.of(event, true))
+        .map(event -> OutboxRowView.of(event, true, clock.now()))
         .orElseThrow(
             () -> new IllegalArgumentException("Outbox row %d not found".formatted(outboxId)));
   }

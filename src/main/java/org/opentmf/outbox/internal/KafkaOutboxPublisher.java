@@ -7,6 +7,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxHeaders;
@@ -30,8 +31,16 @@ import tools.jackson.databind.ObjectMapper;
  * is the stored JSON STRING: the consumer's value serializer must be string-compatible.
  *
  * <p>When the template is transactional the send runs in a Kafka transaction; otherwise the
- * relay awaits the broker acknowledgement synchronously (at most {@code send-timeout}) so a
- * failure is observed before the booking.
+ * relay awaits the broker acknowledgement synchronously so a failure is observed before the
+ * booking - for as long as the PRODUCER may still deliver the record (1.9.0): its {@code
+ * delivery.timeout.ms} plus {@code linger.ms}, at least {@code send-timeout}. The row stays in
+ * flight - its key with it - until the broker or the producer answers. Up to 1.8.0 the wait ended
+ * at {@code send-timeout} while the record stayed in the producer's buffer: the row backed off,
+ * the key's next row passed it from another pod, and the buffered record landed later - one
+ * aggregate's events out of order on the topic after a broker outage. The cost: during an outage
+ * each Kafka send holds its slot up to the producer's delivery timeout (120 s by default - lower
+ * it on the producer to fail faster). {@link #sendTimeout} declares the whole wait, the producer's
+ * {@code max.block.ms} included, so the send heartbeat keeps the lease through it.
  *
  * <p>Lane ({@code opentmf.outbox.kafka.lane}, 1.5.0): ORDERED by default - the single relay
  * thread, {@code id} order within a pod, the ordered lease; with several relays rows interleave
@@ -48,6 +57,12 @@ class KafkaOutboxPublisher implements OutboxPublisher {
   private final ObjectMapper objectMapper;
   private final String serviceName;
 
+  /** How long the acknowledgement is awaited: the producer's delivery timeout plus its linger. */
+  private final Duration acknowledgementWait;
+
+  /** The whole send at most: the producer's {@code max.block.ms} first, then the wait above. */
+  private final Duration sendBound;
+
   KafkaOutboxPublisher(
       KafkaTemplate<Object, Object> kafkaTemplate,
       OutboxProperties properties,
@@ -57,6 +72,38 @@ class KafkaOutboxPublisher implements OutboxPublisher {
     this.properties = properties;
     this.objectMapper = objectMapper;
     this.serviceName = serviceName;
+    Map<String, Object> producer =
+        kafkaTemplate.getProducerFactory() == null
+            ? Map.of()
+            : kafkaTemplate.getProducerFactory().getConfigurationProperties();
+    Duration verdict =
+        millis(producer, ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG)
+            .plus(millis(producer, ProducerConfig.LINGER_MS_CONFIG))
+            .plus(Duration.ofSeconds(1)); // the producer's own expiry, then the callback
+    this.acknowledgementWait = longer(verdict, properties.getSendTimeout());
+    this.sendBound =
+        longer(
+            acknowledgementWait.plus(millis(producer, ProducerConfig.MAX_BLOCK_MS_CONFIG)),
+            properties.getSendTimeout());
+  }
+
+  /** A producer setting in milliseconds - the consumer's value, else Kafka's default. */
+  private static Duration millis(Map<String, Object> producer, String name) {
+    Object value = producer.get(name);
+    if (value == null) {
+      value = ProducerConfig.configDef().defaultValues().get(name);
+    }
+    return Duration.ofMillis(Long.parseLong(String.valueOf(value)));
+  }
+
+  private static Duration longer(Duration a, Duration b) {
+    return a.compareTo(b) >= 0 ? a : b;
+  }
+
+  /** The whole send: the producer's metadata wait, its delivery timeout and linger (1.9.0). */
+  @Override
+  public Duration sendTimeout(OutboxEvent event) {
+    return sendBound;
   }
 
   /** The DEFAULT publisher: everything that is not an http(s) URL is a topic name. */
@@ -127,7 +174,7 @@ class KafkaOutboxPublisher implements OutboxPublisher {
   private void awaitAcknowledgement(
       CompletableFuture<SendResult<Object, Object>> future, OutboxEvent event) {
     try {
-      future.get(properties.getSendTimeout().toMillis(), TimeUnit.MILLISECONDS);
+      future.get(acknowledgementWait.toMillis(), TimeUnit.MILLISECONDS);
     } catch (InterruptedException ex) {
       Thread.currentThread().interrupt();
       throw new KafkaException(

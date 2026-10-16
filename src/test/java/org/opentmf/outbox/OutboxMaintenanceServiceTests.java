@@ -113,8 +113,9 @@ class OutboxMaintenanceServiceTests {
 
   /**
    * OUTBOX-CANCEL-REFUSES-LIVE-LEASE-1 (1.4.0): a row IN FLIGHT - claimed under a live lease, on
-   * either lane - is refused: its publisher may be delivering right now, and a caller told
-   * "cancelled" would be lied to (1.2.x refused it by blocking behind the claim's lock).
+   * either lane - is refused: queued for its send or sending, which the database cannot tell
+   * apart, and a caller told "cancelled" would be lied to (1.2.x refused it by blocking behind
+   * the claim's lock).
    */
   @Test
   void cancel_refusesARowUnderALiveLease_onBothLanes() {
@@ -127,7 +128,8 @@ class OutboxMaintenanceServiceTests {
       assertThatThrownBy(() -> service.cancel(7L))
           .as(lane.name())
           .isInstanceOf(OutboxRowInFlightException.class) // an IllegalStateException: 409
-          .hasMessageContaining("in flight");
+          .hasMessageContaining("claimed by a relay") // queued or sending (1.9.0 wording)
+          .hasMessageContaining("cancellable once it is booked");
       assertThat(inFlight.getCancelledOn()).as(lane.name()).isNull();
     }
   }

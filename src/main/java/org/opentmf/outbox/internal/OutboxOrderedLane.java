@@ -72,7 +72,7 @@ class OutboxOrderedLane {
   private void run(Runnable batch) {
     try {
       batch.run(); // books and logs each row's outcome itself
-    } catch (RuntimeException ex) {
+    } catch (Throwable ex) { // nothing leaves the lane's thread (1.9.0: an Error killed it)
       log.error(
           "Outbox ORDERED batch failed; its unsent rows are redelivered once their leases lapse",
           ex);

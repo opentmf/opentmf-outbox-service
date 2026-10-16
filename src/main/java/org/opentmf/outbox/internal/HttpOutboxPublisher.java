@@ -6,8 +6,10 @@ import org.opentmf.outbox.OutboxClientProfileResolver;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxHeaders;
 import org.opentmf.outbox.OutboxPublisher;
+import org.opentmf.outbox.TerminalOutboxException;
 import org.springframework.http.MediaType;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
@@ -23,8 +25,16 @@ import tools.jackson.databind.ObjectMapper;
  * header of the same name - the Kafka leg does the same). The row's {@code reference} is
  * never sent.
  *
- * <p>Non-2xx answers throw (RestClient's default error handling), unwinding into the relay's
- * ordinary backoff-then-park bookkeeping.
+ * <p>Only a 2xx relays. A 4xx or 5xx throws (RestClient's default error handling) and a 3xx
+ * throws too (1.9.0 - booked RELAYED before, though the receiver never processed the request);
+ * a redirect is never followed into a second POST. Each unwinds into the relay's ordinary
+ * backoff-then-park bookkeeping.
+ *
+ * <p>A row that NAMES a client profile the resolver does not know (or with no resolver at all)
+ * is refused with a {@link TerminalOutboxException} naming the profile, and parks at once (1.9.0 -
+ * it went out through the plain client before, without the profile's authentication). A row that
+ * names none keeps the base-url match and the plain fallback. The plain client has a connect
+ * and a read timeout ({@code opentmf.outbox.http.*}, 1.9.0; none before).
  *
  * <p>Lane (1.3.0): CONCURRENT - an HTTP row never waits behind another receiver, and never holds
  * up an ORDERED row. The ordering key is the DESTINATION, so rows to one receiver are never in
@@ -86,15 +96,42 @@ class HttpOutboxPublisher implements OutboxPublisher {
             })
         .body(event.getPayload())
         .retrieve()
+        .onStatus(
+            status -> status.is3xxRedirection(),
+            (request, response) -> {
+              throw new RestClientResponseException(
+                  "%s from %s - only a 2xx relays; a redirect is not followed (Location: %s)"
+                      .formatted(
+                          response.getStatusCode(),
+                          event.getDestination(),
+                          response.getHeaders().getFirst("Location")),
+                  response.getStatusCode(),
+                  response.getStatusText(),
+                  response.getHeaders(),
+                  null,
+                  null);
+            })
         .toBodilessEntity();
   }
 
   private RestClient selectClient(OutboxEvent event) {
+    String profile = event.getClientProfile();
     if (profileResolver == null) {
+      if (profile != null) {
+        throw new TerminalOutboxException(
+            "Outbox row %d names the client profile '%s', and no OutboxClientProfileResolver"
+                    .formatted(event.getId(), profile)
+                + " is configured - not sent through the plain client");
+      }
       return plainClient;
     }
-    RestClient resolved =
-        profileResolver.resolve(event.getClientProfile(), event.getDestination());
+    RestClient resolved = profileResolver.resolve(profile, event.getDestination());
+    if (resolved == null && profile != null) {
+      throw new TerminalOutboxException(
+          "Outbox row %d names the client profile '%s', which the OutboxClientProfileResolver"
+                  .formatted(event.getId(), profile)
+              + " does not know - not sent through the plain client");
+    }
     return resolved != null ? resolved : plainClient;
   }
 

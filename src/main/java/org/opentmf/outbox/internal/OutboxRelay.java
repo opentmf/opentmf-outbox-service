@@ -39,14 +39,23 @@ class OutboxRelay {
   private final OutboxProperties properties;
   private final OutboxConcurrentLane lane;
   private final OutboxOrderedLane orderedLane;
+  private final OutboxSendHeartbeat heartbeat;
+  private final OutboxClock clock;
   private final AtomicBoolean passQueued = new AtomicBoolean();
   private final AtomicBoolean orderedDue = new AtomicBoolean(true);
 
   private ScheduledExecutorService executor;
 
-  /** Starts the single relay thread and schedules the sweep. */
+  /**
+   * Starts the single relay thread and schedules the sweep - after measuring the clock against
+   * the database (1.9.0), so no claim ever runs on the pod's own clock when the database answers -
+   * and the send heartbeat.
+   */
   @PostConstruct
   void start() {
+    clock.measure();
+    heartbeat.onBeat(worker::giveBackStranded); // a stranded hand-off queue goes back, 1.9.0
+    heartbeat.start();
     executor =
         Executors.newSingleThreadScheduledExecutor(
             runnable -> {
@@ -106,7 +115,7 @@ class OutboxRelay {
         }
         again = batch.concurrentFull() && lane.room() > 0;
       } while (again);
-    } catch (RuntimeException ex) {
+    } catch (Throwable ex) { // anything: a periodic task that throws is never run again
       orderedDue.set(true); // the failed claim may have been the ORDERED one
       log.error("Outbox relay pass failed; the sweep will retry", ex);
     }
@@ -123,6 +132,7 @@ class OutboxRelay {
     if (executor == null) {
       orderedLane.close();
       lane.close();
+      heartbeat.stop();
       return;
     }
     executor.shutdown();
@@ -137,5 +147,6 @@ class OutboxRelay {
     }
     orderedLane.close();
     lane.close();
+    heartbeat.stop(); // last: the sends of the graceful drain keep their leases
   }
 }

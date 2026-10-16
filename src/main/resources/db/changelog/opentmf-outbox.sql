@@ -214,3 +214,15 @@ comment on index ix_outbox_open_since_concurrent is 'Open rows of the CONCURRENT
 --rollback drop index concurrently if exists ix_outbox_open_since_concurrent;
 --rollback drop index concurrently if exists ix_outbox_open_since_ordered;
 --rollback drop index concurrently if exists ix_outbox_parked_lane;
+
+--changeset opentmf-outbox:007-outbox-sending-since
+-- 1.9.0: sending_since - when the current holder's send was known to be under way (the lease
+-- renewal right before a send, or the send heartbeat a third of the lease in). Every booking and
+-- every claim clears it. A lease that lapses while it is set counts as a failed attempt - so a
+-- send that never ends exhausts its row's budget instead of being re-sent every lease forever -
+-- and a lease that lapses on a row held unsent (claimed into a queue, behind an ORDERED head)
+-- costs the row nothing. No index: it is read only on rows a claim already holds.
+alter table outbox add column if not exists sending_since timestamp with time zone;
+
+comment on column outbox.sending_since is 'When the current holder''s send was known to be under way; a lease lapsing while set counts as a failed attempt (1.9.0).';
+--rollback alter table outbox drop column if exists sending_since;

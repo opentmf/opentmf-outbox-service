@@ -116,6 +116,40 @@ public interface OutboxEventRepository
   int stampLeases(@Param("stamp") OffsetDateTime stamp, @Param("ids") String ids);
 
   /**
+   * The send heartbeat ({@link OutboxClaimSql#RENEW_SENDING}, 1.9.0): renews the leases of rows
+   * this pod is sending, each guarded on its stamp, and marks the sends as under way.
+   *
+   * @param ids the rows as a PostgreSQL array literal, e.g. {@code {7,12}}
+   * @param stamps each row's current lease end, in the same order, e.g. {@code {"2026-..Z",..}}
+   * @param renewed each row's new lease end, in the same order
+   * @param since when each row's send started, in the same order
+   * @return the ids renewed - a row missing is no longer this holder's
+   */
+  @Query(value = OutboxClaimSql.RENEW_SENDING, nativeQuery = true)
+  List<Long> renewSending(
+      @Param("ids") String ids,
+      @Param("stamps") String stamps,
+      @Param("renewed") String renewed,
+      @Param("since") String since);
+
+  /**
+   * Gives queued rows back ({@link OutboxClaimSql#RELEASE}, 1.9.0): their leases cleared, each
+   * guarded on its stamp, due at once.
+   *
+   * @param ids the rows as a PostgreSQL array literal, e.g. {@code {7,12}}
+   * @param stamps each row's lease end, in the same order
+   * @return the rows released
+   */
+  @Modifying
+  @Query(value = OutboxClaimSql.RELEASE, nativeQuery = true)
+  int releaseLeases(
+      @Param("ids") String ids, @Param("stamps") String stamps, @Param("now") OffsetDateTime now);
+
+  /** The database's clock ({@code clock_timestamp()}, no table read) - the outbox's time (1.9.0). */
+  @Query(value = "select clock_timestamp()", nativeQuery = true)
+  Instant databaseNow();
+
+  /**
    * The RELAYED booking in ONE statement ({@link OutboxClaimSql#BOOK_RELAYED}), guarded on the
    * lease this holder stamped: the booked row, managed - or empty when the lease lapsed and
    * another holder re-stamped the row (or booked it), and the caller books nothing.

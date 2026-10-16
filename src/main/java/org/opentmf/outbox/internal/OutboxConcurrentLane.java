@@ -1,7 +1,11 @@
 package org.opentmf.outbox.internal;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -21,9 +25,14 @@ import org.springframework.core.task.TaskRejectedException;
  * threads at runtime). {@link SimpleAsyncTaskExecutor} starts one thread per worker and has no
  * bound of its own, so the permits are the thread bound as well.
  *
- * <p>HOW FAR AHEAD the relay claims follows the sends (1.8.1): the queue holds no more rows than
- * the slots start within {@link #HORIZON} - {@code max-in-flight x 1 s / send time}, from a moving
- * average of the sends, and never more than {@code capacity} (the relay's {@code batch-size}). With
+ * <p>HOW FAR AHEAD the relay claims follows the sends (1.9.0): the queue holds no more rows than
+ * the slots start within {@link #HORIZON} - {@code live slots x 1 s / send time}, from a moving
+ * average of the sends, and never more than {@code capacity} (the relay's {@code batch-size}). A
+ * slot is LIVE unless its current send has run longer than the horizon: a slot busy with a slow
+ * send starts nothing soon, whatever the average says - so a lane that mixes fast sends with slow
+ * ones never queues a row behind its slow ones. Rows queued in the second before the slots turned
+ * slow are GIVEN BACK ({@link #evictStranded}): once no slot is live, the relay releases their
+ * leases and any pod with a free slot takes them. With
  * fast sends that is the 1.6.0 queue, and the claim's cost stays off the sends' path; with sends
  * slower than a second per slot it is NONE: the claim takes only the free slots, and no row waits
  * behind a busy slot while its lease runs out. A queued row thus waits about a second at most.
@@ -51,11 +60,17 @@ class OutboxConcurrentLane {
   private final int capacity;
   private final SimpleAsyncTaskExecutor executor;
   private final boolean virtual;
-  private final Queue<Runnable> queue = new ConcurrentLinkedQueue<>();
+  private final Queue<Queued> queue = new ConcurrentLinkedQueue<>();
+
+  /** A queued send and the row it sends ({@code -1}: no row, never given back). */
+  private record Queued(long rowId, Runnable send) {}
   private final AtomicInteger queued = new AtomicInteger();
   private final AtomicReference<Runnable> onRoom = new AtomicReference<>(() -> {});
   /** Moving average of one send (renewal, send, booking), in nanoseconds; 0 = none measured yet. */
   private final AtomicLong sendNanos = new AtomicLong();
+
+  /** When each worker's current send started ({@link System#nanoTime()}), by worker thread. */
+  private final Map<Thread, Long> sendStarted = new ConcurrentHashMap<>();
   private volatile boolean closed;
 
   OutboxConcurrentLane(int maxInFlight, int capacity, boolean virtual, Duration shutdownGrace) {
@@ -86,16 +101,24 @@ class OutboxConcurrentLane {
   }
 
   /**
-   * How many rows the queue holds ahead of the slots: as many as the slots start within the
-   * {@link #HORIZON}, at most the capacity; none before a send has been measured, and none while a
-   * send takes longer than the horizon per slot - a queued row would only wait behind them.
+   * How many rows the queue holds ahead of the slots: as many as the LIVE slots start within the
+   * {@link #HORIZON}, at most the capacity; none before a send has been measured, none while a
+   * send takes longer than the horizon per slot, and none while every slot is busy with a send
+   * older than the horizon - a queued row would only wait behind them.
    */
   int depth() {
     long send = sendNanos.get();
     if (send == 0) {
       return 0;
     }
-    return (int) Math.min(capacity, maxInFlight * HORIZON.toNanos() / send);
+    return (int) Math.min(capacity, liveSlots() * HORIZON.toNanos() / send);
+  }
+
+  /** The slots that are free, or busy with a send younger than the horizon. */
+  int liveSlots() {
+    long now = System.nanoTime();
+    long slow = sendStarted.values().stream().filter(t -> now - t >= HORIZON.toNanos()).count();
+    return (int) Math.max(0, maxInFlight - slow);
   }
 
   /**
@@ -128,13 +151,40 @@ class OutboxConcurrentLane {
    * @return whether the send was queued
    */
   boolean submit(Runnable send) {
+    return submit(-1, send);
+  }
+
+  /** {@link #submit(Runnable)} for row {@code rowId} - which {@link #evictStranded} may give back. */
+  boolean submit(long rowId, Runnable send) {
     if (closed) {
       return false;
     }
     queued.incrementAndGet(); // first: a worker's poll never drives the count below zero
-    queue.add(send);
+    queue.add(new Queued(rowId, send));
     startWorkers();
     return true;
+  }
+
+  /**
+   * Takes the queued rows out of the queue - unsent - while NO slot is live: every slot is busy
+   * with a send older than the {@link #HORIZON}, so a queued row would only wait behind them. They
+   * were claimed in the second before the slots turned slow; the caller gives their leases back,
+   * for any pod with a free slot. A send a worker took meanwhile stays taken.
+   *
+   * @return the rows taken out; none while a slot is live
+   */
+  List<Long> evictStranded() {
+    if (queued.get() == 0 || liveSlots() > 0) {
+      return List.of();
+    }
+    List<Long> evicted = new ArrayList<>();
+    for (Queued entry : queue) {
+      if (entry.rowId() >= 0 && queue.remove(entry)) {
+        queued.decrementAndGet();
+        evicted.add(entry.rowId());
+      }
+    }
+    return evicted;
   }
 
   /** One worker per free slot while sends wait. */
@@ -157,9 +207,17 @@ class OutboxConcurrentLane {
    */
   private void work() {
     try {
-      for (Runnable send = poll(); send != null; send = poll()) {
+      for (Queued next = poll(); next != null; next = poll()) {
+        Runnable send = next.send();
         long started = System.nanoTime();
-        send.run(); // never throws - the relay worker catches and logs
+        sendStarted.put(Thread.currentThread(), started);
+        try {
+          send.run(); // the relay worker catches and logs; this guard is the last line
+        } catch (Throwable ex) {
+          log.error("Outbox send worker caught what a send threw - the worker goes on", ex);
+        } finally {
+          sendStarted.remove(Thread.currentThread());
+        }
         sendTook(System.nanoTime() - started);
       }
     } finally {
@@ -169,15 +227,15 @@ class OutboxConcurrentLane {
     }
   }
 
-  private Runnable poll() {
+  private Queued poll() {
     if (closed) {
       return null;
     }
-    Runnable send = queue.poll();
-    if (send != null && queued.decrementAndGet() == depth() / 2) {
+    Queued next = queue.poll();
+    if (next != null && queued.decrementAndGet() == depth() / 2) {
       onRoom.get().run(); // half drained: time for the next claim
     }
-    return send;
+    return next;
   }
 
   /**
