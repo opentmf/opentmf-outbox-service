@@ -83,10 +83,20 @@ library never imports that BOM (direct property pins in the pom).
   (`OutboxOpsWireConformanceTests`, `OutboxOpsProblemDetailsIT` with Boot problem details and
   the toolkit guard on REJECT). tmf630-toolkit 3.5.1, central-publishing 0.12.0. A new error
   answer on the ops surface must land in the fragment, or `OpsFragmentConformance` is red.
+- **1.8.0 (2026-10-16)** - #14: OUTBOX-CONCURRENT-CLAIM-INDEPENDENT-1 (`OutboxOrderedLane`, thread
+  `opentmf-outbox-ordered`, sends ORDERED batches; the relay thread only claims; ONE ORDERED batch
+  per pod - the relay claims ORDERED only while the lane is idle, the lane's onIdle nudges it;
+  `OutboxLaneIndependenceIT`; pool `max-in-flight` + 3), OUTBOX-FRAGMENT-ERROR-MEDIA-TYPE-REFINABLE-1
+  (every error in the paths a `$ref`; `x-opentmf-refinable: content` on the 8 library refusals =
+  description + headers verbatim, content the consumer's; `true` still exactly the 6 consumer
+  answers + `OutboxProblem`; `OutboxOpsFragmentDriftRuleTests` is the drift rule as code),
+  OUTBOX-UNPARK-FILTER-STRICT-TYPES-1 (body bound as a JSON object, `UnparkFilter.from` types it -
+  never the consumer's mapper, never coerced). `OutboxClaimPlanIT`'s idle gauges pin open-row
+  indexes + a buffer bound, not an index: two EMPTY partial indexes tie in the planner.
 
 ## Open
 
-- Develop is `1.7.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
-  heading `## 1.7.1 - <date>` (or the next minor's, if the row is a minor).
+- Develop is `1.8.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
+  heading `## 1.8.1 - <date>` (or the next minor's, if the row is a minor).
 - Nothing open. OUTBOX-UNUSED-INDEX-1 was closed by Gökhan on 2026-10-15: keep
   `ix_outbox_pending` (measured the most-scanned index on every outbox table).
