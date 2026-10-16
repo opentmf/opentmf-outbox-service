@@ -294,6 +294,75 @@ class OutboxOpsOpenApiTests {
   }
 
   @Test
+  @DisplayName(
+      "every error is a $ref to a marked component: true for the consumer's own answers, content"
+          + " for the library's refusals the consumer renders")
+  void everyErrorIsAMarkedComponent() {
+    Set<String> wholly = new TreeSet<>(CONSUMER_ANSWERS.keySet());
+    wholly.add("415");
+    operations()
+        .forEach(
+            (name, op) -> {
+              @SuppressWarnings("unchecked")
+              Map<String, Object> responses = (Map<String, Object>) op.get("responses");
+              responses.forEach(
+                  (code, response) -> {
+                    if (code.startsWith("2")) {
+                      assertThat(resolved(response)).as("%s %s", name, code).doesNotContainKey(REFINABLE);
+                      return;
+                    }
+                    // the paths stay verbatim for every consumer: an error is never inline
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> asWritten = (Map<String, Object>) response;
+                    assertThat(asWritten).as("%s %s", name, code).containsOnlyKeys("$ref");
+                    Object marker = resolved(response).get(REFINABLE);
+                    assertThat(marker)
+                        .as("%s %s is marked", name, code)
+                        .isEqualTo(wholly.contains(code) ? (Object) Boolean.TRUE : "content");
+                  });
+            });
+  }
+
+  @Test
+  @DisplayName("a content-refinable response names when it happens and documents a default rendering")
+  void aContentRefinableResponse_keepsItsMeaning_andADefaultContent() {
+    @SuppressWarnings("unchecked")
+    Map<String, Map<String, Object>> responses =
+        (Map<String, Map<String, Object>>) (Map<?, ?>) components("responses");
+    Set<String> content = new TreeSet<>();
+    responses.forEach(
+        (name, response) -> {
+          if ("content".equals(response.get(REFINABLE))) {
+            content.add(name);
+            assertThat(response.get("description").toString())
+                .as("%s names when it happens, never a media type - that is the content's", name)
+                .isNotBlank()
+                .doesNotContain("application/");
+            assertThat(response).as(name).containsKey("content");
+          }
+        });
+    assertThat(content)
+        .containsExactlyInAnyOrder(
+            "outboxBadRequest",
+            "outboxRangeNotSatisfiable",
+            "outboxRowIdOutOfRange",
+            "outboxRowNotFound",
+            "outboxInspectBadRequest",
+            "outboxUnparkConflict",
+            "outboxCancelConflict",
+            "outboxUnparkFilterBadRequest");
+    // the marker has exactly two values
+    @SuppressWarnings("unchecked")
+    Map<String, Map<String, Map<String, Object>>> all =
+        (Map<String, Map<String, Map<String, Object>>>) fragment().get("components");
+    all.values().stream()
+        .flatMap(defs -> defs.values().stream())
+        .map(def -> def.get(REFINABLE))
+        .filter(marker -> marker != null)
+        .forEach(marker -> assertThat(marker).isIn(Boolean.TRUE, "content"));
+  }
+
+  @Test
   @DisplayName("every $ref of the fragment resolves inside the fragment")
   void everyReferenceResolves() {
     List<String> refs = new ArrayList<>();

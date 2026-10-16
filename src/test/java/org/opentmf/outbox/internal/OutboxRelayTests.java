@@ -20,7 +20,7 @@ import org.opentmf.outbox.internal.OutboxRelayWorker.Batch;
 /**
  * One relay thread; pokes drain and coalesce - however many arrive during a pass, ONE follow-up
  * pass; room in the CONCURRENT lane nudges; the ORDERED claim runs only when ORDERED rows may be
- * due AND the ORDERED lane is idle, and the lane going idle nudges it (1.7.1); a pass survives
+ * due AND the ORDERED lane is idle, and the lane going idle nudges it (1.8.0); a pass survives
  * worker exceptions; lifecycle is safe and closes both lanes.
  */
 class OutboxRelayTests {
@@ -286,7 +286,7 @@ class OutboxRelayTests {
     relay.sweep(); // the sweep always claims it
     fullOrdered.set(1);
     relay.pokeOrdered();
-    relay.relayPass(); // a full ORDERED batch: the pass ends, the claim stays armed (1.7.1)
+    relay.relayPass(); // a full ORDERED batch: the pass ends, the claim stays armed (1.8.0)
     relay.relayPass(); // the next pass (the idle lane's nudge) claims it again
     relay.relayPass();
 
@@ -294,7 +294,7 @@ class OutboxRelayTests {
   }
 
   /**
-   * OUTBOX-CONCURRENT-CLAIM-INDEPENDENT-1 (1.7.1): while the ORDERED lane sends a batch, a pass
+   * OUTBOX-CONCURRENT-CLAIM-INDEPENDENT-1 (1.8.0): while the ORDERED lane sends a batch, a pass
    * claims the CONCURRENT lane alone and the ORDERED claim stays armed; the lane going idle
    * nudges the relay, and that pass claims the ORDERED lane.
    */

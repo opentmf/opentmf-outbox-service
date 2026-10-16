@@ -77,7 +77,7 @@ class OutboxRelayWorkerTests {
   /** Two slots, a hand-off queue of two: a claim takes at most two CONCURRENT rows. */
   private final OutboxConcurrentLane lane =
       new OutboxConcurrentLane(2, 2, false, Duration.ofSeconds(5));
-  /** The ORDERED lane's one thread (1.7.1): a batch is sent off the calling thread. */
+  /** The ORDERED lane's one thread (1.8.0): a batch is sent off the calling thread. */
   private final OutboxOrderedLane orderedLane = new OutboxOrderedLane(Duration.ofSeconds(5));
 
   /**
@@ -1094,7 +1094,7 @@ class OutboxRelayWorkerTests {
   }
 
   /**
-   * OUTBOX-CONCURRENT-CLAIM-INDEPENDENT-1 (1.7.1): the ORDERED batch is sent on the ORDERED lane's
+   * OUTBOX-CONCURRENT-CLAIM-INDEPENDENT-1 (1.8.0): the ORDERED batch is sent on the ORDERED lane's
    * thread, so the claim returns while it sends - and while it sends, the next batch claims the
    * CONCURRENT lane and leaves the ORDERED lane alone (one ORDERED batch in flight per pod).
    */

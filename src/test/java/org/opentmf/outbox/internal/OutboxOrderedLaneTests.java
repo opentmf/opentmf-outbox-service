@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 /**
- * The ORDERED lane (1.7.1): a batch runs on the lane's one daemon thread, never the caller's; one
+ * The ORDERED lane (1.8.0): a batch runs on the lane's one daemon thread, never the caller's; one
  * batch at a time - a second is refused while the first sends; the lane is idle again BEFORE it
  * nudges the relay, also after a failing batch; close lets the batch in flight finish within the
  * grace, interrupts it after, and refuses new batches.

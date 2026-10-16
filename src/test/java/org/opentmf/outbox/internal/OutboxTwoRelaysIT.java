@@ -68,7 +68,7 @@ class OutboxTwoRelaysIT {
   static final Set<Long> KEYED_SENT = ConcurrentHashMap.newKeySet();
   static final CountDownLatch KEYED_GATE = new CountDownLatch(1);
 
-  /** The threads ORDERED rows were sent on - each pod's ORDERED lane has its own (1.7.1). */
+  /** The threads ORDERED rows were sent on - each pod's ORDERED lane has its own (1.8.0). */
   static final Set<Thread> ORDERED_SENDERS = ConcurrentHashMap.newKeySet();
 
   @TestConfiguration

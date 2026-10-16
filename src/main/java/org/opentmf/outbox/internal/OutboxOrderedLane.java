@@ -10,7 +10,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import lombok.extern.slf4j.Slf4j;
 
 /**
- * The ORDERED lane (1.7.1): ONE daemon thread that sends a claimed ORDERED batch row after row, in
+ * The ORDERED lane (1.8.0): ONE daemon thread that sends a claimed ORDERED batch row after row, in
  * claim order - off the relay thread, which from now on only claims. Up to 1.7.0 the relay thread
  * sent the batch itself, so a slow receiver on the ORDERED lane (a hundred rows at a second each)
  * held back the CONCURRENT lane's next claim for the whole batch.

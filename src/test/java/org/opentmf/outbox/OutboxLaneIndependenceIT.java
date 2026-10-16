@@ -23,7 +23,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * OUTBOX-CONCURRENT-CLAIM-INDEPENDENT-1 (1.7.1): the CONCURRENT lane never waits behind an ORDERED
+ * OUTBOX-CONCURRENT-CLAIM-INDEPENDENT-1 (1.8.0): the CONCURRENT lane never waits behind an ORDERED
  * batch. Up to 1.7.0 the relay thread sent its ORDERED batch itself, so the next CONCURRENT claim
  * waited until the batch's last row was sent - measured on a flow service: 26 s without a
  * CONCURRENT row while ordered HTTP legs went out at about one a second. Here 100 ORDERED rows to a

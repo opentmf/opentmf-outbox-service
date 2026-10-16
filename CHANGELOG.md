@@ -1,6 +1,9 @@
 # Changelog
 
-## 1.7.1 - 2026-10-16
+## 1.8.0 - 2026-10-16
+
+A slow ORDERED receiver no longer stalls the CONCURRENT lane, and a consumer whose error model is
+not RFC 9457 can paste the ops fragment's paths verbatim.
 
 ### Fixed
 
@@ -26,6 +29,35 @@
 - **Shutdown:** the relay thread, then the ORDERED batch, then the CONCURRENT sends each get
   `shutdown-grace` in turn; what is not booked by then is redelivered once its lease lapses, as
   before.
+
+### Changed (the OAS fragment - re-paste it)
+
+- **Every error is a refinable component; the paths are verbatim for every error model**
+  (OUTBOX-FRAGMENT-ERROR-MEDIA-TYPE-REFINABLE-1). The 1.7.0 fragment documented the library's
+  own refusals - which the consumer renders - as `application/problem+json`, in four inline
+  path responses and three unmarked components. A consumer whose single advice answers every
+  error as `application/json` in its own error shape could not paste it without promising a
+  wrong media type. Now:
+  - the four inline responses are components: `outboxInspectBadRequest` (the inspect GET's
+    400), `outboxUnparkConflict` and `outboxCancelConflict` (the 409s), and
+    `outboxUnparkFilterBadRequest` (the bulk unpark's 400). Every error in the paths is a
+    `$ref`, so the paths are pasted verbatim, whatever the consumer's error model;
+  - the library's refusals are marked **`x-opentmf-refinable: content`**: `outboxBadRequest`,
+    `outboxRangeNotSatisfiable`, `outboxRowIdOutOfRange`, `outboxRowNotFound` and the four
+    new ones. Their `description` (when the answer happens) and `headers` are the library's and
+    stay verbatim; their `content` is the consumer's rendering, media types and schemas alike.
+    What ships is the default (Spring's RFC 9457 rendering and the toolkit's `Tmf630Error`),
+    and no such description names a media type any more;
+  - `x-opentmf-refinable: true` is unchanged: exactly the six consumer answers and
+    `OutboxProblem`, redefinable whole.
+  - A drift test compares the paths exactly, `content` components by description and headers,
+    `true` components by name, and everything else exactly (README "OAS fragment").
+    `OutboxOpsFragmentDriftRuleTests` is that rule as code: a verbatim paste and a consumer
+    that answers every error as its own JSON both pass with the paths untouched.
+- **Consumers:** re-paste the fragment (the paths changed: four inline error responses are
+  `$ref`s now). A drift test written for 1.7.0 keeps passing after the re-paste for a consumer
+  that refines only the `true` components; a consumer that refines a refusal's content adds
+  the `content` rule.
 
 ## 1.7.0 - 2026-10-15
 

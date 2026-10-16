@@ -108,7 +108,7 @@ public class OutboxAutoConfiguration {
   }
 
   /**
-   * The ORDERED lane (1.7.1): one thread that sends a claimed ORDERED batch row after row, off the
+   * The ORDERED lane (1.8.0): one thread that sends a claimed ORDERED batch row after row, off the
    * relay thread - so an ORDERED batch never holds back the CONCURRENT lane's next claim.
    */
   @Bean

@@ -130,7 +130,7 @@ sequenceDiagram
   this account: a row no publisher supports, or whose publisher throws while
   naming its lane, is stored without one and the relay books it as before.
   The **ORDERED** lane is one thread per pod: rows go one by one in `id`
-  order — the 1.2.x behaviour (its own thread since 1.7.1, so an ORDERED batch
+  order — the 1.2.x behaviour (its own thread since 1.8.0, so an ORDERED batch
   never holds back a CONCURRENT claim; the relay thread only claims); the
   Kafka publisher rides it by default (`opentmf.outbox.kafka.lane`, 1.5.0,
   below). The **CONCURRENT** lane sends rows
@@ -389,12 +389,12 @@ key ever had two sends overlapping and that each key's rows went in `id` order.
   ordering bullet above). So **`max-in-flight` is the lever**: one slot moves about
   1 / (send + 2 × statement time) rows a second. Each sending slot holds a database
   connection while it books, so size the pool above `max-in-flight` + 3 (the relay
-  thread's claim, the ORDERED lane's booking - concurrent with the claim since 1.7.1 - and
+  thread's claim, the ORDERED lane's booking - concurrent with the claim since 1.8.0 - and
   the gauges).
 - **`batch-size` is the claim-side lever**: a claim tops the queue up to it, so with many
   slots and slow statements a larger batch keeps them fed.
 - The ORDERED lane is unchanged in kind: its rows go one by one on one thread (its own
-  since 1.7.1), and one send plus its booking sets its pace.
+  since 1.8.0), and one send plus its booking sets its pace.
 
 ## Requirements
 
@@ -858,10 +858,10 @@ problem-detail mapper).
 | Code | On | Answered by | Component |
 |---|---|---|---|
 | 400 | the three lists | the toolkit (`Tmf630Error`, application/json) - with its undeclared-query-parameter guard on REJECT also for Spring's `page` / `size`; an unknown state leg: the library, rendered by the consumer (problem) | `outboxBadRequest` |
-| 400 | the three row routes | Spring's binding: digits beyond int64 (problem); on the inspect GET also the toolkit guard on REJECT: an undeclared query parameter (`Tmf630Error`) | `outboxRowIdOutOfRange` on the POSTs, inline on the GET |
-| 400 | the bulk unpark | the library (no destination) or Spring (unreadable body) | inline |
+| 400 | the three row routes | Spring's binding: digits beyond int64 (problem); on the inspect GET also the toolkit guard on REJECT: an undeclared query parameter (`Tmf630Error`) | `outboxRowIdOutOfRange` on the POSTs, `outboxInspectBadRequest` on the GET |
+| 400 | the bulk unpark | the library (no destination) or Spring (unreadable body) | `outboxUnparkFilterBadRequest` |
 | 404 | the three row routes | the library (no such row); an id that is not digits matches no route | `outboxRowNotFound` |
-| 409 | the single unpark and cancel | the library (the row is not in the state the action needs) | inline |
+| 409 | the single unpark and cancel | the library (the row is not in the state the action needs) | `outboxUnparkConflict`, `outboxCancelConflict` |
 | 416 | the three lists | the toolkit (`Tmf630Error`) | `outboxRangeNotSatisfiable` |
 | 401, 403, 503 | every operation | the consumer's security | `outboxUnauthorized`, `outboxForbidden`, `outboxServiceUnavailable` |
 | 405, 406 | every operation | the consumer's web layer (Spring MVC) | `outboxMethodNotAllowed`, `outboxNotAcceptable` |
@@ -878,15 +878,29 @@ guard switched to REJECT (opt-in since 3.5.0) its refusals are `Tmf630Error` too
 and on the inspect GET. The fragment documents that rendering: a
 consumer still on Boot's default error JSON (`application/json`, `{timestamp, status, error,
 path}`) turns problem details on, or renders Spring's `ErrorResponse`s as problems in its own
-advice, rather than editing the library's components.
+advice - or, if its error model is not RFC 9457 at all, refines the content as below.
 
-**Refinable by name.** The six answers of the consumer's security and web layer
-(`outboxUnauthorized`, `outboxForbidden`, `outboxMethodNotAllowed`, `outboxNotAcceptable`,
-`outboxUnsupportedMediaType`, `outboxServiceUnavailable`) and the `OutboxProblem` schema
-are the consumer's own answers, and they are marked `x-opentmf-refinable: true`. A consumer
-may REDEFINE a marked component under the SAME name — its own wording, headers such as
-`Retry-After` or `WWW-Authenticate`, its own problem schema — and the pasted paths stay
-verbatim:
+**Refinable by name.** Every error the paths name is a `$ref` to a component marked
+`x-opentmf-refinable`, so the pasted PATHS are verbatim for every consumer, whatever its error
+model. The marker has two values:
+
+- **`true`** — the consumer's own answers: the six of its security and web layer
+  (`outboxUnauthorized`, `outboxForbidden`, `outboxMethodNotAllowed`, `outboxNotAcceptable`,
+  `outboxUnsupportedMediaType`, `outboxServiceUnavailable`) and the `OutboxProblem` schema. A
+  consumer may REDEFINE such a component under the SAME name — its own wording, headers such
+  as `Retry-After` or `WWW-Authenticate`, its own problem schema.
+- **`content`** (1.8.0) — the library's refusals, which the consumer RENDERS: the 400s, 404,
+  409s and 416 (`outboxBadRequest`, `outboxRangeNotSatisfiable`, `outboxRowIdOutOfRange`,
+  `outboxRowNotFound`, `outboxInspectBadRequest`, `outboxUnparkConflict`,
+  `outboxCancelConflict`, `outboxUnparkFilterBadRequest`). Their `description` (when the
+  answer happens) and `headers` are the library's and stay verbatim; their `content` is the
+  consumer's error rendering, which may replace the media types and the schemas. What ships is
+  the default: Spring's RFC 9457 rendering and the toolkit's own `Tmf630Error`. Their
+  descriptions name no media type, so they stay true under any rendering.
+
+A problem+json consumer typically refines only `true` components; a consumer whose single
+advice answers every error as `application/json` in its own error shape refines the
+`content` of the refusals as well:
 
 ```yaml
 components:
@@ -894,11 +908,20 @@ components:
     OutboxProblem: { $ref: '#/components/schemas/ProblemDetail' }   # the consumer's problem
   responses:
     outboxServiceUnavailable: { $ref: '#/components/responses/SigningKeysUnavailable' }
+    outboxRowNotFound:          # `content`: the library's description, the consumer's body
+      x-opentmf-refinable: content
+      description: >-
+        No row with this id - the library's `ErrorResponse`, rendered by the consumer. ...
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
 ```
 
-Everything unmarked is the library's and is pasted verbatim. Consumers paste the `paths`
-and `components` into their own OAS under their own server URL and security, keep the
-component names, and pin themselves with a drift test that honours the marker:
+Everything unmarked (parameters, request bodies, 2xx, headers, the other schemas) is the
+library's and is pasted verbatim. Consumers paste the `paths` and `components` into their own
+OAS under their own server URL and security, keep the component names, and pin themselves with
+a drift test that honours both values (`OutboxOpsFragmentDriftRuleTests` is this rule as code,
+with a verbatim paste, an every-error-as-JSON consumer and a drifting one):
 
 ```java
 @Test
@@ -907,10 +930,14 @@ void theOpsSurfaceIsPastedAsTheLibraryDescribesIt() {
   Map<String, Object> theirs = new Yaml().load(OutboxOpsOpenApi.fragment());
   assertThat(opsPaths(mine)).isEqualTo(opsPaths(theirs)); // paths starting /ops/outbox
   components(theirs).forEach((kind, name, definition) -> {
-    if (Boolean.TRUE.equals(definition.get("x-opentmf-refinable"))) {
-      assertThat(components(mine, kind)).containsKey(name); // refined, same name
-    } else {
-      assertThat(components(mine, kind)).containsEntry(name, definition); // verbatim
+    Object marker = definition.get("x-opentmf-refinable");
+    Map<String, Object> ours = components(mine, kind).get(name);
+    assertThat(ours).as(name).isNotNull(); // under the library's name, always
+    if ("content".equals(marker)) { // the library's meaning, the consumer's body
+      assertThat(ours.get("description")).isEqualTo(definition.get("description"));
+      assertThat(ours.get("headers")).isEqualTo(definition.get("headers"));
+    } else if (!Boolean.TRUE.equals(marker)) {
+      assertThat(ours).isEqualTo(definition); // verbatim
     }
   });
 }
@@ -918,7 +945,8 @@ void theOpsSurfaceIsPastedAsTheLibraryDescribesIt() {
 
 The library's own guard (`OutboxOpsOpenApiTests`) keeps the fragment equal to the
 controller's mappings and its `OutboxRow` schema equal to `OutboxRowView`'s fields, and pins
-the per-operation error codes, a body on every error, the refinable set and that every
+the per-operation error codes, a body on every error, that every error is a `$ref` to a
+marked component (`true` or `content`, nothing inline), the refinable sets and that every
 `$ref` resolves. `OutboxRoundTripIT` pins the paging behaviour against the real toolkit, and
 `OpsFragmentConformance` (used by `OutboxOpsWireConformanceTests` and
 `OutboxOpsProblemDetailsIT`) checks each provoked answer's status AND media type against

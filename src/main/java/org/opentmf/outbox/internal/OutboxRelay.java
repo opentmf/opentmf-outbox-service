@@ -18,13 +18,13 @@ import org.opentmf.outbox.internal.OutboxRelayWorker.Batch;
  * the after-commit nudge (normal path, milliseconds), room in the CONCURRENT lane's hand-off
  * queue, the ORDERED lane going idle, and a fixed-delay sweep (default 5s - "timers are for the
  * tail"). Nudges coalesce: while a pass is queued, another nudge adds nothing - so any number of
- * nudges during a pass make ONE follow-up pass. The relay thread only CLAIMS (1.7.1): each lane
+ * nudges during a pass make ONE follow-up pass. The relay thread only CLAIMS (1.8.0): each lane
  * sends on its own threads, so no send - however slow - delays the other lane's next claim. A
  * pass drains the CONCURRENT lane: it claims again while that claim comes back full and the
  * queue has room.
  *
  * <p>The ORDERED claim runs only when ORDERED rows may be due (1.6.0) AND the ORDERED lane is
- * idle (1.7.1 - one batch in flight per pod): after a row of that lane (or of no known lane) was
+ * idle (1.8.0 - one batch in flight per pod): after a row of that lane (or of no known lane) was
  * appended or unparked in this pod, after an ORDERED claim that came back full, on the first
  * pass, and on every sweep - which picks up what no nudge announces: an ORDERED retry come due, a
  * lapsed lease, a row another pod appended and could not relay. While a batch is sending, the

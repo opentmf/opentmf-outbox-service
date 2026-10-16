@@ -34,7 +34,7 @@ import org.springframework.transaction.support.TransactionOperations;
  * lane's due rows over its own query ({@code FOR UPDATE SKIP LOCKED}), resolves each row's
  * publisher, stamps {@code claimed_until} on the rows it takes and COMMITS. The sends then run
  * in NO transaction - CONCURRENT rows on the lane's threads, ORDERED rows one after another on
- * the ORDERED lane's one thread (1.7.1; the calling relay thread before, which held back the next
+ * the ORDERED lane's one thread (1.8.0; the calling relay thread before, which held back the next
  * CONCURRENT claim for a whole ORDERED batch) - and each outcome is written by its own short
  * booking transaction,
  * guarded on the lease value this holder stamped: a holder whose lease lapsed (and whose row
@@ -98,7 +98,7 @@ class OutboxRelayWorker {
 
   private final OutboxConcurrentLane lane;
 
-  /** The ORDERED lane's one thread (1.7.1): sends a claimed ORDERED batch off the relay thread. */
+  /** The ORDERED lane's one thread (1.8.0): sends a claimed ORDERED batch off the relay thread. */
   private final OutboxOrderedLane orderedLane;
 
   /** The CONCURRENT claim's round-robin key cursor - read and moved on the relay thread only. */
@@ -152,7 +152,7 @@ class OutboxRelayWorker {
   /**
    * Claims one batch and hands each lane its rows: the CONCURRENT rows to the lane's queue, the
    * ORDERED batch to the ORDERED lane's thread. Neither send runs on the calling thread, so the
-   * caller's next claim never waits for one (1.7.1).
+   * caller's next claim never waits for one (1.8.0).
    *
    * @param withOrdered whether to claim the ORDERED lane - the relay's word that ORDERED rows may
    *     be due; ignored while the ORDERED lane still sends its previous batch

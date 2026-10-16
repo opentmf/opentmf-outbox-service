@@ -44,7 +44,7 @@ public interface OutboxPublisher {
   enum Lane {
     /**
      * One thread per pod, rows in {@code id} order (a failed row backs off and does not stop the
-     * rows behind it) - the 1.2.x behaviour, the default. Since 1.7.1 it is the ORDERED lane's own
+     * rows behind it) - the 1.2.x behaviour, the default. Since 1.8.0 it is the ORDERED lane's own
      * thread, so its sends never hold back the CONCURRENT lane's claims.
      */
     ORDERED,
