@@ -7,6 +7,8 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -15,6 +17,7 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.opentmf.outbox.OpsFragmentConformance;
 import org.opentmf.outbox.OutboxMaintenanceService;
@@ -80,6 +83,27 @@ class OutboxOpsUnparkFilterStrictTypesTests {
 
     assertThat(written).isEqualTo(MediaType.APPLICATION_PROBLEM_JSON);
     verify(maintenance, never()).unpark(any(), any(), any(), any());
+  }
+
+  /** The detail names the field and what it got, for every JSON type a string field refuses. */
+  @ParameterizedTest(name = "{0} = {1}")
+  @CsvSource(
+      delimiter = '|',
+      value = {
+        "destination | false | destination: expected a string, got a boolean",
+        "reference   | 1.5   | reference: expected a string, got a number",
+        "destination | {}    | destination: expected a string, got an object",
+        "reference   | []    | reference: expected a string, got an array",
+        "parkedTo    | 0     | parkedTo: expected an RFC 3339 date-time string, got a number"
+      })
+  void theRefusal_namesTheFieldAndTheTypeItGot(String field, String value, String detail)
+      throws Exception {
+    mvc.perform(
+            post("/ops/outbox/unpark")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(body(field, value)))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.detail").value(detail));
   }
 
   @Test
