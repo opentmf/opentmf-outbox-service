@@ -85,7 +85,19 @@ query cheap regardless of the terminal backlog. Since 1.3.0 each lane claims
 over its own partial indexes: `ix_outbox_ordered_claim` for the ORDERED lane;
 `ix_outbox_claimed_until` (leased unrelayed rows), `ix_outbox_concurrent_keyed`
 and `ix_outbox_concurrent_unkeyed` for the CONCURRENT lane, whose claim reads
-neither relayed rows nor more than one row per key.
+neither relayed rows nor more than one row per key. **The CONCURRENT claim
+stays bounded whatever the statistics say (1.9.0, changeset 008).** An outbox
+is usually analysed while its open set is nearly empty; when a backlog piles
+up, the planner believes it is one row and every partial index over open rows
+looks free — up to 1.8.0 the claim then walked the keys through
+`ix_outbox_pending` (never analysed: the relay-lag index) and sorted the
+backlog for every key, about 36 s for one claim over a 100,000-row backlog.
+The claim now states "open" as ONE expression, `coalesce(relayed_on,
+cancelled_on, parked_on) is null`, which only its own two indexes carry (008
+rebuilds them on it); the other open-row indexes state the three `is null`s
+separately, so no claim can pick them. `OutboxClaimPlanIT` pins every
+statement on statistics taken while the open set was empty and on a table
+never analysed: a claim of 100 reads about 1,315 buffers in 7–8 ms on either.
 
 `relayed` and `cancelled` overlap in exactly one case: a row cancelled after
 its lease LAPSED while its send was still running, whose send then succeeded —
@@ -1136,7 +1148,11 @@ The library is self-contained for consumer testing — no test-jar needed:
 ### Upgrading to 1.9.0
 
 1. Changeset `007-outbox-sending-since` adds one nullable column (no index, no
-   table rewrite).
+   table rewrite). Changeset `008-outbox-claim-plan-fences` rebuilds the two
+   CONCURRENT claim indexes `CONCURRENTLY` (allow about 1 s per million outbox
+   rows per index in the startup probe, as for 004 to 006). **While 1.8.x pods
+   still run**, their CONCURRENT claim has no index of its own after 008 —
+   roll the upgrade at a low backlog.
 2. **A lapsed lease can cost an attempt.** A row whose send was under way when
    its lease lapsed (its pod died mid-send, or the send outran its bound) is
    booked as a failed attempt on its next claim — `OutboxLeaseLapsedException`,

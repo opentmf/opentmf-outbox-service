@@ -82,7 +82,28 @@ class OutboxClaimPlanIT {
           Map.entry("relayedOn", "timestamptz"),
           Map.entry("stamps", "varchar"),
           Map.entry("renewed", "varchar"),
-          Map.entry("since", "varchar"));
+          Map.entry("since", "varchar"),
+          Map.entry("concurrent", "varchar"));
+
+  /**
+   * The ORDERED claim ({@code OutboxEventRepository.claimOrdered}, JPQL) as Hibernate renders it
+   * on PostgreSQL - the lane test a bound parameter, as the repository binds it. Under a GENERIC
+   * plan the parameter hides the lane, so {@code ix_outbox_ordered_claim}'s predicate cannot be
+   * proven and the claim reads {@code ix_outbox_pending}, sorting the due ORDERED rows: measured
+   * 1,864 buffers / 92-96 ms over 20,000 due ORDERED rows on either stale statistics shape, against
+   * 104 buffers / 1 ms for a custom plan. Pinned here to open-row indexes only.
+   */
+  static final String ORDERED_CLAIM =
+      """
+      select e.* from outbox e
+      where e.relayed_on is null and e.cancelled_on is null and e.parked_on is null
+        and (e.release_at is null or e.release_at <= :now)
+        and e.next_attempt_on <= :now
+        and (e.claimed_until is null or e.claimed_until <= :now)
+        and (e.lane is null or e.lane <> :concurrent)
+      order by e.id
+      fetch first :limit rows only
+      for no key update of e skip locked""";
 
   private static final List<String> PLAN_MODES = List.of("force_custom_plan", "force_generic_plan");
 
@@ -245,7 +266,7 @@ class OutboxClaimPlanIT {
                   .contains("next_attempt_on <=")
                   .contains("release_at <=")
                   .contains("claimed_until <=")
-                  .contains("parked_on IS NULL");
+                  .contains("COALESCE(relayed_on, cancelled_on, parked_on) IS NULL");
             });
     long buffers = plan.get("Shared Hit Blocks").asLong() + plan.get("Shared Read Blocks").asLong();
     System.out.printf(
@@ -677,5 +698,200 @@ class OutboxClaimPlanIT {
         OutboxClaimSql.RELEASE,
         Map.of("ids", "'" + ids + "'", "stamps", "'" + stamps + "'", "now", "now()"),
         List.of("outbox_pkey"));
+  }
+
+  // ------------------------------------------------------------ stale statistics (1.9.0, F-9)
+
+  /** Runs SQL WITHOUT the analyse {@link #execute} ends with: the statistics stay as they were. */
+  private static void executeWithoutAnalyze(String... sql) throws SQLException {
+    try (Connection c = connect();
+        Statement st = c.createStatement()) {
+      for (String s : sql) {
+        st.execute(s);
+      }
+    }
+  }
+
+  /** The production backlog: 10,000 keys of ten CONCURRENT rows, ORDERED rows, parked rows. */
+  private static final String[] BACKLOG = {
+    """
+    insert into outbox (aggregate_type, aggregate_id, event_type, destination, payload,
+      created_on, attempts, next_attempt_on, lane, ordering_key)
+    select 'stale', 'a', 'e', 'hub:k' || (g % 10000), '{}', now(), 0,
+      now() - interval '1 second', 'CONCURRENT', 'hub:k' || (g % 10000)
+    from generate_series(1, 100000) g""",
+    """
+    insert into outbox (aggregate_type, aggregate_id, event_type, destination, payload,
+      created_on, attempts, next_attempt_on, lane, ordering_key)
+    select 'stale', 'a', 'e', 'topic', '{}', now(), 0, now() - interval '1 second',
+      case when g % 2 = 0 then 'ORDERED' end, null
+    from generate_series(1, 20000) g""",
+    """
+    insert into outbox (aggregate_type, aggregate_id, event_type, destination, payload,
+      created_on, attempts, next_attempt_on, parked_on, lane, ordering_key)
+    select 'stale', 'a', 'e', 'hub:p', '{}', now(), 5, now(), now(),
+      case when g % 2 = 0 then 'CONCURRENT' else 'ORDERED' end, null
+    from generate_series(1, 2000) g"""
+  };
+
+  /**
+   * Every statement the relay and the gauges run, on the statistics as they are: the claims take
+   * a full batch the bounded way (the key range an index condition, the primary key only for the
+   * rows claimed), the gauges read their own indexes, the writes reach their rows by primary key.
+   */
+  private static void assertEveryStatementBounded(String state) throws Exception {
+    assertThat(
+            claimedUnderBothModes(
+                mode -> explainClaim(mode, "", FULL_BATCH), FULL_BATCH, FULL_BATCH_BUFFER_BOUND))
+        .as(state + ": first pass")
+        .containsOnly((long) FULL_BATCH);
+    assertThat(
+            claimedUnderBothModes(
+                mode -> explainClaim(mode, "hub:k5000", FULL_BATCH),
+                FULL_BATCH,
+                FULL_BATCH_BUFFER_BOUND))
+        .as(state + ": first pass from a cursor")
+        .containsOnly((long) FULL_BATCH);
+    assertThat(
+            claimedUnderBothModes(
+                mode -> explainWrap(mode, "hub:k5", FULL_BATCH),
+                FULL_BATCH,
+                FULL_BATCH_BUFFER_BOUND))
+        .as(state + ": wrap pass")
+        .containsOnly((long) FULL_BATCH);
+    // the ORDERED claim reads open rows only (its generic plan: see ORDERED_CLAIM)
+    assertIndexedOnly(
+        state + " ORDERED claim",
+        ORDERED_CLAIM,
+        Map.of("now", "now()", "concurrent", "'CONCURRENT'", "limit", String.valueOf(FULL_BATCH)),
+        OPEN_ROW_INDEXES);
+    // the gauges read open rows only - which open-row index is a planner's tie on these estimates
+    Map<String, String> now = Map.of("now", "now()");
+    List<String> openRows = new ArrayList<>(OPEN_ROW_INDEXES);
+    openRows.add("ix_outbox_parked"); // parked rows only, too
+    assertIndexedOnly(state + " open-not-parked", OutboxGaugeSql.OPEN_NOT_PARKED, now, openRows);
+    assertIndexedOnly(state + " parked", OutboxGaugeSql.PARKED, now, openRows);
+    assertIndexedOnly(state + " open-since", OutboxGaugeSql.OPEN_SINCE, now, openRows);
+    assertIndexedOnly(state + " in-flight", OutboxGaugeSql.IN_FLIGHT, now, openRows);
+    // the cross-pod re-check, the bookkeeping by primary key, the bulk operations
+    String heads;
+    String stamps;
+    try (Connection c = connect();
+        Statement st = c.createStatement();
+        ResultSet rs =
+            st.executeQuery(
+                "select '{' || string_agg(id::text, ',') || '}',"
+                    + " '{' || string_agg('\"2100-01-01T00:00:00.000000Z\"', ',') || '}'"
+                    + " from (select min(id) id from outbox where relayed_on is null"
+                    + " and lane = 'CONCURRENT' and ordering_key is not null"
+                    + " group by ordering_key order by ordering_key limit "
+                    + FULL_BATCH
+                    + ") h")) {
+      rs.next();
+      heads = rs.getString(1);
+      stamps = rs.getString(2);
+    }
+    assertIndexedOnly(
+        state + " cross-pod re-check",
+        OutboxClaimSql.RECHECK,
+        Map.of("now", "now()", "ids", "'" + heads + "'"),
+        List.of("outbox_pkey", "ix_outbox_claimed_until", "ix_outbox_concurrent_keyed"));
+    for (String mode : PLAN_MODES) { // a probe per candidate, by index: linear in the candidates
+      JsonNode plan =
+          explain(OutboxClaimSql.RECHECK, mode, Map.of("now", "now()", "ids", "'" + heads + "'"))
+              .get("Plan");
+      assertThat(plan.get("Shared Hit Blocks").asLong() + plan.get("Shared Read Blocks").asLong())
+          .as("%s cross-pod re-check, %s: buffers", state, mode)
+          .isLessThanOrEqualTo(FULL_BATCH_BUFFER_BOUND);
+    }
+    assertIndexedOnly(
+        state + " stamp",
+        OutboxClaimSql.STAMP,
+        Map.of("stamp", "now() + interval '15 seconds'", "ids", "'" + heads + "'"),
+        List.of("outbox_pkey"));
+    assertIndexedOnly(
+        state + " send heartbeat",
+        OutboxClaimSql.RENEW_SENDING,
+        Map.of(
+            "ids", "'" + heads + "'",
+            "stamps", "'" + stamps + "'",
+            "renewed", "'" + stamps + "'",
+            "since", "'" + stamps + "'"),
+        List.of("outbox_pkey"));
+    assertIndexedOnly(
+        state + " give-back",
+        OutboxClaimSql.RELEASE,
+        Map.of("ids", "'" + heads + "'", "stamps", "'" + stamps + "'", "now", "now()"),
+        List.of("outbox_pkey"));
+    assertIndexedOnly(
+        state + " prune relayed batch",
+        OutboxPruneSql.RELAYED,
+        Map.of("cutoff", "now()", "limit", "5000"),
+        List.of("ix_outbox_relayed_on", "outbox_pkey"));
+    assertIndexedOnly(
+        state + " unpark batch",
+        OutboxUnparkSql.BY_DESTINATION,
+        Map.of(
+            "now", "now()",
+            "destination", "'hub:p'",
+            "parkedFrom", "now() - interval '2 hours'",
+            "parkedTo", "now()",
+            "limit", "500"),
+        List.of("ix_outbox_parked", "ix_outbox_parked_lane", "outbox_pkey")); // parked only
+  }
+
+  /**
+   * F-9 (G3), the PRODUCTION shape: the statistics were taken while the open set was empty - an
+   * outbox's normal state - and then a backlog of 122,000 rows piled up (an outage). The planner
+   * believes the open set is one row. Up to 1.8.0 the first-pass claim then walked {@code
+   * ix_outbox_pending} and sorted the whole backlog for every key: about 36 s for one claim, a pod
+   * starved to 8 of 100,000 rows. Since changeset 008 the claim states "open" as one expression
+   * that only its own indexes carry. Autovacuum is off for the case, so it cannot re-analyse.
+   */
+  @Test
+  @Order(20)
+  void everyStatement_staysBounded_onStatisticsTakenWhileTheOpenSetWasEmpty() throws Exception {
+    execute(
+        "delete from outbox where relayed_on is null",
+        "alter table outbox set (autovacuum_enabled = false)"); // then analysed: nothing open
+    executeWithoutAnalyze(BACKLOG);
+    try {
+      assertEveryStatementBounded("analysed empty, then a backlog");
+    } finally {
+      execute(
+          "delete from outbox where aggregate_type = 'stale'",
+          "alter table outbox reset (autovacuum_enabled)");
+    }
+  }
+
+  /**
+   * F-9 (G3), a table NEVER analysed (a new deployment, or a restore) that takes a backlog before
+   * autovacuum's first analyse: no column statistics at all, the table's size unknown. Up to 1.8.0
+   * the first-pass claim walked the relay-lag gauge's index ({@code
+   * ix_outbox_open_since_concurrent}) and sorted the backlog for every key: 42 s for one claim.
+   */
+  @Test
+  @Order(21)
+  void everyStatement_staysBounded_onATableNeverAnalysed() throws Exception {
+    executeWithoutAnalyze(
+        "alter table outbox set (autovacuum_enabled = false)",
+        "delete from outbox where relayed_on is null");
+    executeWithoutAnalyze(BACKLOG);
+    executeWithoutAnalyze( // what a table created empty and never analysed carries
+        """
+        delete from pg_statistic where starelid in (select 'outbox'::regclass union all
+          select indexrelid from pg_index where indrelid = 'outbox'::regclass)""",
+        "update pg_class set reltuples = -1, relpages = 0, relallvisible = 0"
+            + " where oid = 'outbox'::regclass",
+        """
+        update pg_class set reltuples = 0, relpages = 1
+        where oid in (select indexrelid from pg_index where indrelid = 'outbox'::regclass)""");
+    try {
+      assertEveryStatementBounded("never analysed");
+    } finally {
+      execute(
+          "delete from outbox where aggregate_type = 'stale'",
+          "alter table outbox reset (autovacuum_enabled)");
+    }
   }
 }

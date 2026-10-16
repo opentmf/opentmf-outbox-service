@@ -92,6 +92,8 @@ before upgrading.
 ### Added
 
 - **Changeset 007** (`sending_since`, nullable, no index - read only on rows a claim holds).
+- **Changeset 008** (rebuilds `ix_outbox_concurrent_keyed` and `ix_outbox_concurrent_unkeyed` on
+  "open" as one expression, `CONCURRENTLY`).
 - **`OutboxPublisher.sendTimeout(event)`** (default null = `send-timeout`): how long one send
   may run before it is presumed hung.
 - **`OutboxLeaseLapsedException`** and **`OutboxSendError`** - the failures a booking hook sees
@@ -103,6 +105,30 @@ before upgrading.
 
 ### Fixed
 
+- **The CONCURRENT claim stays bounded whatever the statistics say** (changeset 008,
+  `LifecycleIT` G3, `OutboxClaimPlanIT`). An outbox is usually analysed while its open set is
+  nearly empty; when a backlog then piles up - an outage - the planner believes the open set is
+  one row, and every partial index over open rows looks free. The first-pass claim then walked
+  the keys through `ix_outbox_pending` (on a table never analysed: through the relay-lag gauge's
+  `ix_outbox_open_since_concurrent`) and sorted the whole backlog for every key: about 354,000
+  buffers and 36 s for one claim of 100 rows over a 100,000-row backlog; in G3 one of two pods
+  relayed 8 of 100,000 rows. The cross-pod re-check's earlier-due probe, a `not exists`, became an
+  anti-join that scanned the whole keyed index once per candidate on a table never analysed: 10
+  million buffers, 35 s for 100 candidates. Now:
+  - the CONCURRENT claim states "open" as ONE expression, `coalesce(relayed_on, cancelled_on,
+    parked_on) is null` - the same rows - and 008 rebuilds its two indexes
+    (`ix_outbox_concurrent_keyed`, `ix_outbox_concurrent_unkeyed`) on that predicate. The other
+    open-row indexes state the three `is null`s separately, so the planner cannot prove their
+    predicate from the claim and never picks them for it. `ix_outbox_pending` and the relay-lag
+    indexes stay as they are;
+  - the earlier-due probe is a correlated scalar subquery: it runs per candidate, its key and id
+    bound an index condition;
+  - measured on both statistics shapes, custom and generic plans alike: the claim of 100 reads
+    about 1,315 buffers in 7-8 ms, the re-check 415 buffers in 2.3 ms. `OutboxClaimPlanIT` pins
+    every statement on statistics taken while the open set was empty and on a table never
+    analysed, beside the fresh statistics it always used;
+  - **while 1.8.x pods still run** in a rolling upgrade, their CONCURRENT claim (three `is
+    null`s) has no index of its own after 008 - roll at a low backlog.
 - **A short-lease CONCURRENT row no longer starves in the hand-off queue behind slow sends**
   (OUTBOX-QUEUED-LEASE-STARVATION-1). Since 1.6.0 the claim ran up to `batch-size` rows ahead
   of the slots, and a row's lease - stamped at the claim - ran while the row waited in the

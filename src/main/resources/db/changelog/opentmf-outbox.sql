@@ -226,3 +226,29 @@ alter table outbox add column if not exists sending_since timestamp with time zo
 
 comment on column outbox.sending_since is 'When the current holder''s send was known to be under way; a lease lapsing while set counts as a failed attempt (1.9.0).';
 --rollback alter table outbox drop column if exists sending_since;
+
+--changeset opentmf-outbox:008-outbox-claim-plan-fences runInTransaction:false
+-- 1.9.0: the CONCURRENT claim stays bounded whatever the statistics say. An outbox is usually
+-- analysed while its open set is (nearly) empty; when a backlog then piles up - an outage - the
+-- planner believes the open set is one row, and every partial index over open rows looks free.
+-- Up to 1.8.0 two of them ordered the claim's key walk wrong - ix_outbox_pending and, on a table
+-- never analysed, the relay-lag gauge's index - and the claim sorted the whole backlog for every
+-- key: about 36 s for one claim of 100 rows over a 100,000-row backlog. The two CONCURRENT claim
+-- indexes are rebuilt on "open" as ONE expression, coalesce(relayed_on, cancelled_on, parked_on)
+-- is null - the same rows - and the claim states it in that form: the planner cannot prove the
+-- other open-row indexes' predicates (three separate "is null"s) from it, so the claim's own
+-- indexes and the primary key are its only candidates. ix_outbox_pending and the relay-lag
+-- indexes stay as they are. Rebuilt CONCURRENTLY under their names (hence
+-- runInTransaction:false), each create preceded by a DROP ... IF EXISTS, as in 004 to 006; while
+-- 1.8.x pods still run, their CONCURRENT claim (three "is null"s) has no index of its own.
+drop index concurrently if exists ix_outbox_concurrent_keyed;
+create index concurrently ix_outbox_concurrent_keyed on outbox (ordering_key, id) where lane = 'CONCURRENT' and ordering_key is not null and coalesce(relayed_on, cancelled_on, parked_on) is null;
+drop index concurrently if exists ix_outbox_concurrent_unkeyed;
+create index concurrently ix_outbox_concurrent_unkeyed on outbox (id) where lane = 'CONCURRENT' and ordering_key is null and coalesce(relayed_on, cancelled_on, parked_on) is null;
+
+comment on index ix_outbox_concurrent_keyed is 'Open CONCURRENT rows with a key, by key then id - the CONCURRENT claim''s key walk and heads. "Open" as one expression: no other index''s predicate can be proven from the claim (1.9.0).';
+comment on index ix_outbox_concurrent_unkeyed is 'Open CONCURRENT rows without a key, by id - the CONCURRENT claim''s unkeyed rows. "Open" as one expression: no other index''s predicate can be proven from the claim (1.9.0).';
+--rollback drop index concurrently if exists ix_outbox_concurrent_unkeyed;
+--rollback create index concurrently ix_outbox_concurrent_unkeyed on outbox (id) where lane = 'CONCURRENT' and ordering_key is null and relayed_on is null and cancelled_on is null and parked_on is null;
+--rollback drop index concurrently if exists ix_outbox_concurrent_keyed;
+--rollback create index concurrently ix_outbox_concurrent_keyed on outbox (ordering_key, id) where lane = 'CONCURRENT' and ordering_key is not null and relayed_on is null and cancelled_on is null and parked_on is null;
