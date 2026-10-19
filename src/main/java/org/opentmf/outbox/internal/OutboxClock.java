@@ -5,6 +5,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 
@@ -44,6 +45,7 @@ public class OutboxClock {
 
   private final Clock jvm;
   private final Supplier<Instant> database;
+  private final LongSupplier ticker;
   private volatile long offsetNanos;
   private volatile long measuredAtNanos;
   private volatile boolean measured;
@@ -55,8 +57,17 @@ public class OutboxClock {
    *     clock as it is
    */
   public OutboxClock(Clock jvm, Supplier<Instant> database) {
+    this(jvm, database, System::nanoTime);
+  }
+
+  /**
+   * @param ticker the monotonic nanosecond count that times each round trip and the remeasure
+   *     period ({@link System#nanoTime()} in production; a test's simulated time)
+   */
+  OutboxClock(Clock jvm, Supplier<Instant> database, LongSupplier ticker) {
     this.jvm = jvm;
     this.database = database;
+    this.ticker = ticker;
   }
 
   /** The JVM clock alone - for code that has no database to measure against. */
@@ -92,10 +103,10 @@ public class OutboxClock {
       long fastest = Long.MAX_VALUE;
       long measuredOffset = 0;
       for (int sample = 0; sample < SAMPLES; sample++) {
-        long started = System.nanoTime();
+        long started = ticker.getAsLong();
         Instant before = jvm.instant();
         Instant databaseNow = database.get();
-        long roundTrip = System.nanoTime() - started;
+        long roundTrip = ticker.getAsLong() - started;
         if (roundTrip < fastest) {
           fastest = roundTrip;
           measuredOffset = Duration.between(before.plusNanos(roundTrip / 2), databaseNow).toNanos();
@@ -104,7 +115,7 @@ public class OutboxClock {
       long uncertainty = fastest / 2 + UNCERTAINTY_FLOOR.toNanos();
       long offset = Math.abs(measuredOffset) <= uncertainty ? 0 : measuredOffset;
       offsetNanos = offset;
-      measuredAtNanos = System.nanoTime();
+      measuredAtNanos = ticker.getAsLong();
       measured = true;
       warnOnSkew(Duration.ofNanos(offset));
       return true;
@@ -119,7 +130,7 @@ public class OutboxClock {
 
   /** Measures again once the last measurement is {@link #REMEASURE} old (or there was none). */
   public void measureIfDue() {
-    if (!measured || System.nanoTime() - measuredAtNanos >= REMEASURE.toNanos()) {
+    if (!measured || ticker.getAsLong() - measuredAtNanos >= REMEASURE.toNanos()) {
       measure();
     }
   }
