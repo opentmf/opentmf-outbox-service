@@ -6,6 +6,9 @@ import static org.awaitility.Awaitility.await;
 
 import com.zaxxer.hikari.HikariDataSource;
 import io.micrometer.core.instrument.MeterRegistry;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.OffsetDateTime;
@@ -17,6 +20,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 import javax.sql.DataSource;
@@ -24,6 +28,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxBooking.Outcome;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.ApplicationContext;
@@ -31,6 +36,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DelegatingDataSource;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -72,8 +78,15 @@ class OutboxLeaseIT {
   /** Relayed-listener calls per row. */
   static final Map<Long, AtomicInteger> LISTENED = new ConcurrentHashMap<>();
 
-  /** Per delivery: was a transaction active / how many pool connections were checked out. */
+  /**
+   * Per delivery: was a transaction active / how many connections the SENDING thread held / how
+   * many the whole pool had checked out (a diagnostic only: the relay's next claim, the heartbeat,
+   * a sweep and the test's own polling hold theirs meanwhile - on a loaded host the claim a send's
+   * hand-off nudges is still open when the send starts).
+   */
   static final List<Boolean> SENT_IN_TX = new CopyOnWriteArrayList<>();
+
+  static final Map<Long, Integer> HELD_AT_SEND = new ConcurrentHashMap<>();
   static final Map<Long, Integer> ACTIVE_AT_SEND = new ConcurrentHashMap<>();
 
   static final CountDownLatch GATE = new CountDownLatch(1);
@@ -81,6 +94,17 @@ class OutboxLeaseIT {
 
   @TestConfiguration
   static class Consumer {
+
+    /** The pool, as every bean sees it, counting check-outs per thread. */
+    @Bean
+    static BeanPostProcessor countingCheckOuts() {
+      return new BeanPostProcessor() {
+        @Override
+        public Object postProcessAfterInitialization(Object bean, String beanName) {
+          return bean instanceof HikariDataSource pool ? new CheckOuts(pool) : bean;
+        }
+      };
+    }
 
     @Bean
     TransactionTemplate transactionTemplate(PlatformTransactionManager txManager) {
@@ -159,7 +183,10 @@ class OutboxLeaseIT {
                 throw new IllegalStateException("503 after the cancel");
               }
             }
-            case "probe" -> ACTIVE_AT_SEND.put(id, active(dataSource));
+            case "probe" -> {
+              HELD_AT_SEND.put(id, heldByThisThread(dataSource));
+              ACTIVE_AT_SEND.put(id, active(dataSource));
+            }
             default -> {
               // acrm: delivered
             }
@@ -204,6 +231,75 @@ class OutboxLeaseIT {
 
   static String scenario(OutboxEvent event) {
     return event.getDestination().substring(0, event.getDestination().indexOf('-'));
+  }
+
+  /**
+   * A data source that counts the connections each thread has checked out: a check-out counts for
+   * the thread that took it until that connection is closed (given back to the pool).
+   */
+  static final class CheckOuts extends DelegatingDataSource {
+
+    private final Map<Thread, AtomicInteger> held = new ConcurrentHashMap<>();
+
+    CheckOuts(DataSource pool) {
+      super(pool);
+    }
+
+    int heldBy(Thread thread) {
+      AtomicInteger count = held.get(thread);
+      return count == null ? 0 : count.get();
+    }
+
+    @Override
+    public Connection getConnection() throws SQLException {
+      return counted(super.getConnection());
+    }
+
+    @Override
+    public Connection getConnection(String username, String password) throws SQLException {
+      return counted(super.getConnection(username, password));
+    }
+
+    private Connection counted(Connection connection) {
+      AtomicInteger count = held.computeIfAbsent(Thread.currentThread(), t -> new AtomicInteger());
+      count.incrementAndGet();
+      AtomicBoolean closed = new AtomicBoolean();
+      return (Connection)
+          Proxy.newProxyInstance(
+              CheckOuts.class.getClassLoader(),
+              new Class<?>[] {Connection.class},
+              (proxy, method, args) -> {
+                switch (method.getName()) {
+                  case "equals" -> {
+                    return proxy == args[0];
+                  }
+                  case "hashCode" -> {
+                    return System.identityHashCode(proxy);
+                  }
+                  case "close" -> {
+                    if (closed.compareAndSet(false, true)) {
+                      count.decrementAndGet();
+                    }
+                  }
+                  default -> {
+                    // passed through
+                  }
+                }
+                try {
+                  return method.invoke(connection, args);
+                } catch (InvocationTargetException ex) {
+                  throw ex.getCause();
+                }
+              });
+    }
+  }
+
+  static int heldByThisThread(DataSource dataSource) {
+    try {
+      return dataSource.unwrap(CheckOuts.class).heldBy(Thread.currentThread());
+    } catch (SQLException ex) {
+      throw new IllegalStateException(ex);
+    }
   }
 
   static int active(DataSource dataSource) {
@@ -408,8 +504,10 @@ class OutboxLeaseIT {
   }
 
   /**
-   * The evidence for moving the ORDERED lane to the lease too: while an ORDERED send is in
-   * flight on the relay thread, the pool has nothing checked out - and the same for CONCURRENT.
+   * The evidence for moving the ORDERED lane to the lease too: while an ORDERED send is in flight
+   * on its lane's thread, that thread holds no connection - and the same for CONCURRENT. Measured
+   * per THREAD: the pool-wide count (in the description) also counts the relay's next claim, which
+   * the CONCURRENT hand-off nudges right before the send - on a loaded host it is still open.
    */
   @Test
   void noConnectionIsCheckedOut_whileASendIsInFlight_onEitherLane() {
@@ -418,7 +516,8 @@ class OutboxLeaseIT {
     OutboxEvent concurrent = append("probe-concurrent:x");
     awaitRelayed(concurrent);
 
-    assertThat(ACTIVE_AT_SEND)
+    assertThat(HELD_AT_SEND)
+        .as("held by the sending thread; pool-wide at the send: %s", ACTIVE_AT_SEND)
         .containsEntry(ordered.getId(), 0)
         .containsEntry(concurrent.getId(), 0);
   }
