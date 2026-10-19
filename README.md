@@ -504,6 +504,13 @@ key ever had two sends overlapping and that each key's rows went in `id` order.
   slots and slow statements a larger batch keeps them fed.
 - The ORDERED lane is unchanged in kind: its rows go one by one on one thread (its own
   since 1.8.0), and one send plus its booking sets its pace.
+- **The bars are absolute.** `OutboxRelayThroughputIT` (500 rows/s at 8 slots, 10,000 rows
+  in under 15 s at 64) and the invariants suite's G3 (500 rows/s for two pods on a 100k
+  backlog) are calibrated on the gate's box - Linux, native Docker. A slower host, such as
+  a desktop Docker VM that adds a network hop to every statement, misses them by its own
+  pace. Run there with `-Dit.absolute-bars=false`: the figures are printed and not
+  asserted, and every functional check (the key contract, exactly-once, no starved pod)
+  still asserts. The gate itself runs with the default, `true`.
 
 ## Requirements
 

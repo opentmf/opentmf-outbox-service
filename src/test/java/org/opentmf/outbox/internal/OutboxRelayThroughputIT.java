@@ -74,6 +74,14 @@ class OutboxRelayThroughputIT {
   private static final int KEYS = Integer.getInteger("it.relay.keys", 5_000);
   private static final int LATENCY_MS = Integer.getInteger("it.relay.latency-ms", 5);
 
+  /**
+   * Whether the rows/s bars are asserted ({@code -Dit.absolute-bars}, default true). They are
+   * ABSOLUTE, calibrated on the gate's box; a slower host (a desktop Docker VM) runs with {@code
+   * false}: its figures are printed, the key contract still asserts.
+   */
+  private static final boolean ABSOLUTE_BARS =
+      Boolean.parseBoolean(System.getProperty("it.absolute-bars", "true"));
+
   static final Network NETWORK = Network.newNetwork();
   static final PostgreSQLContainer POSTGRES =
       new PostgreSQLContainer("postgres:18.1-alpine3.22")
@@ -275,12 +283,26 @@ class OutboxRelayThroughputIT {
   /** The acceptance on the box's shape: the DEFAULT 8 slots move at least 500 rows a second. */
   @Test
   void oneRelay_eightSlots_movesAtLeast500RowsPerSecond() throws Exception {
-    assertThat(drain(8)).isGreaterThanOrEqualTo(500);
+    atLeast(drain(8), 500);
   }
 
   /** The golden figure: with 64 slots the 10,000 rows are gone in under 15 seconds. */
   @Test
   void oneRelay_sixtyFourSlots_drainsTenThousandRowsUnderFifteenSeconds() throws Exception {
-    assertThat(drain(64)).isGreaterThanOrEqualTo(ROWS / 15.0);
+    atLeast(drain(64), ROWS / 15.0);
+  }
+
+  private static void atLeast(double rate, double bar) {
+    if (!ABSOLUTE_BARS) {
+      System.out.printf(
+          "THROUGHPUT-FIGURES: the bar of %.0f rows/s not asserted (-Dit.absolute-bars=false)%n",
+          bar);
+      return;
+    }
+    assertThat(rate)
+        .as(
+            "rows/s - an absolute bar calibrated on the gate's box; on a slower host run with"
+                + " -Dit.absolute-bars=false (the figures print, the key contract still asserts)")
+        .isGreaterThanOrEqualTo(bar);
   }
 }

@@ -104,8 +104,16 @@ class LifecycleIT {
   }
 
   /**
+   * Whether G3's rows/s bar is asserted ({@code -Dit.absolute-bars}, default true): it is ABSOLUTE,
+   * calibrated on the gate's box; a slower host runs with {@code false} and the figure prints.
+   */
+  private static final boolean ABSOLUTE_BARS =
+      Boolean.parseBoolean(System.getProperty("it.absolute-bars", "true"));
+
+  /**
    * G3: two pods start together on a 100,000-row backlog - every row exactly once, throughput over
-   * the bar (500 rows/s), and neither pod starves (each relays at least a quarter).
+   * the bar (500 rows/s, see {@link #ABSOLUTE_BARS}), and neither pod starves (each relays at
+   * least a quarter).
    */
   @Test
   void g3_twoPodsStartingOnA100kBacklog() {
@@ -168,8 +176,14 @@ class LifecycleIT {
           "100k rows in %d s = %.0f rows/s; per pod %s".formatted(took.toSeconds(), rate, perPod));
       f.figure("the table before the pods started: analysed " + analysed);
       slow.stream().limit(15).forEach(q -> f.figure("statement over 3 s: " + q));
-      if (rate < 500) {
-        f.add("S", "two pods on a 100k backlog relayed %.0f rows/s (bar 500)".formatted(rate));
+      if (!ABSOLUTE_BARS) {
+        f.figure("the bar of 500 rows/s not asserted (-Dit.absolute-bars=false)");
+      } else if (rate < 500) {
+        f.add(
+            "S",
+            ("two pods on a 100k backlog relayed %.0f rows/s (bar 500 - absolute, calibrated on the"
+                    + " gate's box; on a slower host run with -Dit.absolute-bars=false)")
+                .formatted(rate));
       }
       for (String pod : new String[] {"pod-a", "pod-b"}) {
         if (perPod.getOrDefault(pod, 0L) < 25_000) {
