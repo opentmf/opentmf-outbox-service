@@ -321,46 +321,19 @@
               <goal>report</goal>
             </goals>
           </execution>
-          <execution>
-            <id>check</id>
-            <goals>
-              <goal>check</goal>
-            </goals>
-            <configuration>
-              <rules>
-                <rule>
-                  <element>BUNDLE</element>
-                  <limits>
-                    <limit>
-                      <counter>LINE</counter>
-                      <value>COVEREDRATIO</value>
-                      <minimum>90%</minimum>
-                    </limit>
-                    <limit>
-                      <counter>INSTRUCTION</counter>
-                      <value>COVEREDRATIO</value>
-                      <minimum>90%</minimum>
-                    </limit>
-                    <limit>
-                      <counter>BRANCH</counter>
-                      <value>COVEREDRATIO</value>
-                      <minimum>90%</minimum>
-                    </limit>
-                  </limits>
-                </rule>
-              </rules>
-            </configuration>
-          </execution>
+          <!-- check: in the invariants profile - the gate's coverage is the whole suite's. -->
         </executions>
       </plugin>
       <!-- Release cut: mvn release:prepare release:perform. The release profile below
            (sources, javadoc, signing, Central publishing) is activated via
-           releaseProfiles - never useReleaseProfile. -->
+           releaseProfiles - never useReleaseProfile. Both forked builds run the full gate:
+           -Pinvariants (the release profile refuses to build without it). -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-release-plugin</artifactId>
         <version>${maven-release-plugin.version}</version>
         <configuration>
+          <arguments>-Pinvariants</arguments>
           <releaseProfiles>release</releaseProfiles>
           <goals>deploy</goals>
         </configuration>
@@ -370,7 +343,8 @@
            virtual-threads-it forked on a JDK 21+ TOOLCHAIN for the *VirtualIT classes (the
            bytecode stays 17; virtual threads exist only at runtime). A machine without a 21+
            entry in ~/.m2/toolchains.xml fails the build there - "both executors tested" must
-           never quietly mean one. -->
+           never quietly mean one. The invariants and load suites run only under the
+           invariants profile (see there). -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
@@ -383,6 +357,11 @@
             <configuration>
               <excludes>
                 <exclude>**/*VirtualIT.java</exclude>
+                <!-- the invariants and load suites: the invariants profile below -->
+                <exclude>org/opentmf/outboxinvariants/**</exclude>
+                <exclude>**/OutboxRelayThroughputIT.java</exclude>
+                <exclude>**/OutboxPruneAtScaleIT.java</exclude>
+                <exclude>**/OutboxBacklogIT.java</exclude>
               </excludes>
             </configuration>
           </execution>
@@ -433,6 +412,77 @@
   </build>
 
   <profiles>
+    <!-- The gate: mvn -Pinvariants clean verify. A plain clean verify is the fast loop - unit
+         tests and the functional ITs, the JaCoCo report written, not checked. This profile adds
+         the invariants suite (org.opentmf.outboxinvariants), the load ITs (throughput, prune at
+         scale, backlog) and the JaCoCo 90/90/90 check on the merged coverage. The gate before a
+         merge and every release run it: release:prepare and release:perform pass -Pinvariants
+         (the release plugin's arguments), and the release profile refuses to build without it. -->
+    <profile>
+      <id>invariants</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>invariants-it</id>
+                <goals>
+                  <goal>integration-test</goal>
+                  <goal>verify</goal>
+                </goals>
+                <configuration>
+                  <includes>
+                    <include>org/opentmf/outboxinvariants/**/*IT.java</include>
+                    <include>**/OutboxRelayThroughputIT.java</include>
+                    <include>**/OutboxPruneAtScaleIT.java</include>
+                    <include>**/OutboxBacklogIT.java</include>
+                  </includes>
+                  <summaryFile>${project.build.directory}/failsafe-reports/failsafe-summary-invariants.xml</summaryFile>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.jacoco</groupId>
+            <artifactId>jacoco-maven-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>check</id>
+                <goals>
+                  <goal>check</goal>
+                </goals>
+                <configuration>
+                  <rules>
+                    <rule>
+                      <element>BUNDLE</element>
+                      <limits>
+                        <limit>
+                          <counter>LINE</counter>
+                          <value>COVEREDRATIO</value>
+                          <minimum>90%</minimum>
+                        </limit>
+                        <limit>
+                          <counter>INSTRUCTION</counter>
+                          <value>COVEREDRATIO</value>
+                          <minimum>90%</minimum>
+                        </limit>
+                        <limit>
+                          <counter>BRANCH</counter>
+                          <value>COVEREDRATIO</value>
+                          <minimum>90%</minimum>
+                        </limit>
+                      </limits>
+                    </rule>
+                  </rules>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
     <!-- Mutation testing (PIT rides the library from day one).
          Run: mvn -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage
          Branch statement: the pinned 1.19.6 hold WITH incremental history (see the pin
@@ -513,6 +563,26 @@
       <id>release</id>
       <build>
         <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-enforcer-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>release-runs-the-invariants</id>
+                <goals>
+                  <goal>enforce</goal>
+                </goals>
+                <configuration>
+                  <rules>
+                    <requireActiveProfile>
+                      <profiles>invariants</profiles>
+                      <message>A release builds with -Pinvariants: the invariants and load suites and the JaCoCo check are its gate.</message>
+                    </requireActiveProfile>
+                  </rules>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
           <plugin>
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-source-plugin</artifactId>

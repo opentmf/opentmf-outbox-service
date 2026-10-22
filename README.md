@@ -504,6 +504,13 @@ key ever had two sends overlapping and that each key's rows went in `id` order.
   slots and slow statements a larger batch keeps them fed.
 - The ORDERED lane is unchanged in kind: its rows go one by one on one thread (its own
   since 1.8.0), and one send plus its booking sets its pace.
+- **The bars are absolute.** `OutboxRelayThroughputIT` (500 rows/s at 8 slots, 10,000 rows
+  in under 15 s at 64) and the invariants suite's G3 (500 rows/s for two pods on a 100k
+  backlog) are calibrated on the gate's box - Linux, native Docker. A slower host, such as
+  a desktop Docker VM that adds a network hop to every statement, misses them by its own
+  pace. Run there with `-Dit.absolute-bars=false`: the figures are printed and not
+  asserted, and every functional check (the key contract, exactly-once, no starved pod)
+  still asserts. The gate itself runs with the default, `true`.
 
 ## Requirements
 
@@ -1265,8 +1272,17 @@ Kafka-only consumers change nothing but the version.
 
 Quality gates on this repo:
 
+- **Two builds.** `mvn clean verify` is the fast loop: the unit tests and the
+  functional ITs, the JaCoCo report written but not checked. The gate is
+  `mvn -Pmutation,sonar,invariants clean verify` (JDK 17, Docker, the local
+  SonarQube): the `invariants` profile adds the invariants suite, the load ITs
+  (`OutboxRelayThroughputIT`, `OutboxPruneAtScaleIT`, `OutboxBacklogIT`) and the
+  JaCoCo check. It runs before every merge and in every release:
+  `release:prepare` and `release:perform` pass `-Pinvariants`, and the `release`
+  profile refuses to build without it.
 - JaCoCo bundle gate **90/90/90** (line/instruction/branch), unit + IT
-  execution merged; generated Querydsl classes excluded from the denominator.
+  execution merged, checked under `-Pinvariants`; generated Querydsl classes
+  excluded from the denominator.
 - SonarQube (`mvn -Psonar clean verify` against a local server on
   `localhost:9000`, token via `SONAR_TOKEN`): zero open findings is the bar.
 - **Prerequisite: a JDK 21+ Maven toolchain.** The ITs run twice over the
@@ -1292,10 +1308,10 @@ Quality gates on this repo:
   ```
 - **CI runs no build.** The repository has no CI workflows; the SonarCloud
   check on a pull request is SonarCloud's automatic analysis, which compiles
-  and tests nothing. The gate above (unit tests, both IT executions, JaCoCo,
+  and tests nothing. The gate above (unit tests, every IT execution, JaCoCo,
   local SonarQube) is run locally before every merge and cut.
 - **The invariants suite (1.9.0)** — `org.opentmf.outboxinvariants`, under
-  failsafe, about 45 minutes. 39 scenarios in nine classes (A lanes, B leases,
+  failsafe in the `invariants` profile. 39 scenarios in nine classes (A lanes, B leases,
   C policies, D database, E Kafka, F HTTP, G lifecycle, H ops, K production
   shapes) drive two or three real pods (`PodApp`, a consumer-shaped
   application; a child JVM for SIGKILL), PostgreSQL behind Toxiproxy (outages)

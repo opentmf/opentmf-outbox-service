@@ -25,8 +25,11 @@ import ch.qos.logback.core.read.ListAppender;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import jakarta.persistence.Column;
+import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.OffsetDateTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
@@ -40,6 +43,7 @@ import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
@@ -136,8 +140,42 @@ class OutboxRelayWorkerTests {
         tx,
         onLane,
         orderedLane,
-            OutboxClock.system(),
+            strictlyAdvancing(),
             OutboxSendHeartbeatFixture.idle());
+  }
+
+  /**
+   * The system clock, each read at least a microsecond - the stamps' precision - after the one
+   * before: never behind the system's time, ahead of it only while reads come faster. Two stamps
+   * of one pass (a claim and the renewal after it) are thus never the same microsecond, on any
+   * host's clock tick; on the system clock alone a fast host's mocked pass stamped both in one.
+   */
+  private static OutboxClock strictlyAdvancing() {
+    Clock system = Clock.systemUTC();
+    AtomicReference<Instant> last = new AtomicReference<>(Instant.MIN);
+    return new OutboxClock(
+        new Clock() {
+          @Override
+          public ZoneId getZone() {
+            return ZoneOffset.UTC;
+          }
+
+          @Override
+          public Clock withZone(ZoneId zone) {
+            throw new UnsupportedOperationException();
+          }
+
+          @Override
+          public Instant instant() {
+            return last.updateAndGet(
+                previous -> {
+                  Instant now = system.instant();
+                  Instant next = previous.plus(1, ChronoUnit.MICROS);
+                  return now.isBefore(next) ? next : now;
+                });
+          }
+        },
+        null);
   }
 
   OutboxRelayWorkerTests() {
