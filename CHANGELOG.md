@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.9.1 - 2026-10-24
+
+Dependencies and the build only: nothing a consumer can see in the API, configuration or
+schema. A drop-in upgrade from 1.9.0.
+
+### Dependencies
+
+- spring-boot-starter-parent 4.1.1 → 4.1.2: the library compiles and is tested against
+  the Boot line its consumers run; their own parent wins at runtime.
+- Held by name: pitest-maven 1.19.6 (latest 1.30.1), Gökhan's hold. Every other
+  property and plugin is current.
+
+### Build (contributors)
+
+- **Two builds.** `mvn clean verify` is the fast loop (about 7 minutes): the unit tests and
+  the functional ITs, with the JaCoCo report written but not checked. The gate is
+  `mvn -Pmutation,sonar,invariants clean verify`. The `invariants` profile adds the
+  invariants suite, the load ITs (`OutboxRelayThroughputIT`, `OutboxPruneAtScaleIT`,
+  `OutboxBacklogIT`) and the JaCoCo 90/90/90 check. A release runs it: the release
+  plugin passes `-Pinvariants`, and the `release` profile refuses a build without it.
+- **The absolute rows/s bars sit behind `-Dit.absolute-bars`** (default `true`). They are
+  `OutboxRelayThroughputIT` and the invariants suite's G3, calibrated on the gate's box. On
+  a slower host, `false` prints the figures instead of asserting them, and every functional
+  check still asserts.
+- Tests that read the host's clock or scheduling now run on simulated or strictly
+  advancing time (`OutboxClockTests`, `OutboxRelayWorkerTests`). `OutboxLeaseIT`'s
+  no-connection-during-a-send probe measures the sending thread.
+
 ## 1.9.0 - 2026-10-16
 
 The release of the relay invariants suite (OUTBOX-RELAY-INVARIANTS-IT-1): 39 scenarios that
