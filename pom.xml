@@ -77,7 +77,7 @@
 
     <!-- Non-BOM-managed pins live here so versions:display-property-updates sees them. -->
     <archunit.version>1.5.1</archunit.version>
-    <jacoco-maven-plugin.version>0.8.15</jacoco-maven-plugin.version>
+    <jacoco-maven-plugin.version>0.8.16</jacoco-maven-plugin.version>
     <maven-enforcer-plugin.version>3.6.3</maven-enforcer-plugin.version>
 
     <!-- jakarta classifier needs the explicit version (shared with querydsl-apt). -->
