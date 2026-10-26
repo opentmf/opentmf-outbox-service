@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.9.2 - 2026-10-26
+
+The build only: nothing a consumer can see in the API, configuration or schema.
+
+### Build (contributors)
+
+- jacoco-maven-plugin 0.8.15 → 0.8.16.
+
 ## 1.9.1 - 2026-10-26
 
 Dependencies and the build only: nothing a consumer can see in the API, configuration or
