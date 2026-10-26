@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.9.1 - 2026-10-24
+## 1.9.1 - 2026-10-26
 
 Dependencies and the build only: nothing a consumer can see in the API, configuration or
 schema. A drop-in upgrade from 1.9.0.
