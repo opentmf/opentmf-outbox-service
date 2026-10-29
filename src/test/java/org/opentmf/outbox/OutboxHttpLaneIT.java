@@ -74,6 +74,9 @@ class OutboxHttpLaneIT {
   /** Counted down once the slow subscriber has the request in hand. */
   static final CountDownLatch SLOW_RECEIVED = new CountDownLatch(1);
 
+  /** Opened by the test once it has read everything it reads while the slow send is in flight. */
+  static final CountDownLatch SLOW_GATE = new CountDownLatch(1);
+
   /** Arrival order at the keyed receivers: "<path>:<idempotency key>". */
   static final List<String> ARRIVALS = new CopyOnWriteArrayList<>();
 
@@ -101,12 +104,13 @@ class OutboxHttpLaneIT {
     @Bean
     RouterFunction<ServerResponse> stubSubscriber() {
       return RouterFunctions.route()
-          // the slow subscriber of the defect: answers 200 after 30 s
+          // the slow subscriber of the defect: answers 200 only when the test opens the gate
+          // (at most 30 s, the defect's own latency), so the case costs its readings, not 30 s
           .POST(
               "/stub/slow",
               request -> {
                 SLOW_RECEIVED.countDown();
-                latency(Duration.ofSeconds(30));
+                SLOW_GATE.await(30, TimeUnit.SECONDS);
                 return ServerResponse.ok().build();
               })
           // one receiver, slow-ish: 1.5 s per request, tracking overlap
@@ -207,10 +211,11 @@ class OutboxHttpLaneIT {
 
   /**
    * THE defect's own test (red on 1.2.x, where both rode one claim transaction on the single
-   * relay thread and the Kafka row waited the full 30 s): an HTTP row whose subscriber answers
-   * after 30 s does not delay a Kafka row appended AFTER it. And while that send is in flight,
+   * relay thread and the Kafka row waited the full 30 s): an HTTP row whose subscriber has not
+   * answered yet does not delay a Kafka row appended AFTER it. And while that send is in flight,
    * no JDBC connection is checked out - the pool reads zero, sample after sample - and the row
-   * shows as in flight on /ops and on the gauge.
+   * shows as in flight on /ops and on the gauge. The subscriber answers only when the test opens
+   * its gate, so every reading below is taken while the send is provably still open.
    */
   @Test
   void aSlowHttpRow_doesNotDelayAnOrderedRowAppendedAfterIt_andHoldsNoConnection()
@@ -218,6 +223,20 @@ class OutboxHttpLaneIT {
     OutboxEvent slow = append("a-slow", url("slow"));
     assertThat(SLOW_RECEIVED.await(20, TimeUnit.SECONDS)).isTrue(); // the send is in flight
 
+    try {
+      readWhileTheSlowSendIsOpen(slow);
+    } finally {
+      SLOW_GATE.countDown(); // the subscriber answers now
+    }
+
+    await()
+        .atMost(Duration.ofSeconds(60))
+        .untilAsserted(
+            () -> assertThat(maintenance.inspect(slow.getId()).relayedOn()).isNotNull());
+    assertThat(maintenance.inspect(slow.getId()).inFlight()).isFalse();
+  }
+
+  private void readWhileTheSlowSendIsOpen(OutboxEvent slow) throws Exception {
     OutboxEvent ordered = append("a-kafka", "lane-" + UUID.randomUUID());
 
     await()
@@ -242,12 +261,6 @@ class OutboxHttpLaneIT {
         .pollInterval(Duration.ofMillis(50))
         .until(() -> activeConnections() == 0);
     assertThat(maintenance.inspect(slow.getId()).relayedOn()).isNull(); // still in flight
-
-    await()
-        .atMost(Duration.ofSeconds(60))
-        .untilAsserted(
-            () -> assertThat(maintenance.inspect(slow.getId()).relayedOn()).isNotNull());
-    assertThat(maintenance.inspect(slow.getId()).inFlight()).isFalse();
   }
 
   /**
