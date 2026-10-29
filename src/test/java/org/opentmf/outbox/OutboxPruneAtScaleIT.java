@@ -17,6 +17,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.ApplicationContext;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -37,6 +38,7 @@ import org.springframework.transaction.support.TransactionTemplate;
       "opentmf.outbox.sweep-interval=1h",
       "opentmf.outbox.metrics-refresh=200ms"
     })
+@DirtiesContext
 class OutboxPruneAtScaleIT {
 
   static final int EXPIRED_RELAYED = 300_000;

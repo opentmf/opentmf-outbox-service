@@ -37,6 +37,7 @@ import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DelegatingDataSource;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -61,6 +62,7 @@ import org.springframework.transaction.support.TransactionTemplate;
       // no scheduled refresh after the one at start: the tests refresh where they read a gauge
       "opentmf.outbox.metrics-refresh=1h"
     })
+@DirtiesContext
 class OutboxLeaseIT {
 
   /** Deliveries per row, with the idempotency key each carried. */

@@ -19,6 +19,7 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -41,6 +42,7 @@ import org.springframework.transaction.support.TransactionTemplate;
       "opentmf.outbox.sweep-interval=1s",
       "opentmf.outbox.batch-size=100"
     })
+@DirtiesContext
 class OutboxLaneIndependenceIT {
 
   static final List<Long> ORDERED_SENT = new CopyOnWriteArrayList<>();

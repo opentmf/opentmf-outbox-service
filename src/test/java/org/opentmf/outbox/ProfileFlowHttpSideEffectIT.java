@@ -19,6 +19,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -47,6 +48,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
       "spring.jpa.hibernate.ddl-auto=validate",
       "opentmf.outbox.sweep-interval=1s"
     })
+@DirtiesContext
 class ProfileFlowHttpSideEffectIT {
 
   /** Every delivery in arrival order: "adapter:<id>" or "http:<id>". */

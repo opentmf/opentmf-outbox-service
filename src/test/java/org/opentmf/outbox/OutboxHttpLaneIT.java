@@ -26,6 +26,7 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -62,6 +63,7 @@ import org.testcontainers.kafka.KafkaContainer;
       // so the refresher never takes a connection while the pool is sampled for zero
       "opentmf.outbox.metrics-refresh=1h"
     })
+@DirtiesContext
 class OutboxHttpLaneIT {
 
   @Container static KafkaContainer kafka = new KafkaContainer("apache/kafka-native:3.8.1");
