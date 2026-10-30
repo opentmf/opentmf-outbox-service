@@ -111,10 +111,9 @@ final class OutboxClaimSql {
       limit :limit
       for update of e skip locked""";
 
-  /** First pass: keys ABOVE {@code :after} (the cursor; {@code ""} = all), plus unkeyed rows. */
-  static final String CONCURRENT =
-      IN_FLIGHT
-          + """
+  /** The first pass's key walk: keys ABOVE {@code :after}, in key order. */
+  private static final String KEYS_ABOVE =
+      """
             keys (k) as (
               (select o.ordering_key from outbox o
                where o.lane = 'CONCURRENT' and o.ordering_key is not null
@@ -128,7 +127,12 @@ final class OutboxClaimSql {
                         and o.ordering_key > keys.k
                       order by o.ordering_key limit 1)
               from keys where keys.k is not null),
-          """
+          """;
+
+  /** First pass: keys ABOVE {@code :after} (the cursor; {@code ""} = all), plus unkeyed rows. */
+  static final String CONCURRENT =
+      IN_FLIGHT
+          + KEYS_ABOVE
           + HEADS
           + """
           ,
@@ -147,6 +151,21 @@ final class OutboxClaimSql {
               order by id limit :limit) c
           """
           + LOCK;
+
+  /**
+   * The keys of the heads the first pass would find above {@code :after}, up to {@code :limit} -
+   * {@link #CONCURRENT}'s own key walk and heads, with no row locked; the key read by primary key.
+   * Run only after a first pass came back SHORT, it tells the two causes apart: fewer heads than
+   * the limit = the keys ran out (the pass wraps round); as many as the limit = heads were there
+   * but another pod's claim holds them locked ({@code SKIP LOCKED}) - the keys above did not run
+   * out, and a wrap would rob every one of them of its turn for a whole cycle
+   * (OUTBOX-D3-FAIRNESS-INVESTIGATION-1). The last key is how far the pass walked.
+   */
+  static final String CONCURRENT_HEADS =
+      IN_FLIGHT
+          + KEYS_ABOVE
+          + HEADS
+          + "select o.ordering_key from heads join outbox o on o.id = heads.id";
 
   /** Wrap pass: keys from the first UP TO {@code :until} (the cursor), no unkeyed rows. */
   static final String CONCURRENT_WRAP =

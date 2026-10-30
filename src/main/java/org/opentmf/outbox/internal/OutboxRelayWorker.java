@@ -285,11 +285,26 @@ class OutboxRelayWorker {
    * Claims up to {@code limit} CONCURRENT rows: keys round-robin from the cursor (then wrapping
    * round to the cursor), rows without a key in {@code id} order. The cursor moves to the last
    * key claimed, so every key gets its turn whatever the others' backlogs.
+   *
+   * <p>A first pass that comes back short wraps round only when the keys above the cursor RAN
+   * OUT. It also comes back short when another pod's claim holds some of its heads locked ({@code
+   * SKIP LOCKED}); a wrap then would move the cursor back to the first keys, and every key above -
+   * due all along - would lose its turn for a whole cycle (OUTBOX-D3-FAIRNESS-INVESTIGATION-1: on
+   * a slow host a contiguous block of rows waited minutes). So a short pass reads the heads it
+   * would have found; with as many as it asked for, it does not wrap and the cursor moves on to
+   * the last of them - past the locked ones too: the other pod is claiming them, and a head held
+   * locked for longer (a consumer's transaction) never stops the cursor.
    */
   private Claimed claimConcurrent(OffsetDateTime now, int limit) {
     List<OutboxEvent> rows = new ArrayList<>(repository.claimConcurrent(now, keyCursor, limit));
     String lastKey = lastKey(rows);
-    if (rows.size() < limit && !keyCursor.isEmpty()) {
+    List<String> walked =
+        rows.size() < limit && !keyCursor.isEmpty()
+            ? repository.concurrentHeadKeys(now, keyCursor, limit)
+            : List.of();
+    if (walked.size() >= limit) {
+      lastKey = walked.stream().max(Comparator.naturalOrder()).orElseThrow();
+    } else if (rows.size() < limit && !keyCursor.isEmpty()) {
       List<OutboxEvent> wrapped =
           repository.claimConcurrentWrap(now, keyCursor, limit - rows.size());
       String wrappedLast = lastKey(wrapped);

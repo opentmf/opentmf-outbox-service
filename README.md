@@ -357,7 +357,8 @@ sequenceDiagram
   CONCURRENT, when the lane's queue has room. The ORDERED sends start after
   both. Neither claim reads relayed rows or the other lane's backlog. **The
   statements a claim issues do not grow with the rows it takes (1.6.0)**: one
-  claim query (two with the wrap), ONE statement that tries every candidate
+  claim query (two with the wrap, or with the head-key read of a short pass),
+  ONE statement that tries every candidate
   key's advisory lock, ONE re-check, ONE stamp per distinct lease length
   (usually one), and the commit. 1.5.x paid a lock statement per key and a
   flushed update per row on the relay thread.
@@ -367,6 +368,11 @@ sequenceDiagram
     per-pod cursor**, and probes one head row per key not in flight. It stops
     as soon as it holds as many rows as the lane has room for (at most
     `batch-size`).
+  - A pass that comes back short wraps round to the first keys only when the
+    keys above the cursor ran out (1.9.2). Heads another pod's claim holds
+    locked also make a pass short; it then reads the head keys it walked and
+    moves the cursor past the last of them, without wrapping. Before 1.9.2 it
+    wrapped, and every key above the cursor lost its turn for a whole cycle.
   - So the CONCURRENT claim's cost is bounded by the rows it takes plus the
     keys it steps over: those in flight (at most `batch-size` +
     `max-in-flight` per pod) and those whose rows are all backing off or held.

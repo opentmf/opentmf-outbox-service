@@ -2,7 +2,10 @@ package org.opentmf.outboxinvariants;
 
 import static org.awaitility.Awaitility.await;
 
+import java.io.IOException;
 import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -23,6 +26,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxPruneResult;
 import org.opentmf.outboxinvariants.Receiver.Delivery;
@@ -104,18 +108,22 @@ class DatabaseIT {
    */
   @Test
   void d3_twoHundredThousandRows_boundedClaim_andAPruneWhileRelaying() throws Exception {
+    Path probeDir = Path.of(System.getProperty("it.claim-probe", "target/d3-probe"));
     try (Scenario s =
-        Scenario.start(
-            "D3-200k-claim-and-prune",
-            0,
-            "opentmf.outbox.retention=1s",
-            "opentmf.outbox.maintenance.batch-size=5000")) {
+            Scenario.start(
+                "D3-200k-claim-and-prune",
+                0,
+                "opentmf.outbox.retention=1s",
+                "opentmf.outbox.maintenance.batch-size=5000",
+                "it.claim-probe=" + probeDir.toAbsolutePath());
+        DrainProbe probe = DrainProbe.open(probeDir)) {
       Receiver.script("inv:d3/", Script.concurrent());
       s.startPod("pod-a", "opentmf.outbox.concurrent.max-in-flight=1"); // migrate, barely relay
       Scenario.insertConcurrent("inv:d3/", 20000, 10);
       Instant eligible = Instant.now(); // every row due from here on
+      probe.eligible(eligible);
       Scenario.sql("analyze outbox");
-      long buffers = claimBuffers();
+      long buffers = claimBuffers(probeDir);
       Set<Long> before = ids();
       s.startPod("pod-b");
       AtomicBoolean pruning = new AtomicBoolean(true);
@@ -124,8 +132,11 @@ class DatabaseIT {
           CompletableFuture.runAsync(
               () -> {
                 while (pruning.get()) {
+                  long start = System.currentTimeMillis() * 1000;
+                  long t0 = System.nanoTime();
                   OutboxPruneResult result = s.pod(0).maintenance().pruneExpired();
                   pruned.addAndGet(result.pruned());
+                  probe.pruned(start, (System.nanoTime() - t0) / 1000, result.pruned());
                 }
               });
       try {
@@ -151,6 +162,7 @@ class DatabaseIT {
       // claim order allows - see starvedInClaimOrder.
       Findings f = s.finish(Duration.ofMinutes(1), Expect.strict().pruned().skipStarvation());
       starvedInClaimOrder(f, eligible);
+      noPrematureWrap(f, probeDir);
       f.figure(
           "claim over 200k pending rows read %d buffers; the prune deleted %d rows while relaying"
               .formatted(buffers, pruned.get()));
@@ -176,6 +188,71 @@ class DatabaseIT {
       }
       f.assertNone();
     }
+  }
+
+  /**
+   * OUTBOX-D3-FAIRNESS-INVESTIGATION-1, the invariant of its fix: a pass never wraps round while
+   * due heads remain above its cursor. Read from the pods' claim probe: every wrap follows a short
+   * first pass whose head keys ({@code concurrentHeadKeys}) came back fewer than its limit - the
+   * keys ran out. A first pass short only because another pod held heads locked ({@code SKIP
+   * LOCKED}) moves on without a wrap; before the fix it wrapped, and the keys above it - a
+   * contiguous block - lost their turn for a whole cycle (minutes, on a slow host). The figure
+   * counts both kinds of short pass.
+   */
+  private static void noPrematureWrap(Findings f, Path probeDir) throws IOException {
+    int wraps = 0;
+    int heldOn = 0;
+    int premature = 0;
+    List<Path> files;
+    try (Stream<Path> listed = Files.list(probeDir)) {
+      files =
+          listed.filter(p -> p.getFileName().toString().startsWith("claims-inv-D3-")).toList();
+    }
+    for (Path file : files) {
+      int limit = -1;
+      int count = -1;
+      int heads = -1;
+      for (String line : Files.readAllLines(file)) {
+        // pod, thread, statement, start, took, cursor, limit, count, result
+        String[] col = line.split(",", -1);
+        switch (col[2]) {
+          case "claimConcurrent" -> {
+            limit = Integer.parseInt(col[6]);
+            count = Integer.parseInt(col[7]);
+            heads = -1;
+          }
+          case "concurrentHeadKeys" -> {
+            heads = Integer.parseInt(col[7]);
+            heldOn += heads >= limit ? 1 : 0;
+          }
+          case "claimConcurrentWrap" -> {
+            wraps++;
+            if (count >= limit || heads < 0 || heads >= limit) {
+              premature++;
+              if (premature <= 5) {
+                f.add(
+                    "S",
+                    ("%s wrapped round while due heads remained above its cursor"
+                            + " (first pass %d of %d, head keys %d)")
+                        .formatted(col[0], count, limit, heads));
+              }
+            }
+          }
+          default -> {
+            // the lock, re-check and stamp lines are the claim's evidence, not this check's
+          }
+        }
+      }
+    }
+    if (files.isEmpty()) {
+      f.add("S", "no claim probe files in " + probeDir + " - the wrap invariant went unchecked");
+    }
+    String figure =
+        ("wraps %d (premature %d); short first passes on locked heads that moved on without a"
+                + " wrap %d")
+            .formatted(wraps, premature, heldOn);
+    f.figure(figure);
+    System.out.println("INVARIANTS: D3 " + figure);
   }
 
   /** The factor over a fair share of the drain that a row's wait may reach. */
@@ -255,8 +332,12 @@ class DatabaseIT {
     return ids;
   }
 
-  /** EXPLAIN (ANALYZE, BUFFERS) of the library's CONCURRENT claim, as a full claim of 100 rows. */
-  private static long claimBuffers() throws Exception {
+  /**
+   * EXPLAIN (ANALYZE, BUFFERS) of the library's CONCURRENT claim, as a full claim of 100 rows; the
+   * plan is kept as {@code claim-buffers-plan.json} in the probe directory - the evidence when the
+   * bound is broken (once in eight runs on a slow host, 16,641 buffers, plan unknown).
+   */
+  private static long claimBuffers(Path probeDir) throws Exception {
     Class<?> sqlClass = Class.forName("org.opentmf.outbox.internal.OutboxClaimSql");
     Field field = sqlClass.getDeclaredField("CONCURRENT");
     field.setAccessible(true);
@@ -274,6 +355,7 @@ class DatabaseIT {
       try (ResultSet rs = st.executeQuery("explain (analyze, buffers, format json) " + sql)) {
         rs.next();
         String json = rs.getString(1);
+        Files.writeString(probeDir.resolve("claim-buffers-plan.json"), json);
         Matcher hit = Pattern.compile("\"Shared Hit Blocks\": (\\d+)").matcher(json);
         Matcher read = Pattern.compile("\"Shared Read Blocks\": (\\d+)").matcher(json);
         long total = 0;

@@ -2,7 +2,19 @@
 
 ## 1.9.2 - 2026-10-26
 
-The build only: nothing a consumer can see in the API, configuration or schema.
+One relay fix, and the build: nothing a consumer can see in the API, configuration or
+schema. A drop-in upgrade from 1.9.1.
+
+### Fixed
+
+- **A CONCURRENT claim no longer skips a block of keys for a whole cursor cycle.** With
+  two or more pods, a pass whose heads another pod's claim held locked (`SKIP LOCKED`) came
+  back short and was read as "the keys above the cursor ran out": it wrapped round and moved
+  its cursor back to the first keys, so every key above it - due all along - waited a full
+  cycle. On a slow host a contiguous block of rows waited minutes. A short pass now reads
+  the head keys it walked (one extra statement, bounded like the claim); with as many as it
+  asked for, it does not wrap and its cursor moves past the last of them. The invariants
+  suite's D3 asserts that no pass wraps while due heads remain above its cursor.
 
 ### Build (contributors)
 

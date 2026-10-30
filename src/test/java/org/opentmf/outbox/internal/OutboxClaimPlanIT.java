@@ -28,7 +28,8 @@ import tools.jackson.databind.ObjectMapper;
 
 /**
  * The CONCURRENT claim's COST, pinned on the real planner: {@code EXPLAIN (ANALYZE, BUFFERS)} of
- * {@link OutboxClaimSql#CONCURRENT} and {@link OutboxClaimSql#CONCURRENT_WRAP} - the very texts
+ * {@link OutboxClaimSql#CONCURRENT} and {@link OutboxClaimSql#CONCURRENT_WRAP} (and the short
+ * pass's {@link OutboxClaimSql#CONCURRENT_HEADS}) - the very texts
  * the repository runs, PREPAREd - over a table carrying 1,000,000 relayed rows, every case under
  * BOTH a custom and a generic plan ({@code plan_cache_mode} set on this test's own connection as a
  * measuring device - the library never sets it). In every case the claim must not read the
@@ -181,6 +182,54 @@ class OutboxClaimPlanIT {
         OutboxClaimSql.CONCURRENT_WRAP,
         planMode,
         Map.of("now", "now()", "until", "'" + until + "'", "limit", String.valueOf(limit)));
+  }
+
+  /**
+   * The keys of a short first pass's heads ({@link OutboxClaimSql#CONCURRENT_HEADS}, the D3
+   * fairness fix) under both plan modes: the claim's own key walk and heads, so the claim's shape
+   * - no scan, the key range an index condition, the primary key only for the heads it returns, a
+   * bounded buffer count. Returns the heads found, per mode.
+   */
+  private static List<Long> headKeysUnderBothModes(String after, int limit, long bufferBound)
+      throws Exception {
+    List<Long> found = new ArrayList<>();
+    for (String mode : PLAN_MODES) {
+      JsonNode explained =
+          explain(
+              OutboxClaimSql.CONCURRENT_HEADS,
+              mode,
+              Map.of("now", "now()", "after", "'" + after + "'", "limit", String.valueOf(limit)));
+      JsonNode plan = explained.get("Plan");
+      List<JsonNode> all = nodes(plan, new ArrayList<>());
+      assertThat(all)
+          .as("%s: rows filtered on the key skip-scan of the head keys", mode)
+          .filteredOn(
+              n -> "ix_outbox_concurrent_keyed".equals(n.path("Index Name").asString(null)))
+          .allSatisfy(
+              n ->
+                  assertThat(n.path("Rows Removed by Filter").asLong(0))
+                      .isLessThanOrEqualTo(limit));
+      assertThat(all)
+          .as("%s: no sequential scan of outbox for the head keys", mode)
+          .noneMatch(
+              n ->
+                  n.get("Node Type").asString().equals("Seq Scan")
+                      && "outbox".equals(n.path("Relation Name").asString(null)));
+      assertThat(all)
+          .as("%s: the primary key only for the heads found", mode)
+          .filteredOn(n -> "outbox_pkey".equals(n.path("Index Name").asString(null)))
+          .allSatisfy(n -> assertThat(n.get("Actual Loops").asLong()).isLessThanOrEqualTo(limit));
+      long buffers =
+          plan.get("Shared Hit Blocks").asLong() + plan.get("Shared Read Blocks").asLong();
+      System.out.printf(
+          "PLAN-FIGURES: head keys of %d | %s %d buffers %.2f ms%n",
+          limit, mode, buffers, explained.get("Execution Time").asDouble());
+      assertThat(buffers)
+          .as("%s: buffers read by the head keys", mode)
+          .isLessThanOrEqualTo(bufferBound);
+      found.add(plan.get("Actual Rows").asLong());
+    }
+    return found;
   }
 
   /** The claim of both statements' cases under both plan modes: rows claimed, per mode. */
@@ -344,6 +393,11 @@ class OutboxClaimPlanIT {
                 mode -> explainWrap(mode, "hub:k5", FULL_BATCH),
                 FULL_BATCH,
                 FULL_BATCH_BUFFER_BOUND))
+        .containsOnly((long) FULL_BATCH);
+    // a short first pass's head keys: the same walk, the same bound
+    assertThat(headKeysUnderBothModes("", FULL_BATCH, FULL_BATCH_BUFFER_BOUND))
+        .containsOnly((long) FULL_BATCH);
+    assertThat(headKeysUnderBothModes("hub:k5000", FULL_BATCH, FULL_BATCH_BUFFER_BOUND))
         .containsOnly((long) FULL_BATCH);
   }
 
@@ -743,6 +797,9 @@ class OutboxClaimPlanIT {
                 FULL_BATCH,
                 FULL_BATCH_BUFFER_BOUND))
         .as(state + ": wrap pass")
+        .containsOnly((long) FULL_BATCH);
+    assertThat(headKeysUnderBothModes("hub:k5000", FULL_BATCH, FULL_BATCH_BUFFER_BOUND))
+        .as(state + ": a short first pass's head keys")
         .containsOnly((long) FULL_BATCH);
     // the ORDERED claim: its own index under both plan modes (its lane test a literal, 1.9.0)
     assertIndexedOnly(
