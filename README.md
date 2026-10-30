@@ -369,9 +369,9 @@ sequenceDiagram
     as soon as it holds as many rows as the lane has room for (at most
     `batch-size`).
   - A pass that comes back short wraps round to the first keys only when the
-    keys above the cursor ran out (1.9.2). Heads another pod's claim holds
+    keys above the cursor ran out (1.10.0). Heads another pod's claim holds
     locked also make a pass short; it then reads the head keys it walked and
-    moves the cursor past the last of them, without wrapping. Before 1.9.2 it
+    moves the cursor past the last of them, without wrapping. Before 1.10.0 it
     wrapped, and every key above the cursor lost its turn for a whole cycle.
   - So the CONCURRENT claim's cost is bounded by the rows it takes plus the
     keys it steps over: those in flight (at most `batch-size` +
@@ -1041,7 +1041,8 @@ model. The marker has two values:
 
 - **`true`** — the consumer's own answers: the six of its security and web layer
   (`outboxUnauthorized`, `outboxForbidden`, `outboxMethodNotAllowed`, `outboxNotAcceptable`,
-  `outboxUnsupportedMediaType`, `outboxServiceUnavailable`) and the `OutboxProblem` schema. A
+  `outboxUnsupportedMediaType`, `outboxServiceUnavailable`), the `OutboxProblem` schema and
+  (1.10.0) the `bearerAuth` security scheme. A
   consumer may REDEFINE such a component under the SAME name — its own wording, headers such
   as `Retry-After` or `WWW-Authenticate`, its own problem schema.
 - **`content`** (1.8.0) — the library's refusals, which the consumer RENDERS: the 400s, 404,
@@ -1072,9 +1073,21 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
 ```
 
+**Security is declared (1.10.0).** Every operation carries `security: [{ bearerAuth: [] }]`,
+on the operation and not the document root, so every pasted path says it is authenticated.
+The scheme `components.securitySchemes.bearerAuth` (HTTP bearer, JWT) is marked
+`x-opentmf-refinable: true`: a consumer that authenticates differently (OAuth 2, an API key,
+its own `bearerAuth`) keeps its own definition under the name `bearerAuth`, and the paths stay
+verbatim. A consumer with no scheme of its own pastes the default as it is. The library's routes still carry no security of their own; the consumer's security
+answers them. Under `redocly lint` (recommended ruleset) the fragment reports one error,
+`no-empty-servers`, because a fragment has no servers of its own. It also reports two
+`no-ambiguous-paths` warnings: `/ops/outbox/state/{state}` against `/ops/outbox/{id}/unpark`
+and `/{id}/cancel`. Those paths never actually collide (`{id}` is an integer, `{state}` one of
+four words), and renaming them would change the contract for every consumer.
+
 Everything unmarked (parameters, request bodies, 2xx, headers, the other schemas) is the
 library's and is pasted verbatim. Consumers paste the `paths` and `components` into their own
-OAS under their own server URL and security, keep the component names, and pin themselves with
+OAS under their own server URL, keep the component names, and pin themselves with
 a drift test that honours both values (`OutboxOpsFragmentDriftRuleTests` is this rule as code,
 with a verbatim paste, an every-error-as-JSON consumer and a drifting one):
 

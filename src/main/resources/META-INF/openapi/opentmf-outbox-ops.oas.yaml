@@ -48,10 +48,25 @@
 #
 # Paths are relative to the consumer's server URL (the library mounts under /ops on the
 # main port); the consumer's deny-by-default security gates them as admin-class.
+#
+# SECURITY IS DECLARED (1.10.0): every operation carries `security: [{ bearerAuth: [] }]`, so
+# every pasted path says it is authenticated (the estate's bearer default; `redocly lint` asks
+# it of every operation). It sits on the operations, not the document root, because a consumer
+# pastes operations and components, never the root. The library's routes still carry no
+# security of their own: the consumer's security answers them. `components.securitySchemes.
+# bearerAuth` (HTTP bearer, JWT) is REFINABLE BY NAME (`x-opentmf-refinable: true`): a
+# consumer whose scheme is another (OAuth 2, an API key, its own `bearerAuth`) keeps its own
+# definition under the name `bearerAuth`, and the pasted paths stay verbatim.
+#
+# `redocly lint` (recommended) then reports no error but `no-empty-servers` (a fragment has no
+# servers: the consumer's are its own) and two warnings, which stay: `no-ambiguous-paths` pairs
+# `/ops/outbox/state/{state}` with `/ops/outbox/{id}/unpark` and `/{id}/cancel`. They never
+# meet: `{id}` is an integer (the routes take `{id:\d+}`) and `{state}` one of four words. A
+# path change would be a contract change for every consumer, for a warning.
 openapi: 3.1.0
 info:
   title: opentmf-outbox-service /ops/outbox fragment
-  version: 1.8.0
+  version: 1.10.0
   description: >-
     Paste-in contract for the outbox ops surface served by opentmf-outbox-service.
     Not a standalone API document — a fragment the consumer's OAS absorbs. The library's
@@ -64,6 +79,7 @@ paths:
   /ops/outbox:
     get:
       operationId: listOutboxRows
+      security: [{ bearerAuth: [] }]
       summary: Outbox triage list (TMF630 attribute filtering + paging, payloads omitted)
       description: >-
         TMF630 attribute filtering over the row fields (aggregateType, aggregateId,
@@ -98,6 +114,7 @@ paths:
   /ops/outbox/state/{state}:
     get:
       operationId: listOutboxRowsByState
+      security: [{ bearerAuth: [] }]
       summary: The list narrowed to ONE derived-state leg
       description: >-
         `pending` (not relayed, not cancelled — parked, held and in-flight rows included),
@@ -127,6 +144,7 @@ paths:
   /ops/outbox/parked:
     get:
       operationId: listParkedOutboxRows
+      security: [{ bearerAuth: [] }]
       summary: The parked rows — runbook alias of /ops/outbox/state/parked (one code path)
       description: >-
         Parked = exhausted its publisher's attempt budget with the PARK outcome
@@ -148,6 +166,7 @@ paths:
   /ops/outbox/{id}:
     get:
       operationId: inspectOutboxRow
+      security: [{ bearerAuth: [] }]
       summary: One row in full (payload + lastError — the pre-unpark forensic read)
       parameters:
         - $ref: '#/components/parameters/outboxRowId'
@@ -168,6 +187,7 @@ paths:
   /ops/outbox/{id}/unpark:
     post:
       operationId: unparkOutboxRow
+      security: [{ bearerAuth: [] }]
       summary: Unpark one parked row (operator break-glass, never automatic)
       description: >-
         Clears `parkedOn`, resets attempts, makes the row due now and nudges the relay after
@@ -192,6 +212,7 @@ paths:
   /ops/outbox/unpark:
     post:
       operationId: unparkOutboxRowsByFilter
+      security: [{ bearerAuth: [] }]
       summary: Unpark by FILTER — every parked row of one destination (bounded; call again while more remain)
       description: >-
         For after a receiver's outage that outlasted its publisher's budget, once the receiver
@@ -224,6 +245,7 @@ paths:
   /ops/outbox/{id}/cancel:
     post:
       operationId: cancelOutboxRow
+      security: [{ bearerAuth: [] }]
       summary: Withdraw one unreleased row — never relayed from now on, retained for audit
       description: >-
         A row IN FLIGHT — claimed by a relay under a live lease: queued for its send (about a
@@ -251,6 +273,7 @@ paths:
   /ops/outbox/maintenance/prune:
     post:
       operationId: pruneOutboxRows
+      security: [{ bearerAuth: [] }]
       summary: One BOUNDED retention-pruning call over terminal (relayed + cancelled) rows
       description: >-
         Deletes relayed and cancelled rows past `opentmf.outbox.retention`, set-based in
@@ -273,6 +296,19 @@ paths:
         '503': { $ref: '#/components/responses/outboxServiceUnavailable' }
 
 components:
+  # The consumer's authentication, named by every operation (1.10.0). REFINABLE BY NAME: the
+  # consumer may redefine it under the same name.
+  securitySchemes:
+    bearerAuth:
+      x-opentmf-refinable: true
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        The consumer's authentication of the ops routes - a bearer token by default. The
+        library's routes carry no security of their own: the consumer's security gates
+        `/ops/outbox/**` as admin-class and answers 401 / 403 before an operation runs.
+
   parameters:
     outboxOffset:
       name: offset

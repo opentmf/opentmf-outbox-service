@@ -1,9 +1,22 @@
 # Changelog
 
-## 1.9.2 - 2026-10-26
+## 1.10.0 - 2026-10-30
 
-One relay fix, and the build: nothing a consumer can see in the API, configuration or
-schema. A drop-in upgrade from 1.9.1.
+One relay fix, the ops OAS fragment's security declaration, and the build. Nothing changes
+in the API, configuration or schema; a consumer that pastes the fragment re-pastes it.
+
+### Changed (the OAS fragment - re-paste it)
+
+- **Every `/ops/outbox` operation declares its security** (OAS-LINT-CLEAN-1):
+  `security: [{ bearerAuth: [] }]` on each of the eight operations, and the scheme
+  `components.securitySchemes.bearerAuth` (HTTP bearer, JWT). It is on the operations, not the
+  document root, because a consumer pastes operations and components. The scheme is
+  `x-opentmf-refinable: true`: a consumer with another scheme keeps its own definition under
+  the name `bearerAuth`, and the paths stay verbatim. A drift test that follows the README rule
+  is red until the consumer re-pastes: the paths changed, and `bearerAuth` is a new component.
+  Under `redocly lint` (recommended) the fragment's only error is `no-empty-servers`, since a
+  fragment has no servers of its own. Its `info.version` is 1.10.0. The routes still carry no
+  security of their own.
 
 ### Fixed
 
