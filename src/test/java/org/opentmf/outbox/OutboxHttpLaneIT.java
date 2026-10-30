@@ -238,7 +238,7 @@ class OutboxHttpLaneIT {
     assertThat(maintenance.inspect(slow.getId()).inFlight()).isFalse();
   }
 
-  private void readWhileTheSlowSendIsOpen(OutboxEvent slow) throws Exception {
+  private void readWhileTheSlowSendIsOpen(OutboxEvent slow) {
     OutboxEvent ordered = append("a-kafka", "lane-" + UUID.randomUUID());
 
     await()
