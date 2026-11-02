@@ -1,5 +1,6 @@
 package org.opentmf.outboxinvariants;
 
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -100,6 +101,16 @@ public class PodApp {
     boolean corrected = environment.getProperty("it.clock-corrected", Boolean.class, true);
     return new OutboxClock(
         Clock.offset(Clock.systemUTC(), skew), corrected ? repository::databaseNow : null);
+  }
+
+  /** The claim probe of the D3 investigation, on {@code it.claim-probe=<dir>} only. */
+  @Bean
+  @ConditionalOnProperty(name = "it.claim-probe")
+  static ClaimProbe claimProbe(Environment environment) {
+    return new ClaimProbe(
+        Path.of(environment.getRequiredProperty("it.claim-probe")),
+        environment.getProperty("spring.application.name", "inv") + "-"
+            + environment.getProperty("it.pod", "pod"));
   }
 
   @Bean

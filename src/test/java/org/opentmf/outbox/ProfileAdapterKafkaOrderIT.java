@@ -12,6 +12,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -40,6 +41,7 @@ import org.testcontainers.kafka.KafkaContainer;
       "spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer",
       "opentmf.outbox.sweep-interval=1s"
     })
+@DirtiesContext
 class ProfileAdapterKafkaOrderIT {
 
   @Container static KafkaContainer kafka = new KafkaContainer("apache/kafka-native:3.8.1");

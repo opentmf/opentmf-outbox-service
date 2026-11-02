@@ -66,6 +66,16 @@ public interface OutboxEventRepository
       @Param("now") OffsetDateTime now, @Param("after") String after, @Param("limit") int limit);
 
   /**
+   * The keys of the heads the first pass would find above {@code after}, up to {@code limit}, with
+   * no row locked ({@link OutboxClaimSql#CONCURRENT_HEADS}): asked only after a SHORT first pass,
+   * it tells "the keys ran out" (fewer than {@code limit}) from "heads were locked by another pod's
+   * claim", and how far the pass walked.
+   */
+  @Query(value = OutboxClaimSql.CONCURRENT_HEADS, nativeQuery = true)
+  List<String> concurrentHeadKeys(
+      @Param("now") OffsetDateTime now, @Param("after") String after, @Param("limit") int limit);
+
+  /**
    * The CONCURRENT lane's wrap-around pass ({@link OutboxClaimSql#CONCURRENT_WRAP}): keyed rows
    * only, keys from the first up to {@code until} (the cursor), by the same rules.
    */

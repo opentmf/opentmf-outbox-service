@@ -34,6 +34,7 @@ import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -75,6 +76,9 @@ import org.springframework.transaction.support.TransactionOperations;
 class OutboxRelayWorkerTests {
 
   private final Map<Long, OutboxEvent> table = new LinkedHashMap<>();
+
+  /** Rows another pod's claim holds {@code FOR UPDATE} right now: the claim SKIPS them. */
+  private final Set<Long> lockedElsewhere = new HashSet<>();
   private final OutboxEventRepository repository = mock(OutboxEventRepository.class);
   private final OutboxPublisher publisher = mock(OutboxPublisher.class, CALLS_REAL_METHODS);
   private final OutboxProperties properties = new OutboxProperties();
@@ -205,6 +209,12 @@ class OutboxRelayWorkerTests {
             inv ->
                 claimConcurrent(
                     inv.getArgument(0), "", inv.getArgument(1), inv.getArgument(2), false));
+    when(repository.concurrentHeadKeys(any(), any(), anyInt()))
+        .thenAnswer(
+            inv ->
+                heads(inv.getArgument(0), inv.getArgument(1), null, inv.getArgument(2)).stream()
+                    .map(OutboxEvent::getOrderingKey)
+                    .toList());
     // the cross-pod guard: every key lock is free, the re-check keeps every candidate - unless a
     // test says otherwise
     when(repository.tryLockKeys(anyInt(), any())).thenAnswer(inv -> keysOf(inv.getArgument(1)));
@@ -297,19 +307,38 @@ class OutboxRelayWorkerTests {
    * {@link OutboxClaimSql#CONCURRENT} / {@code CONCURRENT_WRAP} on the fake table: keys
    * round-robin above {@code after} / up to {@code until}, each key not in flight contributing its
    * first due row, until {@code limit} heads; rows without a key in id order (first pass only);
-   * the union in id order, {@code limit} rows.
+   * the union in id order, {@code limit} rows - less the rows another pod holds locked ({@code FOR
+   * UPDATE SKIP LOCKED} drops them after the heads were chosen, so the pass comes back short).
    */
   private List<OutboxEvent> claimConcurrent(
       OffsetDateTime now, String after, String until, int limit, boolean withUnkeyed) {
-    List<OutboxEvent> pendingConcurrent =
-        table.values().stream()
-            .filter(
-                e ->
-                    e.getLane() == Lane.CONCURRENT
-                        && e.getRelayedOn() == null
-                        && e.getCancelledOn() == null
-                        && e.getParkedOn() == null)
+    List<OutboxEvent> heads = heads(now, after, until, limit);
+    List<OutboxEvent> unkeyed =
+        pendingConcurrent().stream()
+            .filter(e -> withUnkeyed && e.getOrderingKey() == null && claimable(e, now))
+            .limit(limit)
             .toList();
+    return Stream.concat(heads.stream(), unkeyed.stream())
+        .sorted(Comparator.comparing(OutboxEvent::getId))
+        .limit(limit)
+        .filter(e -> !lockedElsewhere.contains(e.getId()))
+        .toList();
+  }
+
+  private List<OutboxEvent> pendingConcurrent() {
+    return table.values().stream()
+        .filter(
+            e ->
+                e.getLane() == Lane.CONCURRENT
+                    && e.getRelayedOn() == null
+                    && e.getCancelledOn() == null
+                    && e.getParkedOn() == null)
+        .toList();
+  }
+
+  /** The keyed heads of a pass, before any row lock: each key not in flight, its first due row. */
+  private List<OutboxEvent> heads(OffsetDateTime now, String after, String until, int limit) {
+    List<OutboxEvent> pendingConcurrent = pendingConcurrent();
     Set<String> inFlight =
         table.values().stream()
             .filter(
@@ -336,15 +365,7 @@ class OutboxRelayWorkerTests {
                     .findFirst()
                     .filter(head -> heads.size() < limit)
                     .ifPresent(heads::add));
-    List<OutboxEvent> unkeyed =
-        pendingConcurrent.stream()
-            .filter(e -> withUnkeyed && e.getOrderingKey() == null && claimable(e, now))
-            .limit(limit)
-            .toList();
-    return Stream.concat(heads.stream(), unkeyed.stream())
-        .sorted(Comparator.comparing(OutboxEvent::getId))
-        .limit(limit)
-        .toList();
+    return heads;
   }
 
   private static OutboxEvent copy(OutboxEvent row) {
@@ -1879,6 +1900,64 @@ class OutboxRelayWorkerTests {
     verify(repository).claimConcurrent(any(), eq("a"), eq(2));
     // a pass that filled every slot never wraps
     verify(repository, times(1)).claimConcurrentWrap(any(), any(), anyInt());
+  }
+
+  /**
+   * OUTBOX-D3-FAIRNESS-INVESTIGATION-1: a first pass that comes back short because another pod
+   * holds some of its heads locked ({@code SKIP LOCKED}) has NOT run out of keys. It must not wrap:
+   * a wrap would move the cursor back to the first keys, and every key above the short pass - due
+   * all along - would lose its turn for a whole cycle (on a slow host, a contiguous block of rows
+   * waiting minutes). The cursor moves on from the short pass's last key instead.
+   */
+  @Test
+  void aFirstPassShortOnLockedHeads_doesNotWrap_theCursorMovesOnFromIt() {
+    concurrent(1L, "a");
+    concurrent(2L, "b");
+    OutboxEvent lockedC = concurrent(3L, "c");
+    concurrent(4L, "d");
+    concurrent(5L, "e");
+    concurrent(6L, "f");
+    concurrent(7L, "a");
+    concurrent(8L, "b");
+
+    relay(); // a, b - the cursor moves to b
+    lockedElsewhere.add(lockedC.getId()); // another pod is claiming c right now
+    relay(); // heads c, d: c is skipped locked, d is claimed - short, but e and f are due above
+
+    verify(repository).claimConcurrent(any(), eq("b"), eq(2));
+    verify(repository, never()).claimConcurrentWrap(any(), any(), anyInt());
+    lockedElsewhere.clear();
+    relay(); // the cursor moved on from d: e, f - a's and b's second rows wait their turn
+    verify(repository).claimConcurrent(any(), eq("d"), eq(2));
+    assertThat(table.get(5L).getRelayedOn()).isNotNull();
+    assertThat(table.get(6L).getRelayedOn()).isNotNull();
+    assertThat(table.get(7L).getRelayedOn()).isNull();
+    assertThat(table.get(8L).getRelayedOn()).isNull();
+  }
+
+  /**
+   * A pass whose every head is held locked takes nothing - and still moves the cursor past them:
+   * a head locked for longer (a consumer's transaction on the row) must never stop the lane.
+   */
+  @Test
+  void aFirstPassWhoseEveryHeadIsLocked_takesNone_andTheCursorStillMovesPastThem() {
+    concurrent(1L, "a");
+    concurrent(2L, "b");
+    concurrent(3L, "c");
+    concurrent(4L, "d");
+    concurrent(5L, "e");
+    concurrent(6L, "f");
+
+    relay(); // a, b - the cursor moves to b
+    lockedElsewhere.addAll(List.of(3L, 4L)); // c and d, held locked for as long as this test runs
+    assertThat(relay()).isZero(); // heads c, d - both locked: nothing taken, no wrap
+    relay(); // the cursor moved past d: e, f
+
+    verify(repository).claimConcurrent(any(), eq("d"), eq(2));
+    verify(repository, never()).claimConcurrentWrap(any(), any(), anyInt());
+    assertThat(table.get(5L).getRelayedOn()).isNotNull();
+    assertThat(table.get(6L).getRelayedOn()).isNotNull();
+    assertThat(table.get(3L).getRelayedOn()).isNull();
   }
 
   @Test

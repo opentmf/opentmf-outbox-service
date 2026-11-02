@@ -19,6 +19,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -41,6 +42,7 @@ import org.springframework.transaction.support.TransactionTemplate;
       "opentmf.outbox.batch-size=50",
       "opentmf.outbox.maintenance.batch-size=500"
     })
+@DirtiesContext
 class OutboxBulkUnparkIT {
 
   static final AtomicInteger CONCURRENT_NOW = new AtomicInteger();

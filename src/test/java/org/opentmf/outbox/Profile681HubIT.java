@@ -28,6 +28,7 @@ import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -66,6 +67,7 @@ import tools.jackson.databind.ObjectMapper;
       "spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer",
       "opentmf.outbox.sweep-interval=1s"
     })
+@DirtiesContext
 class Profile681HubIT {
 
   @Container static KafkaContainer kafka = new KafkaContainer("apache/kafka-native:3.8.1");

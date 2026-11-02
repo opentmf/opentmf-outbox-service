@@ -36,6 +36,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -68,6 +69,7 @@ import org.testcontainers.toxiproxy.ToxiproxyContainer;
       "spring.datasource.hikari.maximum-pool-size=80", // never the bound at 64 in flight
       "opentmf.outbox.sweep-interval=1h"
     })
+@DirtiesContext
 class OutboxRelayThroughputIT {
 
   private static final int ROWS = Integer.getInteger("it.relay.rows", 10_000);

@@ -26,6 +26,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.junit.jupiter.Container;
@@ -51,6 +52,7 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
       "spring.jpa.hibernate.ddl-auto=validate",
       "opentmf.outbox.sweep-interval=1h"
     })
+@DirtiesContext
 class OutboxLaneBookingStatementsIT {
 
   @Container

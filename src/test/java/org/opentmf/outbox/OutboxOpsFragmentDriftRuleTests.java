@@ -18,7 +18,7 @@ import org.yaml.snakeyaml.Yaml;
  * <ul>
  *   <li>every fragment path is in the consumer's OAS, EQUAL;
  *   <li>a component marked {@code x-opentmf-refinable: true} exists under its name (the consumer's
- *       own answer, redefinable);
+ *       own answer or, since 1.10.0, its security scheme - redefinable);
  *   <li>a component marked {@code x-opentmf-refinable: content} (1.8.0) exists under its name with
  *       the library's {@code description} and {@code headers}; its {@code content} is the
  *       consumer's error rendering;
@@ -129,6 +129,34 @@ class OutboxOpsFragmentDriftRuleTests {
     assertThat(consumer).containsEntry("paths", fragment().get("paths")); // not one path edited
     assertThat(new Yaml().dump(consumer)) // and its document promises no RFC 9457 anywhere
         .doesNotContain("application/problem+json");
+  }
+
+  /**
+   * A consumer that authenticates with OAuth 2, not a bearer JWT (1.10.0): it redefines {@code
+   * bearerAuth} under the same name, and the pasted paths, which name {@code bearerAuth}, stay
+   * verbatim. Without the scheme under that name it drifts.
+   */
+  @Test
+  void aConsumerWithItsOwnSecurityScheme_pastesThePathsVerbatim() {
+    Map<String, Object> consumer = copy(fragment());
+    section(consumer, "components")
+        .get("securitySchemes")
+        .put(
+            "bearerAuth",
+            Map.of(
+                "type",
+                "oauth2",
+                "flows",
+                Map.of(
+                    "clientCredentials",
+                    Map.of("tokenUrl", "https://idp.example/token", "scopes", Map.of()))));
+
+    assertThat(violations(consumer, fragment())).isEmpty();
+    assertThat(consumer).containsEntry("paths", fragment().get("paths"));
+
+    section(consumer, "components").remove("securitySchemes");
+    assertThat(violations(consumer, fragment()))
+        .containsExactly("components.securitySchemes.bearerAuth");
   }
 
   @Test

@@ -31,6 +31,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionCallback;
 import org.springframework.transaction.support.TransactionOperations;
@@ -56,6 +57,7 @@ import org.springframework.transaction.support.TransactionTemplate;
       "opentmf.outbox.sweep-interval=1h",
       "opentmf.outbox.batch-size=5" // small claims, so the two pods interleave
     })
+@DirtiesContext
 class OutboxTwoRelaysIT {
 
   static final Map<Long, AtomicInteger> DELIVERED = new ConcurrentHashMap<>();

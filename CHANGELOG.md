@@ -1,12 +1,38 @@
 # Changelog
 
-## 1.9.2 - 2026-10-26
+## 1.10.0 - 2026-11-02
 
-The build only: nothing a consumer can see in the API, configuration or schema.
+One relay fix, the ops OAS fragment's security declaration, and the build. Nothing changes
+in the API, configuration or schema; a consumer that pastes the fragment re-pastes it.
+
+### Changed (the OAS fragment - re-paste it)
+
+- **Every `/ops/outbox` operation declares its security** (OAS-LINT-CLEAN-1):
+  `security: [{ bearerAuth: [] }]` on each of the eight operations, and the scheme
+  `components.securitySchemes.bearerAuth` (HTTP bearer, JWT). It is on the operations, not the
+  document root, because a consumer pastes operations and components. The scheme is
+  `x-opentmf-refinable: true`: a consumer with another scheme keeps its own definition under
+  the name `bearerAuth`, and the paths stay verbatim. A drift test that follows the README rule
+  is red until the consumer re-pastes: the paths changed, and `bearerAuth` is a new component.
+  Under `redocly lint` (recommended) the fragment's only error is `no-empty-servers`, since a
+  fragment has no servers of its own. Its `info.version` is 1.10.0. The routes still carry no
+  security of their own.
+
+### Fixed
+
+- **A CONCURRENT claim no longer skips a block of keys for a whole cursor cycle.** With
+  two or more pods, a pass whose heads another pod's claim held locked (`SKIP LOCKED`) came
+  back short and was read as "the keys above the cursor ran out": it wrapped round and moved
+  its cursor back to the first keys, so every key above it - due all along - waited a full
+  cycle. On a slow host a contiguous block of rows waited minutes. A short pass now reads
+  the head keys it walked (one extra statement, bounded like the claim); with as many as it
+  asked for, it does not wrap and its cursor moves past the last of them. The invariants
+  suite's D3 asserts that no pass wraps while due heads remain above its cursor.
 
 ### Build (contributors)
 
-- jacoco-maven-plugin 0.8.15 → 0.8.16.
+- jacoco-maven-plugin 0.8.15 → 0.8.16, maven-enforcer-plugin 3.6.3 → 3.7.0. pitest-maven stays
+  at 1.19.6, the deliberate hold (1.30.1 is out).
 
 ## 1.9.1 - 2026-10-26
 

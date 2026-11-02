@@ -240,6 +240,30 @@ class OutboxOpsOpenApiTests {
   }
 
   @Test
+  @DisplayName(
+      "every operation declares the consumer's bearer authentication on itself, not on the"
+          + " document root (1.10.0)")
+  void everyOperationDeclaresItsSecurity() {
+    operations()
+        .forEach(
+            (name, op) ->
+                assertThat(op)
+                    .as(name)
+                    .containsEntry("security", List.of(Map.of("bearerAuth", List.of()))));
+    assertThat(fragment()).doesNotContainKey("security"); // a paste never takes the root
+    assertThat(components("securitySchemes"))
+        .containsOnlyKeys("bearerAuth")
+        .containsEntry(
+            "bearerAuth",
+            Map.of(
+                REFINABLE, true,
+                "type", "http",
+                "scheme", "bearer",
+                "bearerFormat", "JWT",
+                "description", component("securitySchemes", "bearerAuth").get("description")));
+  }
+
+  @Test
   @DisplayName("every error response carries a body: no description-only 4xx or 5xx")
   void everyErrorResponseCarriesABody() {
     operations()
@@ -257,12 +281,15 @@ class OutboxOpsOpenApiTests {
   }
 
   @Test
-  @DisplayName("the consumer's answers and the problem body are the refinable components - and nothing else is")
+  @DisplayName(
+      "the consumer's answers, the problem body and the security scheme are the refinable"
+          + " components - and nothing else is")
   void onlyTheConsumersAnswersAreRefinable() {
     Set<String> expected = new TreeSet<>();
     CONSUMER_ANSWERS.values().forEach(c -> expected.add("responses." + c));
     expected.add("responses.outboxUnsupportedMediaType");
     expected.add("schemas.OutboxProblem");
+    expected.add("securitySchemes.bearerAuth");
 
     Set<String> marked = new TreeSet<>();
     @SuppressWarnings("unchecked")

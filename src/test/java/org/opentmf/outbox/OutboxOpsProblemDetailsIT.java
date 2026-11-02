@@ -14,6 +14,7 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Bean;
 import org.springframework.http.MediaType;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.RequestBuilder;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -40,6 +41,7 @@ import org.springframework.transaction.support.TransactionTemplate;
       "spring.mvc.problemdetails.enabled=true",
       "opentmf.tmf630.undeclared-query-params.on-undeclared=REJECT"
     })
+@DirtiesContext
 class OutboxOpsProblemDetailsIT {
 
   @TestConfiguration
