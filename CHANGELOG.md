@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.10.0 - 2026-10-30
+## 1.10.0 - 2026-11-02
 
 One relay fix, the ops OAS fragment's security declaration, and the build. Nothing changes
 in the API, configuration or schema; a consumer that pastes the fragment re-pastes it.
@@ -31,7 +31,8 @@ in the API, configuration or schema; a consumer that pastes the fragment re-past
 
 ### Build (contributors)
 
-- jacoco-maven-plugin 0.8.15 → 0.8.16.
+- jacoco-maven-plugin 0.8.15 → 0.8.16, maven-enforcer-plugin 3.6.3 → 3.7.0. pitest-maven stays
+  at 1.19.6, the deliberate hold (1.30.1 is out).
 
 ## 1.9.1 - 2026-10-26
 
