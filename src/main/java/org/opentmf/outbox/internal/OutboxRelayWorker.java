@@ -100,6 +100,12 @@ class OutboxRelayWorker {
 
   private static final Runnable NOTHING = () -> {};
 
+  /**
+   * While a transport is paused on this pod, a claim reads up to this many times its limit
+   * (1.11.0): the paused transport's rows it skips do not hide the rows behind them.
+   */
+  static final int SKIP_WINDOW = 10;
+
   private final OutboxEventRepository repository;
   private final OutboxPublisherRouter router;
   private final OutboxBackoff backoff;
@@ -135,6 +141,9 @@ class OutboxRelayWorker {
    * next pass and queued at the TAIL - and its old place was dropped as lost.
    */
   private final Map<Long, Leased> queuedHere = new ConcurrentHashMap<>();
+
+  /** Each named transport's claim pause on this pod (1.11.0), built on its first send verdict. */
+  private final Map<String, OutboxClaimPause> pauses = new ConcurrentHashMap<>();
 
   /**
    * One claimed row: its publisher, the lease value this holder stamped, and when - and, while it
@@ -242,7 +251,7 @@ class OutboxRelayWorker {
 
   /** The ORDERED claim, its own short transaction on the relay thread; its failure fails it. */
   private Claimed claimOrdered() {
-    Claimed claimed = tx.execute(status -> claimOrdered(clock.now()));
+    Claimed claimed = tx.execute(status -> claimOrdered(clock.now(), properties.getBatchSize()));
     claimed.rows().forEach(Leased::mirrorStamp);
     return claimed;
   }
@@ -267,18 +276,19 @@ class OutboxRelayWorker {
     }
   }
 
-  private Claimed claimOrdered(OffsetDateTime now) {
-    int limit = properties.getBatchSize();
-    List<OutboxEvent> rows = repository.claimOrdered(now, limit);
+  /**
+   * Claims up to {@code limit} ORDERED rows. While a transport is paused here (1.11.0) it reads up
+   * to {@link #SKIP_WINDOW} times as many, leases at most {@code limit} of those this pod takes
+   * ({@link #takes}) and leaves the rest - and comes back full only when it leased {@code limit}
+   * rows, so a pass of skipped rows never makes the relay claim again at once.
+   */
+  private Claimed claimOrdered(OffsetDateTime now, int limit) {
+    boolean skipping = anyPaused();
+    List<OutboxEvent> rows = repository.claimOrdered(now, skipping ? limit * SKIP_WINDOW : limit);
     List<Leased> leased = new ArrayList<>();
-    for (OutboxEvent row : rows) {
-      OutboxPublisher publisher = route(row);
-      if (publisher != null) {
-        leased.add(lease(row, publisher, Lane.ORDERED, now));
-      }
-    }
+    leaseTaken(rows, limit, Lane.ORDERED, now, leased);
     stampAll(leased);
-    return new Claimed(leased, rows.size() >= limit);
+    return new Claimed(leased, skipping ? leased.size() >= limit : rows.size() >= limit);
   }
 
   /**
@@ -294,8 +304,15 @@ class OutboxRelayWorker {
    * would have found; with as many as it asked for, it does not wrap and the cursor moves on to
    * the last of them - past the locked ones too: the other pod is claiming them, and a head held
    * locked for longer (a consumer's transaction) never stops the cursor.
+   *
+   * <p>While a transport is paused here (1.11.0) the pass reads up to {@link #SKIP_WINDOW} times
+   * the room and leases at most the room of the rows this pod takes ({@link #takes}); the cursor
+   * moves past the skipped keys, but not when the room filled before the window ended - the keys
+   * left over keep their turn. Full only when it filled the room.
    */
-  private Claimed claimConcurrent(OffsetDateTime now, int limit) {
+  private Claimed claimConcurrent(OffsetDateTime now, int room) {
+    boolean skipping = anyPaused();
+    int limit = skipping ? room * SKIP_WINDOW : room;
     List<OutboxEvent> rows = new ArrayList<>(repository.claimConcurrent(now, keyCursor, limit));
     String lastKey = lastKey(rows);
     List<String> walked =
@@ -311,21 +328,78 @@ class OutboxRelayWorker {
       lastKey = wrappedLast != null ? wrappedLast : lastKey;
       rows.addAll(wrapped);
     }
+    List<OutboxEvent> candidates =
+        acrossPods(rows, now).stream()
+            // still queued here, its lease lapsed: it keeps its place, never a second one
+            .filter(row -> !queuedHere.containsKey(row.getId()))
+            .toList();
     List<Leased> leased = new ArrayList<>();
-    for (OutboxEvent row : acrossPods(rows, now)) {
-      if (queuedHere.containsKey(row.getId())) {
-        continue; // still queued here, its lease lapsed: it keeps its place, never a second one
-      }
-      OutboxPublisher publisher = route(row);
-      if (publisher != null) {
-        leased.add(lease(row, publisher, Lane.CONCURRENT, now));
-      }
-    }
+    int taken = leaseTaken(candidates, room, Lane.CONCURRENT, now, leased);
     stampAll(leased);
-    if (lastKey != null) {
+    // not when the room filled inside the skip window: the candidates left keep their turn
+    if (lastKey != null && taken == candidates.size()) {
       keyCursor = lastKey;
     }
-    return new Claimed(leased, rows.size() >= limit);
+    return new Claimed(leased, skipping ? leased.size() >= room : rows.size() >= limit);
+  }
+
+  /**
+   * Leases, in order, the candidates this pod takes ({@link #takes}) until {@code room} rows are
+   * leased; returns how many candidates it went through - all of them unless the room filled.
+   */
+  private int leaseTaken(
+      List<OutboxEvent> candidates,
+      int room,
+      Lane rowLane,
+      OffsetDateTime now,
+      List<Leased> leased) {
+    int seen = 0;
+    while (seen < candidates.size() && leased.size() < room) {
+      OutboxEvent row = candidates.get(seen++);
+      OutboxPublisher publisher = route(row);
+      if (publisher != null && takes(row, publisher, now)) {
+        leased.add(lease(row, publisher, rowLane, now));
+      }
+    }
+    return seen;
+  }
+
+  /** Whether a transport is paused on this pod: the claims then read their skip window. */
+  private boolean anyPaused() {
+    for (OutboxClaimPause pause : pauses.values()) {
+      if (pause.paused()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Whether this pod takes a claimed row: not while the row's transport is paused here - unless
+   * as the probe, once its time has come (a row that never failed: a failed one would pay this
+   * pod's failure again at every probe), or when the row is UNATTENDED: due for longer than
+   * {@code claim-pause.max} and still not taken, so no pod is sending the transport's rows (it is
+   * down for all of them). A row not taken is not leased, not attempted, not backed off: it stays
+   * due for the other pods, and for this one's next pass. An unattended row is taken as before
+   * 1.11.0 - its attempt fails and its backoff moves it out of the way, so a paused transport's
+   * backlog never hides the rows behind it for longer than {@code claim-pause.max}.
+   */
+  private boolean takes(OutboxEvent row, OutboxPublisher publisher, OffsetDateTime now) {
+    String transport = publisher.transport(row);
+    OutboxClaimPause pause = transport == null ? null : pauses.get(transport);
+    if (pause == null || !pause.paused()) {
+      return true;
+    }
+    OffsetDateTime dueSince = row.getNextAttemptOn();
+    if (row.getReleaseAt() != null && (dueSince == null || row.getReleaseAt().isAfter(dueSince))) {
+      dueSince = row.getReleaseAt();
+    }
+    if (dueSince != null && dueSince.isBefore(now.minus(properties.getClaimPause().getMax()))) {
+      return true; // unattended: no pod sends the transport's rows
+    }
+    // a probe is a FRESH row: one that already failed would pay this pod's failure again and
+    // again - its attempt budget is not this pod's to burn while another pod may send it
+    return row.getAttempts() == 0 && pause.mayTake();
   }
 
   /**
@@ -455,7 +529,7 @@ class OutboxRelayWorker {
       if (waitedLong(row) && !renewQueued(row)) {
         return; // taken by another holder meanwhile, or cancelled and released unsent
       }
-      book(laneTx, row, send(row), () -> NOTHING);
+      book(laneTx, row, sent(row), () -> NOTHING);
     } catch (Throwable ex) { // nothing leaves a lane worker
       log.error(
           "Outbox row {} to {} - renewal or booking failed; the row is redelivered once its"
@@ -549,7 +623,8 @@ class OutboxRelayWorker {
       }
       int index = i;
       try {
-        book(tx, row, row.lapsedSending ? lapsed(row) : send(row), () -> renewNext(ordered, index));
+        Attempt attempt = row.lapsedSending ? lapsed(row) : sent(row);
+        book(tx, row, attempt, () -> renewNext(ordered, index));
       } catch (Throwable ex) { // nothing leaves the ORDERED lane's thread
         log.error(
             "Outbox row {} to {} - booking failed; it and the rest of the batch are redelivered"
@@ -607,6 +682,39 @@ class OutboxRelayWorker {
           next.marked = true;
         });
     return true;
+  }
+
+  /**
+   * One send, its verdict told to its transport's claim pause (1.11.0) when the publisher names
+   * one: a success resumes it; a failure with the transport out of reach ({@link
+   * OutboxPublisher#transportDown}) counts towards a pause; a {@link TerminalOutboxException} (the
+   * receiver answered) and a refused row neither.
+   */
+  private Attempt sent(Leased row) {
+    Attempt attempt = send(row);
+    String transport = row.publisher.transport(row.event);
+    if (transport == null) {
+      return attempt;
+    }
+    OutboxClaimPause pause = pauses.computeIfAbsent(transport, this::newPause);
+    RuntimeException failure = attempt.failure();
+    if (failure == null) {
+      pause.succeeded();
+    } else if (!(failure instanceof TerminalOutboxException)
+        && row.publisher.transportDown(row.event, failure)) {
+      pause.failed(failure);
+    }
+    return attempt;
+  }
+
+  private OutboxClaimPause newPause(String transport) {
+    return new OutboxClaimPause(
+        transport,
+        properties.getClaimPause().getAfterFailures(),
+        properties.getBackoffBase(),
+        properties.getClaimPause().getMax(),
+        System::nanoTime,
+        metrics);
   }
 
   /** One send, its lease kept by the heartbeat while it runs; whatever it throws is a failure. */

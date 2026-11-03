@@ -2,6 +2,7 @@ package org.opentmf.outbox.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -11,8 +12,13 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.errors.NetworkException;
+import org.apache.kafka.common.errors.RecordTooLargeException;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.errors.TopicAuthorizationException;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.opentmf.outbox.OutboxEvent;
@@ -238,5 +244,34 @@ class KafkaOutboxPublisherTests {
 
   private static String header(ProducerRecord<?, ?> sent, String name) {
     return new String(sent.headers().lastHeader(name).value(), StandardCharsets.UTF_8);
+  }
+
+  /**
+   * The claim pause (1.11.0): one transport, the cluster; a producer timeout (its own, or the
+   * acknowledgement wait's) or another retriable error means the broker is out of reach - a
+   * record the cluster refused is the record's.
+   */
+  @Test
+  void transport_isTheCluster_andOnlyAnUnreachableBrokerIsTheTransportsFailure() {
+    OutboxEvent event = event("topic", null);
+    // the acknowledgement wait's own timeout (java.util.concurrent's), as publish() wraps it
+    Throwable waited =
+        catchThrowable(() -> new CompletableFuture<Void>().get(1, TimeUnit.MILLISECONDS));
+
+    assertThat(publisher.transport(event)).isEqualTo("kafka");
+    assertThat(publisher.transportDown(event, new KafkaException("x", waited))).isTrue();
+    assertThat(
+            publisher.transportDown(
+                event, new KafkaException("x", new TimeoutException("metadata after 2000ms"))))
+        .isTrue();
+    assertThat(publisher.transportDown(event, new KafkaException("x", new NetworkException())))
+        .isTrue();
+    assertThat(
+            publisher.transportDown(event, new KafkaException("x", new RecordTooLargeException())))
+        .isFalse();
+    assertThat(
+            publisher.transportDown(
+                event, new KafkaException("x", new TopicAuthorizationException("topic"))))
+        .isFalse();
   }
 }

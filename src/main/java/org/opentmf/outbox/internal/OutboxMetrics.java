@@ -7,9 +7,12 @@ import jakarta.annotation.PreDestroy;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import lombok.extern.slf4j.Slf4j;
 import org.opentmf.outbox.OutboxPublisher.Lane;
@@ -37,6 +40,10 @@ import org.opentmf.outbox.internal.OutboxEventRepository.LaneSince;
  *   <li>{@code opentmf.outbox.metrics-age} - gauge, seconds since the last SUCCESSFUL refresh of
  *       the gauges above (NaN before the first) - alert when it exceeds a few refresh periods;
  *       one series, no lane
+ *   <li>{@code opentmf.outbox.claims.paused} - gauge by {@code transport}, 1 while this pod's
+ *       claims of the transport's rows are paused after failed sends in a row (1.11.0, {@code
+ *       claim-pause}), else 0 - read in this pod, no database; one series per transport a
+ *       publisher names, from its first pause; alert when it stays 1
  *   <li>{@code opentmf.outbox.relayed} - counter by {@code destination} (closed tag set)
  *   <li>{@code opentmf.outbox.dropped} - counter by {@code destination}: rows given up by a
  *       publisher's DROP policy (never delivered, forensics kept)
@@ -59,11 +66,13 @@ class OutboxMetrics {
   static final String IN_FLIGHT = "opentmf.outbox.in-flight";
   static final String RELAY_LAG = "opentmf.outbox.relay-lag";
   static final String METRICS_AGE = "opentmf.outbox.metrics-age";
+  static final String CLAIMS_PAUSED = "opentmf.outbox.claims.paused";
   static final String RELAYED = "opentmf.outbox.relayed";
   static final String DROPPED = "opentmf.outbox.dropped";
   static final String ATTEMPTS = "opentmf.outbox.attempts";
   static final String TAG_DESTINATION = "destination";
   static final String TAG_LANE = "lane";
+  static final String TAG_TRANSPORT = "transport";
 
   /** One lane's last values; {@code null} instant = no open row in the lane. */
   record LaneValues(double pending, double parked, double inFlight, Instant openSince) {
@@ -90,6 +99,7 @@ class OutboxMetrics {
   private final OutboxClock clock;
   private final AtomicReference<Snapshot> snapshot = new AtomicReference<>(Snapshot.NONE);
   private final AtomicReference<Instant> lastRefreshed = new AtomicReference<>();
+  private final Map<String, AtomicBoolean> claimsPaused = new ConcurrentHashMap<>();
   private ScheduledExecutorService refresher;
 
   OutboxMetrics(MeterRegistry registry, OutboxEventRepository repository, Duration refreshEvery) {
@@ -184,6 +194,25 @@ class OutboxMetrics {
       snapshot.set(Snapshot.NONE);
       log.warn("Outbox gauges not refreshed - they read NaN until the next refresh", ex);
     }
+  }
+
+  /**
+   * This pod's claims of {@code transport}'s rows paused or resumed (the claim pause, 1.11.0); its
+   * gauge series is registered on the transport's first pause.
+   */
+  public void claimsPaused(String transport, boolean paused) {
+    claimsPaused
+        .computeIfAbsent(
+            transport,
+            name -> {
+              AtomicBoolean flag = new AtomicBoolean();
+              Gauge.builder(CLAIMS_PAUSED, flag, value -> value.get() ? 1d : 0d)
+                  .tag(TAG_TRANSPORT, name)
+                  .description("1 while this pod's claims of the transport's rows are paused")
+                  .register(registry);
+              return flag;
+            })
+        .set(paused);
   }
 
   /** Books one DROP exhaustion: the per-destination dropped counter (never the relayed one). */

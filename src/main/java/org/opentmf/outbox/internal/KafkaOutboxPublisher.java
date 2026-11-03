@@ -9,6 +9,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.errors.RetriableException;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxHeaders;
 import org.opentmf.outbox.OutboxProperties;
@@ -51,6 +52,9 @@ import tools.jackson.databind.ObjectMapper;
  * partitioning never moves.
  */
 class KafkaOutboxPublisher implements OutboxPublisher {
+
+  /** The transport name the claim pause and its gauge use (1.11.0). */
+  static final String TRANSPORT = "kafka";
 
   private final KafkaTemplate<Object, Object> kafkaTemplate;
   private final OutboxProperties properties;
@@ -134,6 +138,28 @@ class KafkaOutboxPublisher implements OutboxPublisher {
     return properties.getKafka().getLane() == Lane.CONCURRENT
         ? properties.getKafka().getLease()
         : null;
+  }
+
+  /** One transport: the cluster this pod's producer talks to (the claim pause, 1.11.0). */
+  @Override
+  public String transport(OutboxEvent event) {
+    return TRANSPORT;
+  }
+
+  /**
+   * The broker out of reach: the producer gave up waiting - for metadata ({@code max.block.ms}),
+   * for the delivery, or for its acknowledgement - or another retriable error (a lost connection,
+   * a leader not available). A record the cluster refused (too large, an unauthorised or invalid
+   * topic, a serialisation failure) is the record's, not the pod's.
+   */
+  @Override
+  public boolean transportDown(OutboxEvent event, RuntimeException failure) {
+    for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+      if (cause instanceof RetriableException || cause instanceof TimeoutException) {
+        return true;
+      }
+    }
+    return false;
   }
 
   @Override

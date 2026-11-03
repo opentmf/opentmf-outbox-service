@@ -173,6 +173,33 @@ public interface OutboxPublisher {
     return null;
   }
 
+  /**
+   * The transport this row's send goes over - for the claim pause (1.11.0, {@code
+   * opentmf.outbox.claim-pause.*}): once a pod's sends over one transport have failed {@code
+   * after-failures} times in a row ({@link #transportDown}), the pod stops taking that
+   * transport's rows - it leaves them to the other pods and probes one now and then - until a
+   * send over it succeeds. Name a transport only where a failure can be THIS POD's: the library's
+   * Kafka publisher names its cluster (a pod can lose its broker while the others reach it); its
+   * HTTP publisher names none - a receiver that is down is down for every pod.
+   *
+   * @return a short name, one per transport (it tags the {@code claims.paused} gauge), or {@code
+   *     null}: this publisher's failures never pause a claim (the default)
+   */
+  default String transport(OutboxEvent event) {
+    return null;
+  }
+
+  /**
+   * Whether a failed send over a named {@link #transport} says this pod cannot REACH it - counted
+   * towards a claim pause - rather than that the receiver refused the row (not counted). Asked
+   * only for a failure that is not a {@link TerminalOutboxException}.
+   *
+   * @return {@code true} (the default) to count every failure over the transport
+   */
+  default boolean transportDown(OutboxEvent event, RuntimeException failure) {
+    return true;
+  }
+
   /** The exhaustion outcome for this row; the library default is {@link ExhaustionOutcome#PARK}. */
   default ExhaustionOutcome onExhausted(OutboxEvent event) {
     return ExhaustionOutcome.PARK;

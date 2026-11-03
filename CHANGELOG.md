@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.11.0 - 2026-11-03
+
+A pod that cannot reach its transport leaves that transport's rows to the pods that can. Two
+new default methods on `OutboxPublisher`, two new properties, one new gauge; no schema change.
+
+### Fixed
+
+- **A pod whose every send fails no longer takes rows from the healthy pods**
+  (OUTBOX-FAILING-RELAY-CLAIMS-1). Its transport down - the broker unreachable from that pod, an
+  expired client credential, a broken egress - such a pod kept claiming: each row it took paid
+  a failed attempt and waited out its backoff (5 s, then doubling), while another pod could have
+  sent it at once. With instant failures (a refused connection) it was the fastest claimer, its
+  send slots freeing at once; with the defaults (10 attempts, 10 min cap) about half an hour of
+  it parked rows a healthy pod would have sent. The behaviour is as old as the claim by lease
+  (1.3.0). 1.10.0's CONCURRENT claim made it likelier when the healthy pods hold their heads
+  locked: a pass that came back short now moves past those heads instead of wrapping round, so a
+  failing pod's pass walks on to the keys beyond them. A consumer's two-pod integration test found
+  it beside a cached test context whose producer pointed at a dead broker. Measured with
+  `OutboxFailingRelayIT` (a healthy relay and a failing one, 300 rows over 100 keys): the failing
+  relay took 102 rows on 1.10.0 and 98 on 1.9.1's claim rule (20 and 12 when each failure took a
+  second), and some rows waited past 90 s; since 1.11.0 it takes 8 and leaves the rest to the
+  healthy pod.
+
+### Added
+
+- **The claim pause, per transport** (`opentmf.outbox.claim-pause.*`): `OutboxPublisher` gains
+  two default methods, `transport(event)` (default none) and `transportDown(event, failure)`
+  (default true). After `after-failures` (default 5) failures over one named transport in a row
+  that say it was out of reach, with no success over it between them, a pod leaves that
+  transport's rows to the other pods - not leased, not attempted, no backoff - except one probe
+  row (a fresh one, never a row that already failed), the first `backoff-base` after the
+  pause, each next one twice as long after the one before, up to `max` (default 1 min); one
+  successful send over it ends the pause. The library's
+  Kafka publisher names `kafka` (a producer timeout or another retriable error is the
+  transport's; a refused record is not); its HTTP publisher names none, so a dead receiver pauses
+  nothing - a lane-wide pause let 354 of 1,000 healthy rows through in a minute beside one dead
+  subscriber. While paused the claim reads up to 10 times its limit and claims again at once only
+  when it filled its room; a paused row due longer than `max` (no pod is sending the transport's
+  rows) is taken as before. `after-failures: 0` switches it off.
+- **`opentmf.outbox.claims.paused`**, a gauge by `transport`: 1 while this pod leaves the
+  transport's rows to the others, else 0; a series per transport from its first pause. A WARN
+  line marks each pause and resume.
+
+### Build (contributors)
+
+- Every dependency and plugin is current; pitest-maven stays at 1.19.6, the deliberate hold
+  (1.30.1 is out).
+
 ## 1.10.0 - 2026-11-02
 
 One relay fix, the ops OAS fragment's security declaration, and the build. Nothing changes

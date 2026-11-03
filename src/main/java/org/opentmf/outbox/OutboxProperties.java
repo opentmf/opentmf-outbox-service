@@ -5,6 +5,7 @@ import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
+import jakarta.validation.constraints.PositiveOrZero;
 import java.time.Duration;
 import lombok.Getter;
 import lombok.Setter;
@@ -86,6 +87,12 @@ public class OutboxProperties {
   /** The bounded bulk operations: prune, unpark by filter ({@code opentmf.outbox.maintenance}). */
   @Valid private final Maintenance maintenance = new Maintenance();
 
+  /**
+   * The claim pause of a pod whose sends keep failing ({@code opentmf.outbox.claim-pause.*},
+   * 1.11.0).
+   */
+  @Valid private final ClaimPause claimPause = new ClaimPause();
+
   /** The ORDERED lane ({@code opentmf.outbox.ordered.*}). */
   @Valid private final Ordered ordered = new Ordered();
 
@@ -124,6 +131,12 @@ public class OutboxProperties {
   @AssertTrue(message = "opentmf.outbox.http.connect-timeout must be positive")
   public boolean isHttpConnectTimeoutPositive() {
     return http.connectTimeout == null || positive(http.connectTimeout);
+  }
+
+  /** The claim pause's longest probe wait must be positive. */
+  @AssertTrue(message = "opentmf.outbox.claim-pause.max must be positive")
+  public boolean isClaimPauseMaxPositive() {
+    return claimPause.max == null || positive(claimPause.max);
   }
 
   /** A set HTTP read timeout must end before the send bound - or a hung call outlives its lease. */
@@ -171,6 +184,33 @@ public class OutboxProperties {
      * {@code send-timeout}. Default 15s.
      */
     @NotNull private Duration lease = Duration.ofSeconds(15);
+  }
+
+  /**
+   * A pod whose sends over one TRANSPORT keep failing - its broker out of reach while other pods
+   * may reach it - leaves that transport's rows to the other pods instead of taking every one
+   * into a failed attempt and its backoff (1.11.0, OUTBOX-FAILING-RELAY-CLAIMS-1). While paused it
+   * takes one probe row, the first {@code backoff-base} after the pause, each next one twice as
+   * long after, up to {@code max} - and any of the transport's rows due longer than {@code max},
+   * which no pod is sending; one successful send ends the pause. Per pod and per transport, for
+   * publishers that name one ({@link org.opentmf.outbox.OutboxPublisher#transport}: the library's
+   * Kafka publisher does, its HTTP publisher does not).
+   */
+  @Getter
+  @Setter
+  public static class ClaimPause {
+
+    /**
+     * Failed sends over a transport in a row, with no success between them, that pause it. 0 =
+     * never. Default 5.
+     */
+    @PositiveOrZero private int afterFailures = 5;
+
+    /**
+     * The longest wait between two probe rows while paused - and how long a paused transport's
+     * row may stay due before this pod takes it anyway (no pod is sending it). Default 1min.
+     */
+    @NotNull private Duration max = Duration.ofMinutes(1);
   }
 
   /** The bounded bulk operations' settings (the prune, the unpark by filter). */
