@@ -2024,4 +2024,225 @@ class OutboxRelayWorkerTests {
     gate.countDown();
     await().atMost(Duration.ofSeconds(5)).until(() -> lane.available() == 2);
   }
+
+
+  // ------------------------------------------------- the claim pause (1.11.0)
+
+  /** Rows to "kafka:" destinations go over the transport "kafka"; every other row names none. */
+  private void transportByDestination() {
+    doAnswer(
+            inv -> {
+              OutboxEvent row = inv.getArgument(0);
+              return row.getDestination().startsWith("kafka:") ? "kafka" : null;
+            })
+        .when(publisher)
+        .transport(any());
+  }
+
+  private OutboxEvent overKafka(long id) {
+    OutboxEvent row = pending(id, 0);
+    row.setDestination("kafka:topic");
+    return row;
+  }
+
+  private double claimsPaused(String transport) {
+    return registry
+        .get(OutboxMetrics.CLAIMS_PAUSED)
+        .tag(OutboxMetrics.TAG_TRANSPORT, transport)
+        .gauge()
+        .value();
+  }
+
+  /**
+   * OUTBOX-FAILING-RELAY-CLAIMS-1: five failed sends over one transport in a row pause it on this
+   * pod. Its next rows are left - not leased, not attempted, no backoff - while a row of another
+   * publisher behind them is taken in the same pass; once a {@code backoff-base} has passed ONE
+   * probe row goes out, and its success resumes the transport.
+   */
+  @Test
+  void fiveTransportFailuresInARow_leaveItsRowsToOtherPods_aProbeRowsSuccessResumesIt() {
+    properties.setBackoffBase(Duration.ofMillis(300));
+    transportByDestination();
+    for (long id = 1; id <= 5; id++) {
+      overKafka(id);
+    }
+    doThrow(new RuntimeException("broker unreachable")).when(publisher).deliver(any());
+
+    relay(); // five sends over kafka, five failures: paused
+    assertThat(claimsPaused("kafka")).isEqualTo(1d);
+    OutboxEvent left = overKafka(6L);
+    OutboxEvent behind = pending(7L, 0); // another publisher's row, behind the kafka rows
+    doReturn(null).when(publisher).deliver(behind);
+    OutboxRelayWorker.Batch skipping = worker.relayBatch(true);
+    orderedIdle();
+
+    assertThat(left.getAttempts()).isZero();
+    assertThat(left.getClaimedUntil()).isNull(); // not leased: due for any other pod
+    assertThat(behind.getRelayedOn()).isNotNull(); // the skip hid nothing behind it
+    assertThat(skipping.orderedFull()).isFalse(); // no claim again at once over skipped rows
+    verify(repository, atLeastOnce())
+        .claimOrdered(any(), eq(properties.getBatchSize() * OutboxRelayWorker.SKIP_WINDOW));
+
+    doReturn(null).when(publisher).deliver(any()); // the broker is back
+    await()
+        .atMost(Duration.ofSeconds(5))
+        .until(
+            () -> {
+              relay();
+              return claimsPaused("kafka") == 0d;
+            });
+    relay();
+    assertThat(left.getRelayedOn()).isNotNull();
+    assertThat(table.values()).allSatisfy(row -> assertThat(row.getRelayedOn()).isNotNull());
+  }
+
+  /** A publisher naming no transport (the HTTP one) never pauses: a dead receiver is everyone's. */
+  @Test
+  void failuresOfAPublisherWithNoTransport_neverPause() {
+    for (long id = 1; id <= 6; id++) {
+      pending(id, 0);
+    }
+    doThrow(new RuntimeException("503 from the receiver")).when(publisher).deliver(any());
+
+    relay();
+    OutboxEvent next = pending(7L, 0);
+    relay();
+
+    assertThat(registry.find(OutboxMetrics.CLAIMS_PAUSED).gauge()).isNull();
+    assertThat(next.getAttempts()).isEqualTo(1);
+  }
+
+  /** A failure the publisher calls the record's, not the transport's, never pauses. */
+  @Test
+  void failuresThePublisherDoesNotCallTransportDown_neverPause() {
+    transportByDestination();
+    doReturn(false).when(publisher).transportDown(any(), any());
+    for (long id = 1; id <= 6; id++) {
+      overKafka(id);
+    }
+    doThrow(new RuntimeException("record too large")).when(publisher).deliver(any());
+
+    relay();
+    OutboxEvent next = overKafka(7L);
+    relay();
+
+    assertThat(next.getAttempts()).isEqualTo(1);
+  }
+
+  /** A terminal refusal is the receiver's answer - the transport works: it never pauses. */
+  @Test
+  void terminalRefusals_neverPause() {
+    transportByDestination();
+    for (long id = 1; id <= 6; id++) {
+      overKafka(id);
+    }
+    doThrow(new TerminalOutboxException("422 from the receiver")).when(publisher).deliver(any());
+
+    relay();
+    OutboxEvent next = overKafka(7L);
+    relay();
+
+    assertThat(next.getAttempts()).isEqualTo(1);
+  }
+
+  /** {@code claim-pause.after-failures: 0} switches the pause off. */
+  @Test
+  void afterFailuresZero_neverPauses() {
+    properties.getClaimPause().setAfterFailures(0);
+    transportByDestination();
+    for (long id = 1; id <= 6; id++) {
+      overKafka(id);
+    }
+    doThrow(new RuntimeException("broker unreachable")).when(publisher).deliver(any());
+
+    relay();
+    OutboxEvent next = overKafka(7L);
+    relay();
+
+    assertThat(next.getAttempts()).isEqualTo(1);
+  }
+
+  /**
+   * The CONCURRENT lane, paused transport: its keys are passed over, a row of another publisher
+   * behind them is taken; the pass that filled no room does not claim again at once.
+   */
+  @Test
+  void aPausedTransportsConcurrentRows_areLeft_andTheRowsBehindThemTaken() {
+    transportByDestination();
+    for (long id = 1; id <= 6; id++) {
+      concurrent(id, "k" + id).setDestination("kafka:topic");
+    }
+    doThrow(new RuntimeException("broker unreachable")).when(publisher).deliver(any());
+    relay(); // two slots: rows 1, 2
+    relay(); // rows 3, 4
+    relay(); // rows 5, 6: paused
+    assertThat(claimsPaused("kafka")).isEqualTo(1d);
+
+    for (long id = 11; id <= 14; id++) {
+      concurrent(id, "a" + id).setDestination("kafka:topic"); // keys BEFORE the others
+    }
+    OutboxEvent other = concurrent(15L, "z15");
+    doReturn(null).when(publisher).deliver(other);
+    OutboxRelayWorker.Batch pass = worker.relayBatch(false);
+    idle(lane, 2);
+
+    assertThat(other.getRelayedOn()).isNotNull();
+    assertThat(pass.concurrentFull()).isFalse();
+    for (long id = 11; id <= 14; id++) {
+      assertThat(table.get(id).getAttempts()).as("row %d", id).isZero();
+      assertThat(table.get(id).getClaimedUntil()).as("row %d", id).isNull();
+    }
+  }
+
+  /**
+   * A paused transport's row due for longer than {@code claim-pause.max} is UNATTENDED - no pod
+   * sends the transport's rows: it is taken as before 1.11.0 (attempted, backed off), so the
+   * paused backlog never hides the rows behind it for longer than that. A fresh one is left.
+   */
+  @Test
+  void aPausedTransportsRowDueLongerThanTheCap_isTakenAsBefore_aFreshOneIsLeft() {
+    transportByDestination();
+    for (long id = 1; id <= 5; id++) {
+      overKafka(id);
+    }
+    doThrow(new RuntimeException("broker unreachable")).when(publisher).deliver(any());
+    relay(); // paused
+    OutboxEvent unattended = overKafka(6L);
+    Duration cap = properties.getClaimPause().getMax();
+    unattended.setNextAttemptOn(OffsetDateTime.now().minus(cap).minusSeconds(1));
+    OutboxEvent fresh = overKafka(7L);
+
+    relay();
+
+    assertThat(unattended.getAttempts()).isEqualTo(1); // taken: its backoff moves it aside
+    assertThat(fresh.getAttempts()).isZero(); // left for a pod that can send it
+    assertThat(fresh.getClaimedUntil()).isNull();
+  }
+
+  /**
+   * The probe is a FRESH row: a row that already failed, due again, is left for the pods that can
+   * send it - a probe on it would pay this pod's failure on the same row at every probe, up to
+   * PARKED.
+   */
+  @Test
+  void theProbe_neverTakesARowThatAlreadyFailed() {
+    properties.setBackoffBase(Duration.ofMillis(200));
+    transportByDestination();
+    for (long id = 1; id <= 5; id++) {
+      overKafka(id);
+    }
+    doThrow(new RuntimeException("broker unreachable")).when(publisher).deliver(any());
+    relay(); // paused
+    OutboxEvent failedBefore = overKafka(6L);
+    failedBefore.setAttempts(1);
+    await().pollDelay(Duration.ofMillis(300)).atMost(Duration.ofSeconds(2)).until(() -> true);
+
+    relay(); // the probe's time has come - and the only due rows already failed
+
+    assertThat(failedBefore.getAttempts()).isEqualTo(1);
+    assertThat(failedBefore.getClaimedUntil()).isNull();
+    OutboxEvent fresh = overKafka(7L);
+    relay();
+    assertThat(fresh.getAttempts()).isEqualTo(1); // the probe, a fresh row
+  }
 }

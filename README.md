@@ -549,6 +549,9 @@ opentmf:
     lease: 2m                # CONCURRENT lane default lease - renewed while a send runs
     shutdown-grace: 10s      # how long a stopping relay lets sends in flight finish
     metrics-refresh: 15s     # how often the gauges are re-read (a scrape never queries)
+    claim-pause:             # a pod whose transport is down leaves its rows to others (1.11.0)
+      after-failures: 5      # failed sends over a transport in a row that pause it; 0 = never
+      max: 1m                # longest wait between two probe rows; a row due longer is taken
     maintenance:             # the bounded bulk operations: prune, unpark by filter
       batch-size: 5000       # rows per batch - each its own short transaction
       time-budget: 10s       # one call stops after this and says more remain
@@ -588,6 +591,8 @@ opentmf:
 | `kafka.lease`    | `Duration` | `15s`   | On `CONCURRENT`: a Kafka row's lease. Must exceed `send-timeout` (validated at boot). Ignored on `ORDERED`. |
 | `shutdown-grace` | `Duration` | `10s`   | On stop: the relay thread's, the ORDERED batch's and the in-flight CONCURRENT sends' time to finish (each in turn); the rest lapse by lease. |
 | `metrics-refresh` | `Duration` | `15s`  | How often the gauges are re-read from the database; a scrape reads the last values. |
+| `claim-pause.after-failures` | `int` | `5` | Failed sends over one transport in a row (the publisher says the transport was out of reach), with no success between them, after which this pod leaves that transport's rows to the other pods (1.11.0; see "A pod whose transport is down"). `0` switches the pause off. |
+| `claim-pause.max` | `Duration` | `1m` | While paused, the pod takes one probe row: the first `backoff-base` after the pause, each next one twice as long after the one before, never longer apart than this. A paused transport's row due for longer than this is taken anyway - no pod is sending it. Positive (validated at boot). |
 | `maintenance.batch-size` | `int`    | `5000`  | Rows per batch of a bulk operation (prune, unpark by filter); each batch is its own transaction, no entity loaded. |
 | `maintenance.time-budget` | `Duration` | `10s` | One bulk call stops after this; the answer says `moreToPrune` / `moreToUnpark` and the caller calls again. |
 | `ops-endpoints`  | `boolean`  | `true`  | `false` removes the library's `/ops` controller entirely. A `@ConditionalOnProperty` key read at boot, not a bound field. |
@@ -632,6 +637,7 @@ reads the relayed history.
 | `opentmf.outbox.parked`    | gauge by `lane` | Rows with `parked_on` stamped — **alert when > 0** |
 | `opentmf.outbox.metrics-age` | gauge | Seconds since the gauges were last refreshed successfully — **alert when above a few refresh periods** (e.g. > 60 s with the default 15 s): the values above are stale or NaN |
 | `opentmf.outbox.relay-lag` | gauge by `lane` | Seconds the lane's oldest *released* pending row has been deliverable (a held row is not lagging) |
+| `opentmf.outbox.claims.paused` | gauge by `transport` | 1 while THIS pod leaves the transport's rows to the other pods after failed sends in a row, else 0 (1.11.0) — read in the pod, no database; a series per transport from its first pause (`kafka` for the library's Kafka publisher); **alert when it stays 1** on one pod while others relay: that pod cannot reach the transport |
 | `opentmf.outbox.relayed`   | counter | Successful relays, tagged by `destination`         |
 | `opentmf.outbox.dropped`   | counter | Rows given up by a publisher's DROP policy, tagged by `destination` (never counted as relayed) |
 | `opentmf.outbox.attempts`  | summary | Delivery attempts a relayed row took               |
@@ -782,6 +788,52 @@ the exhaustion outcome (the destination said retrying is pointless); any other
 `RuntimeException` is a retry. A DROP is booked as `relayed_on` + `last_error`
 + the `dropped` counter — no relayed listener fires and `relayed` is not
 incremented.
+
+#### A pod whose transport is down (1.11.0)
+
+A pod that cannot reach its transport - its Kafka broker out of reach from that pod while
+the other pods reach it, an expired client credential, a broken egress - fails every row it
+takes, while another pod might send the same rows at once. Up to 1.10.0 it kept taking them:
+every row paid an attempt and waited out its backoff, and with instant failures (a refused
+connection) it was the FASTEST claimer, its slots freeing at once. With the defaults, about
+half an hour of it parked rows a healthy pod would have sent.
+
+Since 1.11.0 a publisher may name the TRANSPORT a row goes over (`OutboxPublisher.transport`)
+and say whether a failure means the transport was out of reach (`transportDown`). After
+`claim-pause.after-failures` (5) such failures over one transport in a row, with no success
+over it between them, the pod PAUSES that transport: its rows the claim finds are left - not
+leased, not attempted, no backoff - for the other pods, except one PROBE row, the first
+`backoff-base` after the pause, each next one twice as long after the one before, up to
+`claim-pause.max` (1 min). One successful send over the transport ends the pause. A WARN line
+marks the pause and the resume; `opentmf.outbox.claims.paused{transport}` reads 1 meanwhile.
+
+- **Who names a transport.** The library's Kafka publisher names `kafka`, and counts a failure
+  as the transport's when the producer gave up waiting (metadata, delivery, acknowledgement)
+  or met another retriable error; a record the cluster refused (too large, an unauthorised
+  topic) is the record's. Its HTTP publisher names none: a receiver that is down is down for
+  every pod, and pausing would hold back every other receiver's rows (a lane-wide pause let
+  354 of 1,000 healthy rows through in a minute beside one dead subscriber; without, all
+  1,000). A consumer publisher names one only where a failure can be one pod's.
+- **What never counts.** A `TerminalOutboxException` (the receiver answered), a failed booking,
+  a lapsed lease.
+- **The probe is a fresh row** - one that never failed. A row that already failed is left for
+  the pods that can send it: probing with it would pay this pod's failure on the same row at
+  every probe, its attempts climbing towards PARKED (measured: 5 attempts on one row in 90 s
+  before the rule, at most 1 since).
+- **Rows behind are not starved, the claim does not loop.** While a transport is paused the
+  claim reads up to 10 times its limit, so the paused rows it leaves do not hide the rows
+  behind them, and it comes back "full" (claim again at once) only when it filled its room -
+  never on a pass of skipped rows. A paused transport's row due longer than `claim-pause.max`
+  is UNATTENDED - no pod is sending the transport's rows, it is down for all of them - and is
+  taken as before 1.11.0: its attempt fails and its backoff moves it aside. So a backlog of a
+  transport down everywhere holds the rows behind it back by at most `claim-pause.max`.
+- **Measured** (`OutboxFailingRelayIT`): beside a healthy pod, a pod whose transport is down
+  took 102 of 300 rows on 1.10.0 (98 on 1.9.1's claim rule), 8 since; one dead HTTP
+  receiver beside a healthy one holds nothing back (1,000 of 1,000); 30 rows behind a
+  300-row backlog of a transport down everywhere were sent within `claim-pause.max` (3 s
+  there), and no pass of skipped rows claimed again at once. Without the window the relay
+  claimed again at once over skipped rows (33 times in 4 s); without the unattended rule the
+  30 starved.
 
 ### Lanes, lease and the booking hook (`OutboxPublisher`, 1.3.0)
 
@@ -1072,6 +1124,12 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
 ```
+
+**The list filters are declared (1.11.0).** The three list operations (`/ops/outbox`,
+`/state/{state}`, `/parked`) declare the equality filters `aggregateType`, `aggregateId`,
+`eventType`, `destination`, `clientProfile` and `reference` as query parameters (components
+`outboxFilter*`, verbatim). `/parked` took them all along; up to 1.10.0 its operation did not
+say so. The toolkit's operator forms (`createdOn.gte=` and the like) stay in the descriptions.
 
 **Security is declared (1.10.0).** Every operation carries `security: [{ bearerAuth: [] }]`,
 on the operation and not the document root, so every pasted path says it is authenticated.

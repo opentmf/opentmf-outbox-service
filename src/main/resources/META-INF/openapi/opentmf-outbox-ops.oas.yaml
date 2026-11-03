@@ -63,10 +63,17 @@
 # `/ops/outbox/state/{state}` with `/ops/outbox/{id}/unpark` and `/{id}/cancel`. They never
 # meet: `{id}` is an integer (the routes take `{id:\d+}`) and `{state}` one of four words. A
 # path change would be a contract change for every consumer, for a warning.
+#
+# THE LIST FILTERS ARE DECLARED (1.11.0): the three list operations (`/ops/outbox`,
+# `/state/{state}`, `/parked`) take the same TMF630 attribute filter, and each declares its
+# equality filters as query parameters (`aggregateType`, `aggregateId`, `eventType`,
+# `destination`, `clientProfile`, `reference`). Up to 1.10.0 only the descriptions named them -
+# and `/parked`'s not even that. The toolkit's operator forms (`createdOn.gte=`, `.lt=`, the
+# null-filters) stay in the descriptions: they are filter keys, not parameters of their own.
 openapi: 3.1.0
 info:
   title: opentmf-outbox-service /ops/outbox fragment
-  version: 1.10.0
+  version: 1.11.0
   description: >-
     Paste-in contract for the outbox ops surface served by opentmf-outbox-service.
     Not a standalone API document — a fragment the consumer's OAS absorbs. The library's
@@ -98,6 +105,12 @@ paths:
             One derived-state leg: `pending`, `parked`, `relayed`, `cancelled`; an unknown
             value is a 400. Absent = every row.
           schema: { type: string, enum: [pending, parked, relayed, cancelled] }
+        - $ref: '#/components/parameters/outboxFilterAggregateType'
+        - $ref: '#/components/parameters/outboxFilterAggregateId'
+        - $ref: '#/components/parameters/outboxFilterEventType'
+        - $ref: '#/components/parameters/outboxFilterDestination'
+        - $ref: '#/components/parameters/outboxFilterClientProfile'
+        - $ref: '#/components/parameters/outboxFilterReference'
         - $ref: '#/components/parameters/outboxOffset'
         - $ref: '#/components/parameters/outboxLimit'
       responses:
@@ -128,6 +141,12 @@ paths:
           in: path
           required: true
           schema: { type: string, enum: [pending, parked, relayed, cancelled] }
+        - $ref: '#/components/parameters/outboxFilterAggregateType'
+        - $ref: '#/components/parameters/outboxFilterAggregateId'
+        - $ref: '#/components/parameters/outboxFilterEventType'
+        - $ref: '#/components/parameters/outboxFilterDestination'
+        - $ref: '#/components/parameters/outboxFilterClientProfile'
+        - $ref: '#/components/parameters/outboxFilterReference'
         - $ref: '#/components/parameters/outboxOffset'
         - $ref: '#/components/parameters/outboxLimit'
       responses:
@@ -148,8 +167,17 @@ paths:
       summary: The parked rows — runbook alias of /ops/outbox/state/parked (one code path)
       description: >-
         Parked = exhausted its publisher's attempt budget with the PARK outcome
-        (`parkedOn` stamped). The break-glass unpark takes the ids this names.
+        (`parkedOn` stamped). The break-glass unpark takes the ids this names. The same TMF630
+        attribute filters as the list apply on top (`?aggregateId=`, `?reference=`, the
+        `createdOn` ranges ...; an unknown filter field is a strict 400) - declared below
+        since 1.11.0 - with the same paging.
       parameters:
+        - $ref: '#/components/parameters/outboxFilterAggregateType'
+        - $ref: '#/components/parameters/outboxFilterAggregateId'
+        - $ref: '#/components/parameters/outboxFilterEventType'
+        - $ref: '#/components/parameters/outboxFilterDestination'
+        - $ref: '#/components/parameters/outboxFilterClientProfile'
+        - $ref: '#/components/parameters/outboxFilterReference'
         - $ref: '#/components/parameters/outboxOffset'
         - $ref: '#/components/parameters/outboxLimit'
       responses:
@@ -324,6 +352,49 @@ components:
         rejected - so the schema declares no `maximum` (1.7.0: it said 500, which a
         black-box suite reads as "501 must be refused"); 0 or a negative value is a 400.
       schema: { type: integer, minimum: 1, default: 50 }
+    outboxFilterAggregateType:
+      name: aggregateType
+      in: query
+      required: false
+      description: >-
+        TMF630 attribute filter: rows of this aggregate type (equality; the toolkit's operator
+        forms are filter keys of their own).
+      schema: { type: string }
+    outboxFilterAggregateId:
+      name: aggregateId
+      in: query
+      required: false
+      description: >-
+        TMF630 attribute filter: rows of this aggregate id.
+      schema: { type: string }
+    outboxFilterEventType:
+      name: eventType
+      in: query
+      required: false
+      description: >-
+        TMF630 attribute filter: rows of this event type.
+      schema: { type: string }
+    outboxFilterDestination:
+      name: destination
+      in: query
+      required: false
+      description: >-
+        TMF630 attribute filter: rows to this destination (a topic or a URL).
+      schema: { type: string }
+    outboxFilterClientProfile:
+      name: clientProfile
+      in: query
+      required: false
+      description: >-
+        TMF630 attribute filter: rows sent with this named HTTP client profile.
+      schema: { type: string }
+    outboxFilterReference:
+      name: reference
+      in: query
+      required: false
+      description: >-
+        TMF630 attribute filter: rows of this reference (the consumer's own correlation id).
+      schema: { type: string }
     outboxRowId:
       name: id
       in: path
