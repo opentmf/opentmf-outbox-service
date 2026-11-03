@@ -170,6 +170,35 @@ class OutboxOpsOpenApiTests {
     assertThat(headers).containsKeys("X-Total-Count", "X-Result-Count", "Content-Range", "Link");
   }
 
+  /** The equality filters every list operation takes - the row fields the toolkit filters on. */
+  private static final List<String> LIST_FILTERS =
+      List.of(
+          "aggregateType", "aggregateId", "eventType", "destination", "clientProfile", "reference");
+
+  @Test
+  @DisplayName("every list operation declares the same equality filters as query parameters (1.11.0)")
+  void listOperationsDeclareTheirFilters() {
+    @SuppressWarnings("unchecked")
+    Map<String, Map<String, Map<String, Object>>> paths =
+        (Map<String, Map<String, Map<String, Object>>>) fragment().get("paths");
+    for (String list : Set.of("/ops/outbox", "/ops/outbox/state/{state}", "/ops/outbox/parked")) {
+      @SuppressWarnings("unchecked")
+      List<Map<String, Object>> parameters =
+          (List<Map<String, Object>>) paths.get(list).get("get").get("parameters");
+      List<String> filters = new ArrayList<>();
+      for (Map<String, Object> parameter : parameters) {
+        String ref = Objects.toString(parameter.get("$ref"), "");
+        if (ref.startsWith("#/components/parameters/outboxFilter")) {
+          Map<String, Object> filter =
+              component("parameters", ref.substring(ref.lastIndexOf('/') + 1));
+          assertThat(filter).as(ref).containsEntry("in", "query");
+          filters.add(filter.get("name").toString());
+        }
+      }
+      assertThat(filters).as(list).containsExactlyElementsOf(LIST_FILTERS);
+    }
+  }
+
   @Test
   @DisplayName("the fragment names the version of the library that ships it")
   void fragmentIsVersioned() {

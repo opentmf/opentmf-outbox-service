@@ -1125,6 +1125,12 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
 ```
 
+**The list filters are declared (1.11.0).** The three list operations (`/ops/outbox`,
+`/state/{state}`, `/parked`) declare the equality filters `aggregateType`, `aggregateId`,
+`eventType`, `destination`, `clientProfile` and `reference` as query parameters (components
+`outboxFilter*`, verbatim). `/parked` took them all along; up to 1.10.0 its operation did not
+say so. The toolkit's operator forms (`createdOn.gte=` and the like) stay in the descriptions.
+
 **Security is declared (1.10.0).** Every operation carries `security: [{ bearerAuth: [] }]`,
 on the operation and not the document root, so every pasted path says it is authenticated.
 The scheme `components.securitySchemes.bearerAuth` (HTTP bearer, JWT) is marked

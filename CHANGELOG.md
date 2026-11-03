@@ -43,6 +43,16 @@ new default methods on `OutboxPublisher`, two new properties, one new gauge; no 
   transport's rows to the others, else 0; a series per transport from its first pause. A WARN
   line marks each pause and resume.
 
+### Changed (the OAS fragment - re-paste it)
+
+- **The list filters are declared** on all three list operations (`/ops/outbox`,
+  `/ops/outbox/state/{state}`, `/ops/outbox/parked`): the equality filters `aggregateType`,
+  `aggregateId`, `eventType`, `destination`, `clientProfile` and `reference` as query parameters
+  (new components `outboxFilter*`). `/ops/outbox/parked` always took the list's TMF630 filter, but
+  its operation named neither the filter nor its fields; the other two named them in prose only.
+  The toolkit's operator forms (`createdOn.gte=` and the like) stay in the descriptions. No
+  behaviour change; the fragment's `info.version` is 1.11.0.
+
 ### Build (contributors)
 
 - Every dependency and plugin is current; pitest-maven stays at 1.19.6, the deliberate hold

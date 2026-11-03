@@ -199,6 +199,20 @@ class OutboxRoundTripIT {
         .andExpect(status().isOk())
         .andExpect(jsonPath("$").isArray())
         .andExpect(jsonPath("$").isEmpty());
+    // the parked list takes the list's filters (1.11.0: declared in the fragment) - each a
+    // known filter field, never the strict unknown-field 400
+    for (String filter :
+        List.of(
+            "aggregateType", "aggregateId", "eventType", "destination", "clientProfile",
+            "reference")) {
+      mockMvc
+          .perform(get("/ops/outbox/parked").param(filter, "x"))
+          .andExpect(status().isOk())
+          .andExpect(jsonPath("$").isArray());
+    }
+    mockMvc
+        .perform(get("/ops/outbox/parked").param("noSuchField", "x"))
+        .andExpect(status().isBadRequest());
 
     // the state legs on the PATH, with the toolkit predicate still applying on top - and the
     // literal "state" segment routes past /ops/outbox/{id} (a two-segment path, no clash)
