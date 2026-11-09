@@ -7,10 +7,26 @@ library never imports that BOM (direct property pins in the pom).
 
 ## Standing rules
 
-- **Never push without Gökhan's explicit word.** `git fetch` before any
-  ahead/behind claim. Release cuts happen on his typed go: `JAVA_HOME=/usr/lib/jvm/openjdk-17
-  mvn -B release:prepare release:perform` (release profile via `releaseProfiles`,
-  Central auto-publish), then read the GAV back from repo1.maven.org.
+- **Never push without Gökhan's explicit word** - his own, or a step of an approved plan
+  from the coordinator session (`analysis-<xx>` on the dnotify-analysis repo; confirm with
+  ListAgents). `git fetch` before any ahead/behind claim.
+- **Push over HTTPS:** GitHub refuses datca's SSH key (since 2026-10-30), so push and fetch
+  with `git -c credential.helper='!gh auth git-credential' push
+  https://github.com/opentmf/opentmf-outbox-service.git <ref>`.
+- **Release cut:** `JAVA_HOME=/usr/lib/jvm/openjdk-17 mvn -B -DpushChanges=false -DskipTests
+  -Darguments="-DskipTests -DskipITs -Djacoco.skip=true" clean release:clean release:prepare`,
+  push develop and the tag over HTTPS, then `mvn -B release:perform -DlocalCheckout=true`
+  (release profile via `releaseProfiles`, Central auto-publish; the plugin's `<arguments>`
+  add `-Pinvariants`, so perform runs the tests). The enforcer execution
+  `release-runs-the-invariants` refuses a deploy without the invariants - never bypass it.
+  If perform goes red before anything is uploaded, re-run it from the tag checkout:
+  `cd target/checkout && mvn -B -Prelease,invariants clean deploy`. Signing reads
+  `MAVEN_GPG_PASSPHRASE` from the environment. Then read the GAV back from repo1.maven.org
+  (the pom and jar answer before `maven-metadata.xml` moves).
+- **The throughput bar stays absolute on release builds** (Gökhan, #2720, 2026-11-04):
+  `OutboxRelayThroughputIT`'s >= 500 rows/s at 8 slots fails under box load. Releases run on a
+  quiet box (the coordinator grants the window); a red under load is re-run quiet, never
+  switched to `-Dit.absolute-bars=false` or a relative bar.
 - **Build recipe:** `JAVA_HOME=/usr/lib/jvm/openjdk-17 mvn -Pmutation,sonar clean verify`
   (the enforcer refuses the default JDK 25; ITs need Docker — Testcontainers
   Postgres + Kafka; the local SonarQube compose stack must be up). `-Pmutation`
@@ -33,7 +49,9 @@ library never imports that BOM (direct property pins in the pom).
   statement PREPAREd under `force_custom_plan` AND `force_generic_plan`). Fix plans by
   index and query SHAPE only - no hints, no `plan_cache_mode` in the library.
 - **Merge convention:** PR to `develop`, merged as a merge commit, branch deleted.
-  Identity `gokhanus`; no AI attribution lines in this repo.
+  Identity `gokhanus`. No AI attribution anywhere (Gökhan, 2026-11-07): no
+  `Co-Authored-By: Claude` or `Claude-Session:` trailers, no "Generated with Claude Code"
+  footer in PRs, no AI provenance in release notes, CHANGELOG, README or comments.
 - **Reviews carry a plan-conformance checklist:** every enumerable plan surface is
   diffed item-by-item; an omission is a finding, not a follow-up.
 
@@ -109,9 +127,24 @@ library never imports that BOM (direct property pins in the pom).
   Roll 1.8.x -> 1.9.0 at a low backlog. The nine `java:S1181` suppressions are Gökhan's decision
   (2026-10-16, README "Sonar suppressions") - the only Sonar suppressions in the repo.
 
+- **1.9.1 (2026-10-26)** - train 7: spring-boot-starter-parent 4.1.2; two builds (`clean
+  verify` the fast loop, `-Pinvariants` the gate); the absolute rows/s bars behind
+  `-Dit.absolute-bars` (default `true`); test-clock determinism (#16, #17).
+- **1.10.0 (2026-11-02)** - train 8, #19/#20: a CONCURRENT pass short on heads another pod
+  holds locked moves past them instead of wrapping (OUTBOX-D3-FAIRNESS-INVESTIGATION-1; D3
+  asserts no premature wrap); every ops operation declares `bearerAuth` security, refinable
+  (OAS-LINT-CLEAN-1 - fragment re-paste); HttpLane ITs on a test gate; Spring ITs
+  `@DirtiesContext`; jacoco 0.8.16, enforcer 3.7.0.
+- **1.11.0 (2026-11-03)** - #21: OUTBOX-FAILING-RELAY-CLAIMS-1 - the claim pause per
+  transport (`OutboxPublisher.transport` / `transportDown`; Kafka names `kafka`, HTTP none;
+  `claim-pause.after-failures` 5, `.max` 1 min; gauge `claims.paused` by transport; a skip
+  window of 10x the limit while paused; a paused row due longer than `max` is taken as
+  before; the probe takes a fresh row only). `OutboxFailingRelayIT` is its proof. The ops
+  fragment declares its six list filters on the three list operations (fragment re-paste).
+
 ## Open
 
-- Develop is `1.9.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
-  heading `## 1.9.1 - <date>` (or the next minor's, if the row is a minor).
+- Develop is `1.11.1-SNAPSHOT`; a new CHANGELOG section uses the bare numeric
+  heading `## 1.11.1 - <date>` (or the next minor's, if the row is a minor).
 - Nothing open. `ix_outbox_pending` stays (Gökhan: OUTBOX-UNUSED-INDEX-1 closed
   2026-10-15, reaffirmed 2026-10-16 when 1.9.0's F-9 first dropped it).
