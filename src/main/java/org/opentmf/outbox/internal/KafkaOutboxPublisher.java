@@ -41,7 +41,9 @@ import tools.jackson.databind.ObjectMapper;
  * aggregate's events out of order on the topic after a broker outage. The cost: during an outage
  * each Kafka send holds its slot up to the producer's delivery timeout (120 s by default - lower
  * it on the producer to fail faster). {@link #sendTimeout} declares the whole wait, the producer's
- * {@code max.block.ms} included, so the send heartbeat keeps the lease through it.
+ * {@code max.block.ms} included, so the send heartbeat keeps the lease through it - three times for
+ * a transactional producer (1.11.1): {@code initTransactions}, the record's {@code send} and {@code
+ * commitTransaction} each block up to it on their own.
  *
  * <p>Lane ({@code opentmf.outbox.kafka.lane}, 1.5.0): ORDERED by default - the single relay
  * thread, {@code id} order within a pod, the ordered lease; with several relays rows interleave
@@ -64,7 +66,14 @@ class KafkaOutboxPublisher implements OutboxPublisher {
   /** How long the acknowledgement is awaited: the producer's delivery timeout plus its linger. */
   private final Duration acknowledgementWait;
 
-  /** The whole send at most: the producer's {@code max.block.ms} first, then the wait above. */
+  /**
+   * The whole send at most: the wait above plus the producer's {@code max.block.ms} - once for the
+   * record's {@code send} (its metadata), and for a transactional producer twice more, for {@code
+   * initTransactions} (a new producer: the first send, or the next one after a failure closed it)
+   * and {@code commitTransaction}. Up to 1.11.0 a transactional send counted it once: with a
+   * lowered delivery timeout the heartbeat interrupted a send whose every call was within the
+   * producer's own limits, and every retry, its producer new, paid the initialisation again.
+   */
   private final Duration sendBound;
 
   KafkaOutboxPublisher(
@@ -85,10 +94,9 @@ class KafkaOutboxPublisher implements OutboxPublisher {
             .plus(millis(producer, ProducerConfig.LINGER_MS_CONFIG))
             .plus(Duration.ofSeconds(1)); // the producer's own expiry, then the callback
     this.acknowledgementWait = longer(verdict, properties.getSendTimeout());
-    this.sendBound =
-        longer(
-            acknowledgementWait.plus(millis(producer, ProducerConfig.MAX_BLOCK_MS_CONFIG)),
-            properties.getSendTimeout());
+    Duration maxBlock = millis(producer, ProducerConfig.MAX_BLOCK_MS_CONFIG);
+    Duration blocking = kafkaTemplate.isTransactional() ? maxBlock.multipliedBy(3) : maxBlock;
+    this.sendBound = longer(acknowledgementWait.plus(blocking), properties.getSendTimeout());
   }
 
   /** A producer setting in milliseconds - the consumer's value, else Kafka's default. */

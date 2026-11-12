@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.11.1 - 2026-11-12
+
+### Fixed
+
+- **A transactional Kafka send is no longer interrupted while its producer is within its limits**
+  (OUTBOX-TRANSACTIONAL-SEND-BOUND-1). With a `transaction-id-prefix` a send blocks up to
+  `max.block.ms` in each of `initTransactions` (a new producer: the first send, or the next one
+  after a failure closed it), the record's `send` and `commitTransaction`, but the Kafka
+  publisher's send bound counted `max.block.ms` once. With a lowered `delivery.timeout.ms` and a
+  slow transaction coordinator, the heartbeat interrupted sends that were going to succeed, and
+  every retry - its producer closed by the failure, so new - paid the initialisation again: the
+  row never got through (measured: three calls of 4 s each under a 5 s `max.block.ms` against a
+  9 s bound, interrupted on every attempt). The transactional bound now counts `max.block.ms`
+  three times; with Kafka's defaults it grows from 181 s to 301 s. A non-transactional producer's
+  bound is unchanged. **Who was exposed:** a healthy transactional send could pass the 1.11.0
+  bound only when `2 × max.block.ms` exceeds `delivery.timeout.ms + linger.ms + 1 s` (and
+  `send-timeout`), and `3 × max.block.ms` the row's lease - Kafka's defaults miss it by one
+  second; a producer with a lowered `delivery.timeout.ms` or a raised `max.block.ms` can meet
+  it. **The cost:** a transactional send that truly hangs holds its row, its lease renewed, up
+  to the longer bound before it is interrupted (README, "The Kafka publisher waits for its
+  producer's own verdict").
+
 ## 1.11.0 - 2026-11-03
 
 A pod that cannot reach its transport leaves that transport's rows to the pods that can. Two

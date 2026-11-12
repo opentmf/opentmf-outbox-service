@@ -314,6 +314,30 @@ sequenceDiagram
   **The cost:** during a broker outage each Kafka send holds its slot up to
   the producer's delivery timeout (120 s by default, plus 60 s of
   `max.block.ms`) — lower them on the producer to fail faster.
+  **A transactional producer (`transaction-id-prefix`) counts `max.block.ms`
+  three times (1.11.1):** `initTransactions` (a new producer — the first send,
+  or the next one after a failure closed it), the record's `send` and
+  `commitTransaction` each block up to it on their own. Up to 1.11.0 the bound
+  counted it once, so with a lowered delivery timeout a slow transaction
+  coordinator made the heartbeat interrupt sends that were going to succeed —
+  and every retry, its producer new, paid the initialisation again
+  (`KafkaTransactionalSendBoundIT`: three calls of 4 s under a 5 s
+  `max.block.ms` against a 9 s bound, never delivered; delivered on the first
+  attempt since). **When 1.11.0 is exposed:** a healthy transactional send
+  could pass its bound only if `2 × max.block.ms` exceeds `delivery.timeout.ms
+  + linger.ms + 1 s` (and `send-timeout`), and `3 × max.block.ms` the row's
+  lease. Kafka's defaults (60 s, 120 s) miss it by one second; a producer that
+  lowers `delivery.timeout.ms` — as advised above — or raises `max.block.ms`
+  can meet it. **The cost of the longer bound:** a transactional send that
+  truly hangs now holds its row — its lease renewed, its ordering key in
+  flight — up to 301 s with Kafka's defaults (181 s up to 1.11.0) before the
+  heartbeat interrupts it; no other pod takes the row meanwhile, and the claim
+  pause's unattended rule does not shorten that (a leased row is not due).
+  Since the pause counts such an interrupt, a pod whose transactional sends
+  all hang pauses after about one bound on the CONCURRENT lane (the slots hang
+  together) but after `claim-pause.after-failures` bounds on the ORDERED lane
+  (one send at a time: 25 minutes with the defaults). Lower `max.block.ms`
+  and `delivery.timeout.ms` together to shorten both.
 - **At-least-once, consumer-dedupable.** A crash between delivery and booking
   means redelivery once the row's lease lapses (seconds on the ORDERED lane,
   up to the lease on the CONCURRENT lane); `x-idempotency-key = <spring.application.name>:outbox:<id>`
