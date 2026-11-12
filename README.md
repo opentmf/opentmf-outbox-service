@@ -838,8 +838,16 @@ marks the pause and the resume; `opentmf.outbox.claims.paused{transport}` reads 
   every pod, and pausing would hold back every other receiver's rows (a lane-wide pause let
   354 of 1,000 healthy rows through in a minute beside one dead subscriber; without, all
   1,000). A consumer publisher names one only where a failure can be one pod's.
+- **A send that outran its bound counts (1.11.1).** The send heartbeat interrupts a send
+  still running at its bound (the larger of its lease and its send timeout); that failure
+  counts towards the pause whatever the publisher makes of the interrupt - the transport did
+  not answer in time. Up to 1.11.0 it counted only when `transportDown` said so, and the Kafka
+  publisher's `InterruptException` is neither retriable nor a timeout: a pod whose sends hung
+  never paused. An interrupt the heartbeat did not make - the lanes' own at shutdown - counts
+  nothing.
 - **What never counts.** A `TerminalOutboxException` (the receiver answered), a failed booking,
-  a lapsed lease.
+  a lapsed lease - the pod that books it claimed the row next and never sent it; the pod that
+  did send it counted its own interrupt.
 - **The probe is a fresh row** - one that never failed. A row that already failed is left for
   the pods that can send it: probing with it would pay this pod's failure on the same row at
   every probe, its attempts climbing towards PARKED (measured: 5 attempts on one row in 90 s

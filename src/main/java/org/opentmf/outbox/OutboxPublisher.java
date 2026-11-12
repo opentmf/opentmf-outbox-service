@@ -192,7 +192,8 @@ public interface OutboxPublisher {
   /**
    * Whether a failed send over a named {@link #transport} says this pod cannot REACH it - counted
    * towards a claim pause - rather than that the receiver refused the row (not counted). Asked
-   * only for a failure that is not a {@link TerminalOutboxException}.
+   * only for a failure that is not a {@link TerminalOutboxException}, and not for a send the relay
+   * interrupted at its bound ({@link #sendTimeout}): that one counts without asking (1.11.1).
    *
    * @return {@code true} (the default) to count every failure over the transport
    */

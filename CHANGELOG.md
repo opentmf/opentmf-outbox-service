@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- **A send that outran its bound now counts towards the claim pause**
+  (OUTBOX-INTERRUPTED-SEND-COUNTS-FOR-PAUSE-1). The send heartbeat interrupts a send still
+  running at its bound; the Kafka publisher then fails with Kafka's `InterruptException`, which
+  is neither retriable nor a timeout, so `transportDown` said no and the failure never counted:
+  a pod whose Kafka sends hung - a starved host, a client that does not return - went on taking
+  the transport's rows instead of leaving them to the other pods (in 1.11.0, four counted
+  failures and an interrupted fifth left the pod unpaused until the next retry). The relay now
+  counts a send it interrupted itself, whatever the publisher makes of the interrupt. An
+  interrupt it did not make - the lanes' own at shutdown - still counts nothing, and so does
+  the lapsed lease the interrupted send leaves (the pod that books it never sent the row).
 - **A transactional Kafka send is no longer interrupted while its producer is within its limits**
   (OUTBOX-TRANSACTIONAL-SEND-BOUND-1). With a `transaction-id-prefix` a send blocks up to
   `max.block.ms` in each of `initTransactions` (a new producer: the first send, or the next one

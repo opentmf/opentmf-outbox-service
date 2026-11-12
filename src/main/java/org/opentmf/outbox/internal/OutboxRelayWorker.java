@@ -687,8 +687,11 @@ class OutboxRelayWorker {
   /**
    * One send, its verdict told to its transport's claim pause (1.11.0) when the publisher names
    * one: a success resumes it; a failure with the transport out of reach ({@link
-   * OutboxPublisher#transportDown}) counts towards a pause; a {@link TerminalOutboxException} (the
-   * receiver answered) and a refused row neither.
+   * OutboxPublisher#transportDown}) counts towards a pause, and so does a send the heartbeat
+   * interrupted at its bound (1.11.1) - whatever the publisher makes of the interrupt, the
+   * transport did not answer in time; a {@link TerminalOutboxException} (the receiver answered)
+   * and a refused row neither. An interrupt the heartbeat did not make (a shutdown) counts
+   * nothing.
    */
   private Attempt sent(Leased row) {
     Attempt attempt = send(row);
@@ -701,7 +704,7 @@ class OutboxRelayWorker {
     if (failure == null) {
       pause.succeeded();
     } else if (!(failure instanceof TerminalOutboxException)
-        && row.publisher.transportDown(row.event, failure)) {
+        && (row.interrupted || row.publisher.transportDown(row.event, failure))) {
       pause.failed(failure);
     }
     return attempt;

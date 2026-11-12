@@ -22,9 +22,11 @@ import lombok.extern.slf4j.Slf4j;
  * receiver's rows on it (measured: one dead HTTP subscriber beside a healthy one let 354 of
  * 1,000 healthy rows through in a minute under a lane-wide pause, all 1,000 without).
  *
- * <p>Only a SEND's verdict counts: a booking that failed, a lapsed lease counted as an attempt and
- * a {@link org.opentmf.outbox.TerminalOutboxException} (the receiver answered - the transport
- * works) neither pause nor resume. Thread-safe: the senders record, the relay thread asks.
+ * <p>Only a SEND's verdict counts: a booking that failed, a lapsed lease counted as an attempt (the
+ * pod that books it claimed the row next and never sent it) and a {@link
+ * org.opentmf.outbox.TerminalOutboxException} (the receiver answered - the transport works)
+ * neither pause nor resume. A send the heartbeat interrupted at its bound counts as a failure over
+ * its transport (1.11.1); the lapse it leaves does not. Thread-safe: the senders record, the relay thread asks.
  */
 @Slf4j
 final class OutboxClaimPause {
