@@ -31,6 +31,19 @@
   it. **The cost:** a transactional send that truly hangs holds its row, its lease renewed, up
   to the longer bound before it is interrupted (README, "The Kafka publisher waits for its
   producer's own verdict").
+- **A dispatch's trace no longer ends at the outbox** (OUTBOX-SEND-OBSERVATION-PARENT-1). The
+  relay copies a row's stored headers onto the record, and with
+  `spring.kafka.template.observation-enabled=true` Spring Kafka's send observation then replaced a
+  stored `traceparent` with its own producer span's - a new trace's root, since nothing was current
+  on a relay thread. The event a consumer read could not be joined to the request that appended
+  it. The same held for an HTTP profile client built with an `ObservationRegistry`. A row whose
+  stored headers carry a `traceparent` is now sent inside an `outbox relay` span, the stored span's
+  child, so the producer or client span is its child and the header that leaves continues the
+  stored trace. The span covers one send attempt; its start after the stored span's shows how long
+  the row waited (README, "Trace continuity"). A row without a stored `traceparent` is sent exactly
+  as before; the plain HTTP client, which has no observation, still forwards the stored header as
+  it is. Where the application's `ObservationRegistry` has a meter handler, the span is also the
+  timer `opentmf.outbox.relay`, for those rows only.
 
 ## 1.11.0 - 2026-11-03
 

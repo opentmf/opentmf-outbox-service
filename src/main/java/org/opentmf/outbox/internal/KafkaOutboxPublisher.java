@@ -28,8 +28,12 @@ import tools.jackson.databind.ObjectMapper;
  * {@code x-producer} ({@link OutboxHeaders}). Stored headers apply first; relay-stamped ones
  * REPLACE same-named ones. The row's {@code reference} is never sent. {@code traceparent} is
  * stamped by Micrometer's Kafka observation - which the CONSUMER enables with
- * {@code spring.kafka.template.observation-enabled=true} - never home-grown. The record value
- * is the stored JSON STRING: the consumer's value serializer must be string-compatible.
+ * {@code spring.kafka.template.observation-enabled=true} - never home-grown: it replaces a stored
+ * one. A row that stored a {@code traceparent} is sent inside the relay span ({@link
+ * OutboxRelayObservation}, 1.11.1), so the header that leaves is the producer span's, a child in
+ * the stored trace; up to 1.11.0 it was a new trace's root, and the dispatch's trace ended at the
+ * outbox. The record value is the stored JSON STRING: the consumer's value serializer must be
+ * string-compatible.
  *
  * <p>When the template is transactional the send runs in a Kafka transaction; otherwise the
  * relay awaits the broker acknowledgement synchronously so a failure is observed before the
@@ -62,6 +66,7 @@ class KafkaOutboxPublisher implements OutboxPublisher {
   private final OutboxProperties properties;
   private final ObjectMapper objectMapper;
   private final String serviceName;
+  private final OutboxRelayObservation relayObservation;
 
   /** How long the acknowledgement is awaited: the producer's delivery timeout plus its linger. */
   private final Duration acknowledgementWait;
@@ -81,10 +86,20 @@ class KafkaOutboxPublisher implements OutboxPublisher {
       OutboxProperties properties,
       ObjectMapper objectMapper,
       String serviceName) {
+    this(kafkaTemplate, properties, objectMapper, serviceName, OutboxRelayObservation.NONE);
+  }
+
+  KafkaOutboxPublisher(
+      KafkaTemplate<Object, Object> kafkaTemplate,
+      OutboxProperties properties,
+      ObjectMapper objectMapper,
+      String serviceName,
+      OutboxRelayObservation relayObservation) {
     this.kafkaTemplate = kafkaTemplate;
     this.properties = properties;
     this.objectMapper = objectMapper;
     this.serviceName = serviceName;
+    this.relayObservation = relayObservation;
     Map<String, Object> producer =
         kafkaTemplate.getProducerFactory() == null
             ? Map.of()
@@ -172,7 +187,12 @@ class KafkaOutboxPublisher implements OutboxPublisher {
 
   @Override
   public void publish(OutboxEvent event) {
-    ProducerRecord<Object, Object> producerRecord = toProducerRecord(event);
+    Map<String, String> stored = storedHeaders(event);
+    ProducerRecord<Object, Object> producerRecord = toProducerRecord(event, stored);
+    relayObservation.around(event, TRANSPORT, stored, () -> send(producerRecord, event));
+  }
+
+  private void send(ProducerRecord<Object, Object> producerRecord, OutboxEvent event) {
     if (kafkaTemplate.isTransactional()) {
       kafkaTemplate.executeInTransaction(operations -> operations.send(producerRecord));
     } else {
@@ -180,10 +200,11 @@ class KafkaOutboxPublisher implements OutboxPublisher {
     }
   }
 
-  private ProducerRecord<Object, Object> toProducerRecord(OutboxEvent event) {
+  private ProducerRecord<Object, Object> toProducerRecord(
+      OutboxEvent event, Map<String, String> stored) {
     ProducerRecord<Object, Object> producerRecord =
         new ProducerRecord<>(event.getDestination(), event.getAggregateId(), event.getPayload());
-    storedHeaders(event).forEach((name, value) -> setHeader(producerRecord, name, value));
+    stored.forEach((name, value) -> setHeader(producerRecord, name, value));
     setHeader(
         producerRecord,
         OutboxHeaders.IDEMPOTENCY_KEY,

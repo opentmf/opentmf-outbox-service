@@ -501,7 +501,30 @@ sequenceDiagram
   double-encodes it). `traceparent` on the wire is Micrometer's Kafka
   observation, which the consumer enables with
   `spring.kafka.template.observation-enabled=true`; the library stamps nothing
-  home-grown.
+  home-grown. That observation replaces a stored `traceparent` with its own
+  producer span's; the relay span (next point) is what keeps it in the stored
+  trace.
+- **Trace continuity: the `outbox relay` span (1.11.1).** A row whose stored
+  headers carry a W3C `traceparent` (any letter case) is sent inside a
+  CONSUMER-kind span named **`outbox relay`**, the child of the stored span.
+  The send's own observation opens inside it - Spring Kafka's template
+  observation, or the observation of an HTTP profile client the consumer built
+  with an `ObservationRegistry` - so the producer or client span is its child
+  and the `traceparent` that leaves is that span's: one trace from the request
+  that appended the row to the consumer that reads the event. **What it
+  measures:** one send attempt, from the relay handing the row to its
+  publisher to the publisher's verdict (a failure ends it in error); the gap
+  between the stored span and its start is the time the row waited in the
+  outbox. A retried row has one `outbox relay` span per attempt, all in the
+  same trace. It carries `outbox.id`, `outbox.event-type`,
+  `outbox.destination` and `outbox.transport` (`kafka` or `http`). The
+  registry is the application's unique `ObservationRegistry`, as
+  `KafkaTemplate` finds its own; nothing is opened without one. A row with no
+  stored `traceparent` opens no span and is sent exactly as before; a
+  malformed one makes the relay span a root. The plain HTTP client has no
+  observation and forwards the stored header as it is. **Up to 1.11.0** the
+  send's observation found nothing current on a relay thread and started a new
+  trace: with `observation-enabled` the dispatch's trace ended at the outbox.
 
 ## Relay throughput
 
@@ -665,6 +688,7 @@ reads the relayed history.
 | `opentmf.outbox.relayed`   | counter | Successful relays, tagged by `destination`         |
 | `opentmf.outbox.dropped`   | counter | Rows given up by a publisher's DROP policy, tagged by `destination` (never counted as relayed) |
 | `opentmf.outbox.attempts`  | summary | Delivery attempts a relayed row took               |
+| `opentmf.outbox.relay`     | timer   | The `outbox relay` span's observation (1.11.1), tagged by `outbox.transport` and `error`: recorded only when the application's `ObservationRegistry` has a meter handler, and only for rows that stored a `traceparent` - a trace aid, not a throughput figure |
 
 ## Usage
 
