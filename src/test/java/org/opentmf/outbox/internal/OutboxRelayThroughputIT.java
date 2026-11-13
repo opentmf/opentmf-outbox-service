@@ -3,6 +3,7 @@ package org.opentmf.outbox.internal;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
+import com.zaxxer.hikari.HikariDataSource;
 import eu.rekawek.toxiproxy.Proxy;
 import eu.rekawek.toxiproxy.ToxiproxyClient;
 import eu.rekawek.toxiproxy.model.Toxic;
@@ -30,6 +31,7 @@ import org.opentmf.outbox.OutboxProperties;
 import org.opentmf.outbox.OutboxPublisher;
 import org.opentmf.outbox.OutboxTestApplication;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
@@ -58,6 +60,14 @@ import org.testcontainers.toxiproxy.ToxiproxyContainer;
  * <p>Measured on 1.5.0 (one statement per claimed row for the key lock, one for the stamp, the
  * claim bounded by the free slots) and on 1.6.0 - the figures are printed as {@code
  * THROUGHPUT-FIGURES} and recorded in the README.
+ *
+ * <p>The rows/s bars measure the statement economy TIMES the CPU the relay gets, so another build
+ * on the box moves them. Every run therefore also counts what load cannot move (1.11.1,
+ * OUTBOX-GATE-INDEPENDENT-OF-MACHINE-LOAD-1): the application's JDBC round trips - every statement
+ * executed, every commit, rollback and isolation change on its DataSource - per relayed row, and
+ * asserts them below {@link #ROUND_TRIPS_PER_ROW}. The 1.6.0 shape costs a row its booking (one
+ * update, one commit) plus its share of a batch's claim; 1.5.x's paid two more per row. That check
+ * is additive: the absolute bars stay (Gökhan, #2720).
  */
 @Import(OutboxRelayThroughputIT.Publishers.class)
 @SpringBootTest(
@@ -83,6 +93,13 @@ class OutboxRelayThroughputIT {
    */
   private static final boolean ABSOLUTE_BARS =
       Boolean.parseBoolean(System.getProperty("it.absolute-bars", "true"));
+
+  /**
+   * The most JDBC round trips a relayed row may cost, its batch's claim shared in: 2.10 measured at
+   * 8 slots and 2.06 at 64, three times each (2026-11-14), and 2.5 - one more statement per row
+   * crosses it.
+   */
+  static final double ROUND_TRIPS_PER_ROW = 2.5;
 
   static final Network NETWORK = Network.newNetwork();
   static final PostgreSQLContainer POSTGRES =
@@ -140,6 +157,17 @@ class OutboxRelayThroughputIT {
 
   @TestConfiguration
   static class Publishers {
+
+    /** The application's pool, its round trips counted (the test's own connections are direct). */
+    @Bean
+    static BeanPostProcessor countingRoundTrips() {
+      return new BeanPostProcessor() {
+        @Override
+        public Object postProcessAfterInitialization(Object bean, String beanName) {
+          return bean instanceof HikariDataSource pool ? new RoundTrips(pool) : bean;
+        }
+      };
+    }
 
     /** "golden:" rows: CONCURRENT, keyed by aggregate, a 15 s lease (Kafka's), each send 1 ms. */
     @Bean
@@ -262,6 +290,7 @@ class OutboxRelayThroughputIT {
     proxy.toxics().latency("latency", ToxicDirection.DOWNSTREAM, LATENCY_MS);
     relay.start();
     try {
+      RoundTrips.reset();
       long started = System.nanoTime();
       relay.poke();
       await()
@@ -270,10 +299,14 @@ class OutboxRelayThroughputIT {
           .until(() -> pending() == 0);
       double seconds = (System.nanoTime() - started) / 1e9;
       double rate = ROWS / seconds;
+      double perRow = (double) RoundTrips.count() / ROWS;
       System.out.printf(
           "THROUGHPUT-FIGURES: %d rows, %d keys, latency %d ms, max-in-flight %d, batch-size %d:"
-              + " %.1f s, %.0f rows/s%n",
-          ROWS, KEYS, LATENCY_MS, maxInFlight, properties.getBatchSize(), seconds, rate);
+              + " %.1f s, %.0f rows/s, %.2f JDBC round trips per row%n",
+          ROWS, KEYS, LATENCY_MS, maxInFlight, properties.getBatchSize(), seconds, rate, perRow);
+      assertThat(perRow) // load cannot move this one: asserted whatever -Dit.absolute-bars says
+          .as("JDBC round trips per relayed row (its booking, its share of the batch's claim)")
+          .isLessThanOrEqualTo(ROUND_TRIPS_PER_ROW);
       assertThat(TWO_IN_FLIGHT.get()).as("a key with two rows in flight").isZero();
       assertThat(OUT_OF_ORDER.get()).as("a key's rows out of id order").isZero();
       return rate;
