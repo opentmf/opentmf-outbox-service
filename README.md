@@ -557,13 +557,15 @@ key ever had two sends overlapping and that each key's rows went in `id` order.
   slots and slow statements a larger batch keeps them fed.
 - The ORDERED lane is unchanged in kind: its rows go one by one on one thread (its own
   since 1.8.0), and one send plus its booking sets its pace.
-- **The bars are absolute.** `OutboxRelayThroughputIT` (500 rows/s at 8 slots, 10,000 rows
-  in under 15 s at 64) and the invariants suite's G3 (500 rows/s for two pods on a 100k
-  backlog) are calibrated on the gate's box - Linux, native Docker. A slower host, such as
-  a desktop Docker VM that adds a network hop to every statement, misses them by its own
-  pace. Run there with `-Dit.absolute-bars=false`: the figures are printed and not
-  asserted, and every functional check (the key contract, exactly-once, no starved pod)
-  still asserts. The gate itself runs with the default, `true`.
+- **The bars are absolute, and the release build's (1.11.1).** `OutboxRelayThroughputIT`
+  (500 rows/s at 8 slots, 10,000 rows in under 15 s at 64) and the invariants suite's G3
+  (500 rows/s for two pods on a 100k backlog) are calibrated on the gate's box - Linux,
+  native Docker - on a quiet machine, so another build beside them moves them. The
+  `release` profile asserts them (`it.absolute-bars=true`); every other build, the everyday
+  gate included, prints the figures and asserts what load cannot move: the **JDBC round
+  trips per relayed row** (at most 2.5; 2.10 measured at 8 slots, 2.06 at 64), and every
+  functional check (the key contract, exactly-once, no starved pod). `-Dit.absolute-bars=true`
+  asserts the bars in any build.
 
 ## Requirements
 
@@ -1462,7 +1464,11 @@ Quality gates on this repo:
   (`OutboxRelayThroughputIT`, `OutboxPruneAtScaleIT`, `OutboxBacklogIT`) and the
   JaCoCo check. It runs before every merge and in every release:
   `release:prepare` and `release:perform` pass `-Pinvariants`, and the `release`
-  profile refuses to build without it.
+  profile refuses to build without it. **Which asserts what (1.11.1):** the everyday
+  gate prints the rows/s figures and asserts the round trips per row, so it needs no
+  quiet machine; the release build (`release:perform`, the `release` profile) also asserts
+  the absolute rows/s bars, on the quiet machine a release is given (see "Relay
+  throughput").
 - JaCoCo bundle gate **90/90/90** (line/instruction/branch), unit + IT
   execution merged, checked under `-Pinvariants`; generated Querydsl classes
   excluded from the denominator.

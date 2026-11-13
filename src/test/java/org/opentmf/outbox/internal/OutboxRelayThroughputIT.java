@@ -87,12 +87,14 @@ class OutboxRelayThroughputIT {
   private static final int LATENCY_MS = Integer.getInteger("it.relay.latency-ms", 5);
 
   /**
-   * Whether the rows/s bars are asserted ({@code -Dit.absolute-bars}, default true). They are
-   * ABSOLUTE, calibrated on the gate's box; a slower host (a desktop Docker VM) runs with {@code
-   * false}: its figures are printed, the key contract still asserts.
+   * Whether the rows/s bars are asserted ({@code -Dit.absolute-bars}). They are ABSOLUTE,
+   * calibrated on the gate's box on a quiet machine, so they are the RELEASE build's (Gökhan,
+   * #2720 and #4082): the {@code release} profile sets {@code true}; every other build, the
+   * everyday gate included, prints the figures and asserts the round trips per row, which other
+   * load cannot move. Default false (1.11.1; true before).
    */
   private static final boolean ABSOLUTE_BARS =
-      Boolean.parseBoolean(System.getProperty("it.absolute-bars", "true"));
+      Boolean.parseBoolean(System.getProperty("it.absolute-bars", "false"));
 
   /**
    * The most JDBC round trips a relayed row may cost, its batch's claim shared in: 2.10 measured at
@@ -330,7 +332,7 @@ class OutboxRelayThroughputIT {
   private static void atLeast(double rate, double bar) {
     if (!ABSOLUTE_BARS) {
       System.out.printf(
-          "THROUGHPUT-FIGURES: the bar of %.0f rows/s not asserted (-Dit.absolute-bars=false)%n",
+          "THROUGHPUT-FIGURES: the bar of %.0f rows/s not asserted (the release build asserts it)%n",
           bar);
       return;
     }

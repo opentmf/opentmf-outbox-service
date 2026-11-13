@@ -590,6 +590,18 @@
       <id>release</id>
       <build>
         <plugins>
+          <!-- The absolute rows/s bars (OutboxRelayThroughputIT, the invariants' G3) are the
+               RELEASE build's, on a quiet machine (Gokhan, #2720 and #4082): every other build
+               prints the figures and asserts the round trips per row, which load cannot move. -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <systemPropertyVariables>
+                <it.absolute-bars>true</it.absolute-bars>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
           <plugin>
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-enforcer-plugin</artifactId>

@@ -104,11 +104,12 @@ class LifecycleIT {
   }
 
   /**
-   * Whether G3's rows/s bar is asserted ({@code -Dit.absolute-bars}, default true): it is ABSOLUTE,
-   * calibrated on the gate's box; a slower host runs with {@code false} and the figure prints.
+   * Whether G3's rows/s bar is asserted ({@code -Dit.absolute-bars}): it is ABSOLUTE, calibrated on
+   * the gate's box on a quiet machine - the RELEASE build's, which the {@code release} profile
+   * sets (Gökhan, #4082); every other build prints the figure. Default false (1.11.1; true before).
    */
   private static final boolean ABSOLUTE_BARS =
-      Boolean.parseBoolean(System.getProperty("it.absolute-bars", "true"));
+      Boolean.parseBoolean(System.getProperty("it.absolute-bars", "false"));
 
   /**
    * G3: two pods start together on a 100,000-row backlog - every row exactly once, throughput over
@@ -177,7 +178,7 @@ class LifecycleIT {
       f.figure("the table before the pods started: analysed " + analysed);
       slow.stream().limit(15).forEach(q -> f.figure("statement over 3 s: " + q));
       if (!ABSOLUTE_BARS) {
-        f.figure("the bar of 500 rows/s not asserted (-Dit.absolute-bars=false)");
+        f.figure("the bar of 500 rows/s not asserted (the release build asserts it)");
       } else if (rate < 500) {
         f.add(
             "S",
