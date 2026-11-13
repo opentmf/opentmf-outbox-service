@@ -1,5 +1,95 @@
 # Changelog
 
+## 1.11.1 - 2026-11-12
+
+### Added
+
+- **A row's sensitive text has a path of its own, and the views can leave it out**
+  (OUTBOX-OPS-PAYLOAD-OWN-PATH-1). `GET /ops/outbox/{id}/payload` serves a row's stored payload
+  and its full `lastError` - the failure's message, which for an HTTP 4xx or 5xx carries the
+  receiver's whole response body. With the new `opentmf.outbox.ops.sensitive-in-views=false` the
+  row views - inspect and the three lists - no longer carry them: `payload` is null and
+  `lastError` holds the failure's kind only (the exception's type name, `unclassified` for any
+  other text), so a consumer's path rules can give the payload path a stricter role than the
+  views. The default, `true`, leaves every response exactly as it was; `OutboxRowView` keeps its
+  shape. The ops OAS fragment gains the operation (`getOutboxRowPayload`, schema
+  `OutboxRowPayload`): re-paste it.
+
+### Fixed
+
+- **A send that outran its bound now counts towards the claim pause**
+  (OUTBOX-INTERRUPTED-SEND-COUNTS-FOR-PAUSE-1). The send heartbeat interrupts a send still
+  running at its bound; the Kafka publisher then fails with Kafka's `InterruptException`, which
+  is neither retriable nor a timeout, so `transportDown` said no and the failure never counted:
+  a pod whose Kafka sends hung - a starved host, a client that does not return - went on taking
+  the transport's rows instead of leaving them to the other pods (in 1.11.0, four counted
+  failures and an interrupted fifth left the pod unpaused until the next retry). The relay now
+  counts a send it interrupted itself, whatever the publisher makes of the interrupt. An
+  interrupt it did not make - the lanes' own at shutdown - still counts nothing, and so does
+  the lapsed lease the interrupted send leaves (the pod that books it never sent the row).
+- **A transactional Kafka send is no longer interrupted while its producer is within its limits**
+  (OUTBOX-TRANSACTIONAL-SEND-BOUND-1). With a `transaction-id-prefix` a send blocks up to
+  `max.block.ms` in each of `initTransactions` (a new producer: the first send, or the next one
+  after a failure closed it), the record's `send` and `commitTransaction`, but the Kafka
+  publisher's send bound counted `max.block.ms` once. With a lowered `delivery.timeout.ms` and a
+  slow transaction coordinator, the heartbeat interrupted sends that were going to succeed, and
+  every retry - its producer closed by the failure, so new - paid the initialisation again: the
+  row never got through (measured: three calls of 4 s each under a 5 s `max.block.ms` against a
+  9 s bound, interrupted on every attempt). The transactional bound now counts `max.block.ms`
+  three times; with Kafka's defaults it grows from 181 s to 301 s. A non-transactional producer's
+  bound is unchanged. **Who was exposed:** a healthy transactional send could pass the 1.11.0
+  bound only when `2 × max.block.ms` exceeds `delivery.timeout.ms + linger.ms + 1 s` (and
+  `send-timeout`), and `3 × max.block.ms` the row's lease - Kafka's defaults miss it by one
+  second; a producer with a lowered `delivery.timeout.ms` or a raised `max.block.ms` can meet
+  it. **The cost:** a transactional send that truly hangs holds its row, its lease renewed, up
+  to the longer bound before it is interrupted (README, "The Kafka publisher waits for its
+  producer's own verdict").
+- **A dispatch's trace no longer ends at the outbox** (OUTBOX-SEND-OBSERVATION-PARENT-1). The
+  relay copies a row's stored headers onto the record, and with
+  `spring.kafka.template.observation-enabled=true` Spring Kafka's send observation then replaced a
+  stored `traceparent` with its own producer span's - a new trace's root, since nothing was current
+  on a relay thread. The event a consumer read could not be joined to the request that appended
+  it. The same held for an HTTP profile client built with an `ObservationRegistry`. A row whose
+  stored headers carry a `traceparent` is now sent inside an `outbox relay` span, the stored span's
+  child, so the producer or client span is its child and the header that leaves continues the
+  stored trace. The span covers one send attempt; its start after the stored span's shows how long
+  the row waited (README, "Trace continuity"). A row without a stored `traceparent` is sent exactly
+  as before; the plain HTTP client, which has no observation, still forwards the stored header as
+  it is. Where the application's `ObservationRegistry` has a meter handler, the span is also the
+  timer `opentmf.outbox.relay`, for those rows only.
+- **The HTTP publisher's plain client ends within the send bound, the connect included**
+  (OUTBOX-HTTP-CONNECT-TIMEOUT-WITHIN-SEND-BOUND-1). Its read timeout was kept below the bound
+  (the larger of `lease` and `send-timeout`), but its connect timeout only had to be positive: a
+  connect plus a read could outlast the bound, where the send heartbeat interrupts the send and
+  lets its lease lapse. With **Apache HttpClient 5** on the classpath it was worse: Spring 7's
+  factory takes the read timeout only, so the connect ran Apache's own three minutes, past the
+  default bound, and its blocking connect ignores the interrupt on a platform thread - the lease
+  lapsed while the connect went on, another relay sent the row, and the first could still POST
+  it: the row delivered twice, two sends to one receiver in flight at once. The JDK's and Jetty's
+  clients were not exposed (their read timeout is a total from the request's start). Now:
+  - the library builds the Apache client itself, with the connect timeout set on its connections
+    (`httpclient5` is an optional dependency of the library; a consumer brings it, as before). Its
+    read timeout remains per read: README, "Timeouts".
+  - and turns off three of Apache's own defaults, each a 1.11.0 defect for every consumer with
+    Apache on its classpath (the library's plain client was Apache's system client): **a 503 or a
+    429 was sent twice inside one attempt** (Apache's retry strategy; the relay's budget never
+    counted the second POST), **a 3xx was followed** into a second request whose 2xx booked the row
+    RELAYED, and **at most five sends per receiver host were in flight** (Apache's pool), the lane's
+    other slots waiting for a connection inside their send. Now no redirect is followed, Apache
+    never retries (the relay does), and the pool holds `concurrent.max-in-flight` connections per
+    route and in all. A profile client the consumer builds on Apache must do the same (README,
+    "Timeouts").
+  - **The default connect timeout scales down with a short bound**: unset, it is 10 s or a
+    quarter of the bound, the shorter (a fixed 10 s before).
+  - **The plain client's default read timeout is shorter by the connect time**: the bound less the
+    connect timeout and a tenth of the bound - **98 s on the defaults (108 s before)**.
+  - **Refused at boot now**: explicitly SET timeouts that cannot end before the bound - an
+    `http.connect-timeout` at or past the bound, an `http.connect-timeout` plus an
+    `http.read-timeout` (set, or derived from a set connect) at or past it, or an
+    `http.read-timeout` set so close to the bound that the derived connect timeout no longer fits
+    (a 30 s bound with a 29 s read timeout: 7.5 s + 29 s). The rejected value names the figures.
+    Every configuration that leaves both timeouts unset boots as before.
+
 ## 1.11.0 - 2026-11-03
 
 A pod that cannot reach its transport leaves that transport's rows to the pods that can. Two

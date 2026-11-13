@@ -314,6 +314,30 @@ sequenceDiagram
   **The cost:** during a broker outage each Kafka send holds its slot up to
   the producer's delivery timeout (120 s by default, plus 60 s of
   `max.block.ms`) — lower them on the producer to fail faster.
+  **A transactional producer (`transaction-id-prefix`) counts `max.block.ms`
+  three times (1.11.1):** `initTransactions` (a new producer — the first send,
+  or the next one after a failure closed it), the record's `send` and
+  `commitTransaction` each block up to it on their own. Up to 1.11.0 the bound
+  counted it once, so with a lowered delivery timeout a slow transaction
+  coordinator made the heartbeat interrupt sends that were going to succeed —
+  and every retry, its producer new, paid the initialisation again
+  (`KafkaTransactionalSendBoundIT`: three calls of 4 s under a 5 s
+  `max.block.ms` against a 9 s bound, never delivered; delivered on the first
+  attempt since). **When 1.11.0 is exposed:** a healthy transactional send
+  could pass its bound only if `2 × max.block.ms` exceeds `delivery.timeout.ms
+  + linger.ms + 1 s` (and `send-timeout`), and `3 × max.block.ms` the row's
+  lease. Kafka's defaults (60 s, 120 s) miss it by one second; a producer that
+  lowers `delivery.timeout.ms` — as advised above — or raises `max.block.ms`
+  can meet it. **The cost of the longer bound:** a transactional send that
+  truly hangs now holds its row — its lease renewed, its ordering key in
+  flight — up to 301 s with Kafka's defaults (181 s up to 1.11.0) before the
+  heartbeat interrupts it; no other pod takes the row meanwhile, and the claim
+  pause's unattended rule does not shorten that (a leased row is not due).
+  Since the pause counts such an interrupt, a pod whose transactional sends
+  all hang pauses after about one bound on the CONCURRENT lane (the slots hang
+  together) but after `claim-pause.after-failures` bounds on the ORDERED lane
+  (one send at a time: 25 minutes with the defaults). Lower `max.block.ms`
+  and `delivery.timeout.ms` together to shorten both.
 - **At-least-once, consumer-dedupable.** A crash between delivery and booking
   means redelivery once the row's lease lapses (seconds on the ORDERED lane,
   up to the lease on the CONCURRENT lane); `x-idempotency-key = <spring.application.name>:outbox:<id>`
@@ -477,7 +501,30 @@ sequenceDiagram
   double-encodes it). `traceparent` on the wire is Micrometer's Kafka
   observation, which the consumer enables with
   `spring.kafka.template.observation-enabled=true`; the library stamps nothing
-  home-grown.
+  home-grown. That observation replaces a stored `traceparent` with its own
+  producer span's; the relay span (next point) is what keeps it in the stored
+  trace.
+- **Trace continuity: the `outbox relay` span (1.11.1).** A row whose stored
+  headers carry a W3C `traceparent` (any letter case) is sent inside a
+  CONSUMER-kind span named **`outbox relay`**, the child of the stored span.
+  The send's own observation opens inside it - Spring Kafka's template
+  observation, or the observation of an HTTP profile client the consumer built
+  with an `ObservationRegistry` - so the producer or client span is its child
+  and the `traceparent` that leaves is that span's: one trace from the request
+  that appended the row to the consumer that reads the event. **What it
+  measures:** one send attempt, from the relay handing the row to its
+  publisher to the publisher's verdict (a failure ends it in error); the gap
+  between the stored span and its start is the time the row waited in the
+  outbox. A retried row has one `outbox relay` span per attempt, all in the
+  same trace. It carries `outbox.id`, `outbox.event-type`,
+  `outbox.destination` and `outbox.transport` (`kafka` or `http`). The
+  registry is the application's unique `ObservationRegistry`, as
+  `KafkaTemplate` finds its own; nothing is opened without one. A row with no
+  stored `traceparent` opens no span and is sent exactly as before; a
+  malformed one makes the relay span a root. The plain HTTP client has no
+  observation and forwards the stored header as it is. **Up to 1.11.0** the
+  send's observation found nothing current on a relay thread and started a new
+  trace: with `observation-enabled` the dispatch's trace ended at the outbox.
 
 ## Relay throughput
 
@@ -510,13 +557,15 @@ key ever had two sends overlapping and that each key's rows went in `id` order.
   slots and slow statements a larger batch keeps them fed.
 - The ORDERED lane is unchanged in kind: its rows go one by one on one thread (its own
   since 1.8.0), and one send plus its booking sets its pace.
-- **The bars are absolute.** `OutboxRelayThroughputIT` (500 rows/s at 8 slots, 10,000 rows
-  in under 15 s at 64) and the invariants suite's G3 (500 rows/s for two pods on a 100k
-  backlog) are calibrated on the gate's box - Linux, native Docker. A slower host, such as
-  a desktop Docker VM that adds a network hop to every statement, misses them by its own
-  pace. Run there with `-Dit.absolute-bars=false`: the figures are printed and not
-  asserted, and every functional check (the key contract, exactly-once, no starved pod)
-  still asserts. The gate itself runs with the default, `true`.
+- **The bars are absolute, and the release build's (1.11.1).** `OutboxRelayThroughputIT`
+  (500 rows/s at 8 slots, 10,000 rows in under 15 s at 64) and the invariants suite's G3
+  (500 rows/s for two pods on a 100k backlog) are calibrated on the gate's box - Linux,
+  native Docker - on a quiet machine, so another build beside them moves them. The
+  `release` profile asserts them (`it.absolute-bars=true`); every other build, the everyday
+  gate included, prints the figures and asserts what load cannot move: the **JDBC round
+  trips per relayed row** (at most 2.5; 2.10 measured at 8 slots, 2.06 at 64), and every
+  functional check (the key contract, exactly-once, no starved pod). `-Dit.absolute-bars=true`
+  asserts the bars in any build.
 
 ## Requirements
 
@@ -565,10 +614,12 @@ opentmf:
       ordering-key: AGGREGATE_ID  # on CONCURRENT: AGGREGATE_ID | NONE
       lease: 15s             # on CONCURRENT: a Kafka row's lease, > send-timeout
     http:                    # the HTTP publisher's plain client (1.9.0)
-      connect-timeout: 10s
-      read-timeout:          # unset: max(lease, send-timeout) less a tenth (108 s here)
+      connect-timeout:       # unset: 10 s, or a quarter of max(lease, send-timeout) if shorter
+      read-timeout:          # unset: that bound less the connect and a tenth (98 s here)
     ops-endpoints: true      # serve the /ops surface (see below) - a conditional switch,
                              # not a field of OutboxProperties
+    ops:
+      sensitive-in-views: true  # false: views drop the payload, lastError = the kind only (1.11.1)
 ```
 
 | Property         | Type       | Default | Notes                                                                 |
@@ -582,8 +633,8 @@ opentmf:
 | `retention`      | `Duration` | `7d`    | Used by the prune (`OutboxMaintenanceService.prune()`): relayed AND cancelled rows. |
 | `send-timeout`   | `Duration` | `10s`   | A send's bound is the larger of its lease and this (or its publisher's `sendTimeout(event)`): the heartbeat renews a running send's lease up to it, then the send is presumed hung (1.9.0). The Kafka publisher awaits at least this long. |
 | `lease`          | `Duration` | `2m`    | Lease of a CONCURRENT row when its publisher declares none: how long a claimed row stays its holder's without a word from it. Renewed every third of it while a send runs (1.9.0); up to 1.8.0 it had to exceed the lane's longest call. |
-| `http.connect-timeout` | `Duration` | `10s` | The HTTP publisher's plain client (1.9.0; none before). Positive (validated at boot). |
-| `http.read-timeout` | `Duration` | unset | The plain client's read timeout (1.9.0; none before). Unset = the larger of `lease` and `send-timeout`, less a tenth (at least 1 s). When set it must be below that larger value (validated at boot). A profile's client keeps its own. |
+| `http.connect-timeout` | `Duration` | unset | The HTTP publisher's plain client (1.9.0; none before). Unset (1.11.1) = 10 s, or a quarter of the send bound - the larger of `lease` and `send-timeout` - when that is shorter; a fixed 10 s up to 1.11.0. Positive when set (validated at boot). |
+| `http.read-timeout` | `Duration` | unset | The plain client's read timeout (1.9.0; none before). Unset = the send bound less the connect timeout and a tenth of the bound (at least 1 s) - 98 s on the defaults (1.11.1; 108 s up to 1.11.0). When set it must be below the bound, and **the connect and read timeouts together must end before it** (1.11.1; validated at boot - see "Timeouts"). A profile's client keeps its own. |
 | `ordered.lease`  | `Duration` | `15s`   | Lease of an ORDERED row when its publisher declares none. Short on purpose: after a pod stop the row waits this long. Must exceed `send-timeout` (validated at boot). |
 | `concurrent.max-in-flight` | `int` | `8` | CONCURRENT sends in flight per pod (also the thread bound). Since 1.6.0 the claim runs ahead of the slots, so this is the lever for the lane's throughput; each send holds a connection while it books, so the pool must exceed it. |
 | `kafka.lane`     | `ORDERED`/`CONCURRENT` | `ORDERED` | The default Kafka publisher's lane (1.5.0). `CONCURRENT` = per-aggregate order across pods (see "Running several relays with Kafka"). Stamped at append. |
@@ -596,6 +647,7 @@ opentmf:
 | `maintenance.batch-size` | `int`    | `5000`  | Rows per batch of a bulk operation (prune, unpark by filter); each batch is its own transaction, no entity loaded. |
 | `maintenance.time-budget` | `Duration` | `10s` | One bulk call stops after this; the answer says `moreToPrune` / `moreToUnpark` and the caller calls again. |
 | `ops-endpoints`  | `boolean`  | `true`  | `false` removes the library's `/ops` controller entirely. A `@ConditionalOnProperty` key read at boot, not a bound field. |
+| `ops.sensitive-in-views` | `boolean` | `true` | Whether the row views (inspect and the three lists) carry the row's sensitive text (1.11.1). `false`: `payload` null and `lastError` the failure's kind only, the full text on `GET /ops/outbox/{id}/payload` - see "Ops endpoints". |
 
 ## Metrics
 
@@ -641,6 +693,7 @@ reads the relayed history.
 | `opentmf.outbox.relayed`   | counter | Successful relays, tagged by `destination`         |
 | `opentmf.outbox.dropped`   | counter | Rows given up by a publisher's DROP policy, tagged by `destination` (never counted as relayed) |
 | `opentmf.outbox.attempts`  | summary | Delivery attempts a relayed row took               |
+| `opentmf.outbox.relay`     | timer   | The `outbox relay` span's observation (1.11.1), tagged by `outbox.transport` and `error`: recorded only when the application's `ObservationRegistry` has a meter handler, and only for rows that stored a `traceparent` - a trace aid, not a throughput figure |
 
 ## Usage
 
@@ -814,8 +867,16 @@ marks the pause and the resume; `opentmf.outbox.claims.paused{transport}` reads 
   every pod, and pausing would hold back every other receiver's rows (a lane-wide pause let
   354 of 1,000 healthy rows through in a minute beside one dead subscriber; without, all
   1,000). A consumer publisher names one only where a failure can be one pod's.
+- **A send that outran its bound counts (1.11.1).** The send heartbeat interrupts a send
+  still running at its bound (the larger of its lease and its send timeout); that failure
+  counts towards the pause whatever the publisher makes of the interrupt - the transport did
+  not answer in time. Up to 1.11.0 it counted only when `transportDown` said so, and the Kafka
+  publisher's `InterruptException` is neither retriable nor a timeout: a pod whose sends hung
+  never paused. An interrupt the heartbeat did not make - the lanes' own at shutdown - counts
+  nothing.
 - **What never counts.** A `TerminalOutboxException` (the receiver answered), a failed booking,
-  a lapsed lease.
+  a lapsed lease - the pod that books it claimed the row next and never sent it; the pod that
+  did send it counted its own interrupt.
 - **The probe is a fresh row** - one that never failed. A row that already failed is left for
   the pods that can send it: probing with it would pay this pod's failure on the same row at
   every probe, its attempts climbing towards PARKED (measured: 5 attempts on one row in 90 s
@@ -892,15 +953,47 @@ client. **A row that NAMES a profile the resolver does not know (1.9.0)** —
 goes out through the plain client, without the profile's authentication (up
 to 1.8.0 it did).
 
-**Timeouts (1.9.0).** The plain client has a connect timeout
-(`opentmf.outbox.http.connect-timeout`, 10 s) and a read timeout
-(`opentmf.outbox.http.read-timeout`; by default the larger of `lease` and
-`send-timeout` less a tenth — 108 s with the defaults — and when set it must
-be below that larger value, validated at startup). It is the client
-`RestClient.create()` picks from the classpath (Apache HttpClient 5, Jetty,
-Reactor Netty, else the JDK's), its timeouts set; Apache takes the read
-timeout only. Up to 1.8.0 the plain client had no timeout: a receiver that
-never answered held its send and its lease. **A profile's client keeps its
+**Timeouts (1.9.0; within the send bound since 1.11.1).** The plain client has
+a connect timeout (`opentmf.outbox.http.connect-timeout`) and a read timeout
+(`opentmf.outbox.http.read-timeout`), and **together they end before the send
+bound**, the larger of `lease` and `send-timeout`: at the bound the send
+heartbeat interrupts the send and lets its lease lapse, and a client that
+ignores the interrupt would go on while another relay sends the row. Unset,
+the connect timeout is 10 s, or a quarter of the bound when that is shorter,
+and the read timeout is the bound less the connect timeout and a tenth of the
+bound (at least 1 s): 10 s + 98 s against the default 2 min. A configuration
+that SETS them so that they cannot end before the bound is refused at
+startup; the rejected value names the figures (`connect PT10S + read PT25S is
+not below the send bound PT30S`). It is the client `RestClient.create()` picks
+from the classpath, its timeouts set:
+
+| Client (picked in this order) | Connect timeout | Read timeout | Past the send bound | Redirects, retries, connections |
+|---|---|---|---|---|
+| Apache HttpClient 5 | set on its connections (1.11.1; Apache's own 3 min before) | **per read** (inactivity) | the connect and each read end in time; a receiver that drips its response slower than the read timeout but never stops can outlast the bound, and on a platform thread the blocking read ignores the interrupt - virtual threads (Boot's `spring.threads.virtual.enabled`) honour it | the library builds it (1.11.1): a 3xx is **not followed**, Apache **never retries** (the relay does), and its pool holds `concurrent.max-in-flight` connections per route and in all |
+| Jetty | set | a **total** from the request's queueing, the connect included | ends in time | Jetty's defaults (it follows a 3xx) |
+| Reactor Netty | set | after the request is sent | the two add up, and the check above keeps the sum in the bound | Reactor's defaults (no redirect, no retry) |
+| the JDK's (none of the above present) | set | a **total** from the request's start, the connect included | ends in time | the JDK's defaults (no redirect, no retry, no pool limit) |
+
+**Apache HttpClient 5's own defaults, up to 1.11.0** (the client
+`HttpClients.createSystem()` builds, which Spring's factory used), were each a
+defect for a consumer with Apache on its classpath: a 503 or a 429 was **sent
+twice inside one attempt** (its retry strategy re-sends them once, and the
+relay's budget never counted the second POST); a 3xx was **followed** into a
+second request, whose 2xx booked the row RELAYED although the receiver never
+processed it; and **at most five sends per receiver host** were in flight
+(its pool's per-route limit), the rest of the lane's slots waiting for a
+connection inside their send, lease and slot held. **A profile's client built
+on Apache must do the same**: `disableRedirectHandling()`,
+`disableAutomaticRetries()`, and a pool of at least `concurrent.max-in-flight`
+per route - the library cannot reach a client the consumer builds.
+
+Up to 1.11.0 the default read timeout did not leave room for the connect (a
+30 s lease: 10 s + 27 s), and with Apache the connect ran Apache's own three
+minutes, past the default bound: the lease lapsed while the connect went on,
+another relay sent the row, and the first could still POST it - the row
+delivered twice, and two sends to one receiver in flight at once. Up to 1.8.0
+the plain client had no timeout: a receiver that never answered held its send
+and its lease. **A profile's client keeps its
 own timeouts — set them below its rows' lease**, or a hung call runs to the
 send's bound and its lapse counts as a failed attempt.
 
@@ -952,7 +1045,22 @@ surface):
 | GET    | `/ops/outbox`                 | TMF630 triage list (attribute filtering + paging), payloads omitted; `?state=` (1.4.0) narrows it to one derived-state leg like the path form below |
 | GET    | `/ops/outbox/state/{state}`   | The list narrowed to one derived-state leg (`pending`, `parked`, `relayed`, `cancelled`; unknown → 400), same filtering + paging on top |
 | GET    | `/ops/outbox/parked`          | Runbook alias of `/ops/outbox/state/parked`                           |
-| GET    | `/ops/outbox/{id}`            | One row in full — payload + `last_error`, the pre-unpark forensic read (behind the consumer's admin role, by ruling) |
+| GET    | `/ops/outbox/{id}`            | One row in full — payload + `last_error`, the pre-unpark forensic read (behind the consumer's admin role, by ruling); without them under `ops.sensitive-in-views=false` |
+| GET    | `/ops/outbox/{id}/payload`    | The row's sensitive text alone, on its own path (1.11.1): `{"id", "payload", "lastError"}` - the stored payload and the full failure text; never the stored headers |
+
+**The sensitive text on its own path (1.11.1).** A row's payload is the customer's data, and so
+is its `lastError`: it is the failure's message, and for an HTTP 4xx or 5xx Spring puts the
+receiver's whole response body into it - a receiver that echoes the request echoes the
+customer. Up to 1.11.0 an administrator who could read the views read both: the payload on the
+inspect, `lastError` on every list. `GET /ops/outbox/{id}/payload` now serves them on a path of
+their own, and with `opentmf.outbox.ops.sensitive-in-views=false` **the views no longer carry
+them**: `payload` is null, and `lastError` holds the failure's kind only - the exception's type
+name, the leading token of the stored text when it has that shape (`unclassified` for any
+other text, never a piece of it), so list triage still sees what failed. The values are not in
+the response record at all, so a `fields=` selection cannot bring them back. The default,
+`true`, leaves every view exactly as it was. The library adds no security: the consumer gives
+the payload path its stricter role in its own rules, **matching `/ops/outbox/*/payload` before
+`/ops/outbox/*`** (Spring Security takes the first match).
 
 The row routes take an id of **digits only** (`{id:\d+}`, 1.7.0). A literal sibling segment
 is never read as an id: `GET /ops/outbox/unpark` is the 405 of a path that serves POST only
@@ -1065,9 +1173,9 @@ problem-detail mapper).
 | Code | On | Answered by | Component |
 |---|---|---|---|
 | 400 | the three lists | the toolkit (`Tmf630Error`, application/json) - with its undeclared-query-parameter guard on REJECT also for Spring's `page` / `size`; an unknown state leg: the library, rendered by the consumer (problem) | `outboxBadRequest` |
-| 400 | the three row routes | Spring's binding: digits beyond int64 (problem); on the inspect GET also the toolkit guard on REJECT: an undeclared query parameter (`Tmf630Error`) | `outboxRowIdOutOfRange` on the POSTs, `outboxInspectBadRequest` on the GET |
+| 400 | the four row routes | Spring's binding: digits beyond int64 (problem); on the two GETs (inspect, payload) also the toolkit guard on REJECT: an undeclared query parameter (`Tmf630Error`) | `outboxRowIdOutOfRange` on the POSTs, `outboxInspectBadRequest` on the GETs |
 | 400 | the bulk unpark | the library (no destination) or Spring (unreadable body) | `outboxUnparkFilterBadRequest` |
-| 404 | the three row routes | the library (no such row); an id that is not digits matches no route | `outboxRowNotFound` |
+| 404 | the four row routes | the library (no such row); an id that is not digits matches no route | `outboxRowNotFound` |
 | 409 | the single unpark and cancel | the library (the row is not in the state the action needs) | `outboxUnparkConflict`, `outboxCancelConflict` |
 | 416 | the three lists | the toolkit (`Tmf630Error`) | `outboxRangeNotSatisfiable` |
 | 401, 403, 503 | every operation | the consumer's security | `outboxUnauthorized`, `outboxForbidden`, `outboxServiceUnavailable` |
@@ -1356,7 +1464,11 @@ Quality gates on this repo:
   (`OutboxRelayThroughputIT`, `OutboxPruneAtScaleIT`, `OutboxBacklogIT`) and the
   JaCoCo check. It runs before every merge and in every release:
   `release:prepare` and `release:perform` pass `-Pinvariants`, and the `release`
-  profile refuses to build without it.
+  profile refuses to build without it. **Which asserts what (1.11.1):** the everyday
+  gate prints the rows/s figures and asserts the round trips per row, so it needs no
+  quiet machine; the release build (`release:perform`, the `release` profile) also asserts
+  the absolute rows/s bars, on the quiet machine a release is given (see "Relay
+  throughput").
 - JaCoCo bundle gate **90/90/90** (line/instruction/branch), unit + IT
   execution merged, checked under `-Pinvariants`; generated Querydsl classes
   excluded from the denominator.
@@ -1453,7 +1565,7 @@ Accepted survivors, each reviewed:
 | `OutboxRelayWorker.renew` | a lapsed ORDERED row's `return true` → `false` | Harmless: the booking then renews the NEXT row one turn early - nothing is sent out of turn, and the lapsed row is still counted, never sent |
 | `OutboxSendHeartbeat.finished` | removed `unlock` | Equivalent: a finished row leaves the sending set and is never locked by the heartbeat again |
 | `OutboxSendHeartbeat` thread factory | removed `setDaemon` | As the other factories: asserted where the thread runs, missed by PIT's per-line mapping |
-| `OutboxHttpClients` | the Apache, Jetty and Reactor branches (no coverage); the JDK client's read timeout; `present` → false | None of those clients is on the unit-test classpath, by design (and `present` false is that classpath's own answer); the read timeout is the suite's F4 |
+| `OutboxHttpClients` | the Jetty and Reactor branches (no coverage); the clients' read timeouts; `present` → false | Neither client is on the unit-test classpath, by design; Apache's (picked here since 1.11.1) and the JDK's connect timeouts are the stalled-connect cells of `OutboxHttpClientsTests`, their read timeouts the suite's F4 on both clients |
 
 `NO_COVERAGE` entries (the Kafka publisher bean method) are exercised by the
 Testcontainers ITs, which the posture deliberately keeps out of PIT (unit tests

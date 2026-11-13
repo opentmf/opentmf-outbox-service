@@ -124,6 +124,7 @@ class OutboxOpsRoutingTests {
       }
     }
 
-    assertThat(idRoutes).hasSize(3).allMatch(path -> path.contains("{id:\\d+}"));
+    // inspect, payload (1.11.1), unpark, cancel
+    assertThat(idRoutes).hasSize(4).allMatch(path -> path.contains("{id:\\d+}"));
   }
 }

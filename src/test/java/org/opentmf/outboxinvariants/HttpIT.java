@@ -5,14 +5,26 @@ import static org.awaitility.Awaitility.await;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
-import org.junit.jupiter.api.Test;
+import java.util.stream.Stream;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.opentmf.outbox.OutboxAppend;
 import org.opentmf.outbox.OutboxHeaders;
 import org.opentmf.outboxinvariants.HttpReceiver.Answer;
 import org.opentmf.outboxinvariants.HttpReceiver.Request;
 
-/** F - the library's own HTTP publisher against a programmable receiver. */
+/**
+ * F - the library's own HTTP publisher against a programmable receiver, each scenario on both plain
+ * clients (1.11.1): Apache HttpClient, which this classpath carries and so the library picks, and
+ * the JDK's, which a consumer without Apache gets ({@code it.http.client=jdk}, PodApp).
+ */
 class HttpIT {
+
+  /** The scenario's properties, on that plain client. */
+  private static String[] on(String client, String... properties) {
+    return Stream.concat(Stream.of(properties), Stream.of("it.http.client=" + client))
+        .toArray(String[]::new);
+  }
 
   private static final String[] HTTP = {
     "it.http.profiles=true",
@@ -29,9 +41,10 @@ class HttpIT {
    * F1: a row naming a client profile the resolver does not know - parked with the reason, never
    * sent through the plain client (no auth); a known profile is used.
    */
-  @Test
-  void f1_anUnknownClientProfile_parksWithTheReason() {
-    try (Scenario s = Scenario.start("F1-unknown-client-profile", 1, HTTP);
+  @ParameterizedTest(name = "{0}")
+  @ValueSource(strings = {"apache", "jdk"})
+  void f1_anUnknownClientProfile_parksWithTheReason(String client) {
+    try (Scenario s = Scenario.start("F1-unknown-client-profile-" + client, 1, on(client, HTTP));
         HttpReceiver http = new HttpReceiver()) {
       long known = s.pod(0).append(row(http.url("/f1/known"), "known").withClientProfile("good"));
       long unknown =
@@ -59,9 +72,10 @@ class HttpIT {
   }
 
   /** F2: a 401 once, on a profile whose client re-authenticates - relayed in ONE attempt. */
-  @Test
-  void f2_a401Once_reAuthenticates_relayedInOneAttempt() {
-    try (Scenario s = Scenario.start("F2-401-reauth", 1, HTTP);
+  @ParameterizedTest(name = "{0}")
+  @ValueSource(strings = {"apache", "jdk"})
+  void f2_a401Once_reAuthenticates_relayedInOneAttempt(String client) {
+    try (Scenario s = Scenario.start("F2-401-reauth-" + client, 1, on(client, HTTP));
         HttpReceiver http = new HttpReceiver()) {
       http.answer("/f2", n -> n == 1 ? Answer.status(401) : Answer.ok());
       long id = s.pod(0).append(row(http.url("/f2"), "f2").withClientProfile("auth"));
@@ -83,9 +97,10 @@ class HttpIT {
    * F3: a stored header named like a client default header - ONE header arrives, the stored one; a
    * stored header named like a relay header - ONE, the relay's.
    */
-  @Test
-  void f3_storedHeaderVsClientHeader_oneHeaderTheStoredOne() {
-    try (Scenario s = Scenario.start("F3-header-collision", 1, HTTP);
+  @ParameterizedTest(name = "{0}")
+  @ValueSource(strings = {"apache", "jdk"})
+  void f3_storedHeaderVsClientHeader_oneHeaderTheStoredOne(String client) {
+    try (Scenario s = Scenario.start("F3-header-collision-" + client, 1, on(client, HTTP));
         HttpReceiver http = new HttpReceiver()) {
       s.pod(0)
           .append(
@@ -114,18 +129,21 @@ class HttpIT {
    * the send timeout and counts as a failed attempt; it never holds a slot for as long as the
    * receiver likes. Two pods, a five-second lease.
    */
-  @Test
-  void f4_aSlowLorisReceiver_timesOut_andCountsAnAttempt() {
+  @ParameterizedTest(name = "{0}")
+  @ValueSource(strings = {"apache", "jdk"})
+  void f4_aSlowLorisReceiver_timesOut_andCountsAnAttempt(String client) {
     try (Scenario s =
             Scenario.start(
-                "F4-slow-loris",
+                "F4-slow-loris-" + client,
                 2,
-                "it.http.profiles=true",
-                "opentmf.outbox.lease=5s",
-                "opentmf.outbox.send-timeout=2s",
-                "opentmf.outbox.max-attempts=5",
-                "opentmf.outbox.backoff-base=200ms",
-                "opentmf.outbox.backoff-cap=1s");
+                on(
+                    client,
+                    "it.http.profiles=true",
+                    "opentmf.outbox.lease=5s",
+                    "opentmf.outbox.send-timeout=2s",
+                    "opentmf.outbox.max-attempts=5",
+                    "opentmf.outbox.backoff-base=200ms",
+                    "opentmf.outbox.backoff-cap=1s"));
         HttpReceiver http = new HttpReceiver()) {
       // request 1 never answers (12 s, then the status); request 2 sends its headers and stalls the
       // body
@@ -175,9 +193,10 @@ class HttpIT {
   }
 
   /** F5: 200 with a body, 204, 202 - relayed; a 302 - not followed into a second POST. */
-  @Test
-  void f5_2xxVariantsRelay_a3xxIsNeverFollowedIntoASecondPost() {
-    try (Scenario s = Scenario.start("F5-2xx-and-3xx", 1, HTTP);
+  @ParameterizedTest(name = "{0}")
+  @ValueSource(strings = {"apache", "jdk"})
+  void f5_2xxVariantsRelay_a3xxIsNeverFollowedIntoASecondPost(String client) {
+    try (Scenario s = Scenario.start("F5-2xx-and-3xx-" + client, 1, on(client, HTTP));
         HttpReceiver http = new HttpReceiver()) {
       http.answer(
           "/f5/200",

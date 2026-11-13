@@ -28,8 +28,12 @@ import tools.jackson.databind.ObjectMapper;
  * {@code x-producer} ({@link OutboxHeaders}). Stored headers apply first; relay-stamped ones
  * REPLACE same-named ones. The row's {@code reference} is never sent. {@code traceparent} is
  * stamped by Micrometer's Kafka observation - which the CONSUMER enables with
- * {@code spring.kafka.template.observation-enabled=true} - never home-grown. The record value
- * is the stored JSON STRING: the consumer's value serializer must be string-compatible.
+ * {@code spring.kafka.template.observation-enabled=true} - never home-grown: it replaces a stored
+ * one. A row that stored a {@code traceparent} is sent inside the relay span ({@link
+ * OutboxRelayObservation}, 1.11.1), so the header that leaves is the producer span's, a child in
+ * the stored trace; up to 1.11.0 it was a new trace's root, and the dispatch's trace ended at the
+ * outbox. The record value is the stored JSON STRING: the consumer's value serializer must be
+ * string-compatible.
  *
  * <p>When the template is transactional the send runs in a Kafka transaction; otherwise the
  * relay awaits the broker acknowledgement synchronously so a failure is observed before the
@@ -41,7 +45,9 @@ import tools.jackson.databind.ObjectMapper;
  * aggregate's events out of order on the topic after a broker outage. The cost: during an outage
  * each Kafka send holds its slot up to the producer's delivery timeout (120 s by default - lower
  * it on the producer to fail faster). {@link #sendTimeout} declares the whole wait, the producer's
- * {@code max.block.ms} included, so the send heartbeat keeps the lease through it.
+ * {@code max.block.ms} included, so the send heartbeat keeps the lease through it - three times for
+ * a transactional producer (1.11.1): {@code initTransactions}, the record's {@code send} and {@code
+ * commitTransaction} each block up to it on their own.
  *
  * <p>Lane ({@code opentmf.outbox.kafka.lane}, 1.5.0): ORDERED by default - the single relay
  * thread, {@code id} order within a pod, the ordered lease; with several relays rows interleave
@@ -60,11 +66,19 @@ class KafkaOutboxPublisher implements OutboxPublisher {
   private final OutboxProperties properties;
   private final ObjectMapper objectMapper;
   private final String serviceName;
+  private final OutboxRelayObservation relayObservation;
 
   /** How long the acknowledgement is awaited: the producer's delivery timeout plus its linger. */
   private final Duration acknowledgementWait;
 
-  /** The whole send at most: the producer's {@code max.block.ms} first, then the wait above. */
+  /**
+   * The whole send at most: the wait above plus the producer's {@code max.block.ms} - once for the
+   * record's {@code send} (its metadata), and for a transactional producer twice more, for {@code
+   * initTransactions} (a new producer: the first send, or the next one after a failure closed it)
+   * and {@code commitTransaction}. Up to 1.11.0 a transactional send counted it once: with a
+   * lowered delivery timeout the heartbeat interrupted a send whose every call was within the
+   * producer's own limits, and every retry, its producer new, paid the initialisation again.
+   */
   private final Duration sendBound;
 
   KafkaOutboxPublisher(
@@ -72,10 +86,20 @@ class KafkaOutboxPublisher implements OutboxPublisher {
       OutboxProperties properties,
       ObjectMapper objectMapper,
       String serviceName) {
+    this(kafkaTemplate, properties, objectMapper, serviceName, OutboxRelayObservation.NONE);
+  }
+
+  KafkaOutboxPublisher(
+      KafkaTemplate<Object, Object> kafkaTemplate,
+      OutboxProperties properties,
+      ObjectMapper objectMapper,
+      String serviceName,
+      OutboxRelayObservation relayObservation) {
     this.kafkaTemplate = kafkaTemplate;
     this.properties = properties;
     this.objectMapper = objectMapper;
     this.serviceName = serviceName;
+    this.relayObservation = relayObservation;
     Map<String, Object> producer =
         kafkaTemplate.getProducerFactory() == null
             ? Map.of()
@@ -85,10 +109,9 @@ class KafkaOutboxPublisher implements OutboxPublisher {
             .plus(millis(producer, ProducerConfig.LINGER_MS_CONFIG))
             .plus(Duration.ofSeconds(1)); // the producer's own expiry, then the callback
     this.acknowledgementWait = longer(verdict, properties.getSendTimeout());
-    this.sendBound =
-        longer(
-            acknowledgementWait.plus(millis(producer, ProducerConfig.MAX_BLOCK_MS_CONFIG)),
-            properties.getSendTimeout());
+    Duration maxBlock = millis(producer, ProducerConfig.MAX_BLOCK_MS_CONFIG);
+    Duration blocking = kafkaTemplate.isTransactional() ? maxBlock.multipliedBy(3) : maxBlock;
+    this.sendBound = longer(acknowledgementWait.plus(blocking), properties.getSendTimeout());
   }
 
   /** A producer setting in milliseconds - the consumer's value, else Kafka's default. */
@@ -164,7 +187,12 @@ class KafkaOutboxPublisher implements OutboxPublisher {
 
   @Override
   public void publish(OutboxEvent event) {
-    ProducerRecord<Object, Object> producerRecord = toProducerRecord(event);
+    Map<String, String> stored = storedHeaders(event);
+    ProducerRecord<Object, Object> producerRecord = toProducerRecord(event, stored);
+    relayObservation.around(event, TRANSPORT, stored, () -> send(producerRecord, event));
+  }
+
+  private void send(ProducerRecord<Object, Object> producerRecord, OutboxEvent event) {
     if (kafkaTemplate.isTransactional()) {
       kafkaTemplate.executeInTransaction(operations -> operations.send(producerRecord));
     } else {
@@ -172,10 +200,11 @@ class KafkaOutboxPublisher implements OutboxPublisher {
     }
   }
 
-  private ProducerRecord<Object, Object> toProducerRecord(OutboxEvent event) {
+  private ProducerRecord<Object, Object> toProducerRecord(
+      OutboxEvent event, Map<String, String> stored) {
     ProducerRecord<Object, Object> producerRecord =
         new ProducerRecord<>(event.getDestination(), event.getAggregateId(), event.getPayload());
-    storedHeaders(event).forEach((name, value) -> setHeader(producerRecord, name, value));
+    stored.forEach((name, value) -> setHeader(producerRecord, name, value));
     setHeader(
         producerRecord,
         OutboxHeaders.IDEMPOTENCY_KEY,

@@ -1,6 +1,7 @@
 package org.opentmf.outbox.internal;
 
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.observation.ObservationRegistry;
 import java.time.Clock;
 import java.util.List;
 import org.opentmf.outbox.OutboxClientProfileResolver;
@@ -199,6 +200,15 @@ public class OutboxAutoConfiguration {
     return new TransactionTemplate(transactionManager);
   }
 
+  /**
+   * The relay span's registry (1.11.1): the application's {@link ObservationRegistry}, found as
+   * {@code KafkaTemplate} finds its own - the unique one, else none - so the relay span and the
+   * template's observation share their handlers. No registry: the relay span is never opened.
+   */
+  static OutboxRelayObservation relayObservation(ObjectProvider<ObservationRegistry> registry) {
+    return new OutboxRelayObservation(registry.getIfUnique(() -> ObservationRegistry.NOOP));
+  }
+
   @Bean
   OutboxRelay outboxRelay(
       OutboxRelayWorker worker,
@@ -255,12 +265,14 @@ public class OutboxAutoConfiguration {
         KafkaTemplate<Object, Object> kafkaTemplate,
         OutboxProperties properties,
         ObjectMapper objectMapper,
-        Environment environment) {
+        Environment environment,
+        ObjectProvider<ObservationRegistry> observationRegistry) {
       return new KafkaOutboxPublisher(
           kafkaTemplate,
           properties,
           objectMapper,
-          environment.getProperty("spring.application.name", "unknown"));
+          environment.getProperty("spring.application.name", "unknown"),
+          relayObservation(observationRegistry));
     }
   }
 
@@ -274,13 +286,17 @@ public class OutboxAutoConfiguration {
         ObjectProvider<OutboxClientProfileResolver> profileResolver,
         ObjectMapper objectMapper,
         Environment environment,
-        OutboxProperties properties) {
+        OutboxProperties properties,
+        ObjectProvider<ObservationRegistry> observationRegistry) {
       return new HttpOutboxPublisher(
           OutboxHttpClients.plain(
-              properties.getHttp().getConnectTimeout(), properties.httpReadTimeout()),
+              properties.httpConnectTimeout(),
+              properties.httpReadTimeout(),
+              properties.getConcurrent().getMaxInFlight()),
           profileResolver.getIfAvailable(),
           objectMapper,
-          environment.getProperty("spring.application.name", "unknown"));
+          environment.getProperty("spring.application.name", "unknown"),
+          relayObservation(observationRegistry));
     }
   }
 

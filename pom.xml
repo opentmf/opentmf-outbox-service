@@ -137,6 +137,15 @@
          A consumer wanting NAMED authenticated clients brings the
          opentmf-http-clients starter itself and implements the resolver - the
          library stays free of that starter's mandatory configuration surface. -->
+    <!-- Apache HttpClient 5 - OPTIONAL, compiled against only: when a consumer has it on its
+         classpath, RestClient (and the HTTP publisher's plain client) pick it, and the library
+         builds that client itself so its CONNECT timeout is set (Spring 7's factory takes the
+         read timeout only; Apache's own connect timeout is three minutes). -->
+    <dependency>
+      <groupId>org.apache.httpcomponents.client5</groupId>
+      <artifactId>httpclient5</artifactId>
+      <optional>true</optional>
+    </dependency>
 
     <!-- ================================================================ -->
     <!-- The /ops trio: REST + the TMF630 toolkit list (the list endpoint  -->
@@ -165,6 +174,11 @@
     <dependency>
       <groupId>io.micrometer</groupId>
       <artifactId>micrometer-core</artifactId>
+    </dependency>
+    <!-- The relay span (1.11.1) uses the Observation API directly; micrometer-core brings it too. -->
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-observation</artifactId>
     </dependency>
 
     <!-- The library-provided seal rule (OutboxArchRules) — optional: only test
@@ -242,6 +256,19 @@
     <dependency>
       <groupId>org.springframework.kafka</groupId>
       <artifactId>spring-kafka-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- The relay span's proof (1.11.1): a real OpenTelemetry tracer behind Micrometer's handlers,
+         wired by the tests themselves (TestTracing) - no Boot tracing auto-configuration, so no
+         other test context traces anything. -->
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-tracing-bridge-otel</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.opentelemetry</groupId>
+      <artifactId>opentelemetry-sdk-testing</artifactId>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -563,6 +590,18 @@
       <id>release</id>
       <build>
         <plugins>
+          <!-- The absolute rows/s bars (OutboxRelayThroughputIT, the invariants' G3) are the
+               RELEASE build's, on a quiet machine (Gokhan, #2720 and #4082): every other build
+               prints the figures and asserts the round trips per row, which load cannot move. -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <systemPropertyVariables>
+                <it.absolute-bars>true</it.absolute-bars>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
           <plugin>
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-enforcer-plugin</artifactId>

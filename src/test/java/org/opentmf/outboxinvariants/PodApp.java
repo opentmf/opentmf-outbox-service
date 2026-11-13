@@ -5,9 +5,13 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.opentmf.outbox.OutboxClientProfileResolver;
+import org.opentmf.outbox.OutboxProperties;
+import org.opentmf.outbox.OutboxPublisher;
 import org.opentmf.outbox.OutboxRelayedListener;
+import org.opentmf.outbox.internal.JdkPlainHttpPublisher;
 import org.opentmf.outbox.internal.OutboxClock;
 import org.opentmf.outbox.internal.OutboxEventRepository;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.convert.DurationStyle;
@@ -19,6 +23,7 @@ import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.client.RestClient;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * One pod of a scenario: a consumer-shaped application with the library auto-configured, the
@@ -86,6 +91,26 @@ public class PodApp {
       }
       return null;
     };
+  }
+
+  /**
+   * The library's HTTP publisher on the JDK's plain client (HttpIT's second run, 1.11.1): ahead of
+   * the library's own HTTP publisher, which picks Apache HttpClient on this classpath - as a
+   * consumer without Apache has it.
+   */
+  @Bean
+  @Order(Ordered.LOWEST_PRECEDENCE - 2)
+  @ConditionalOnProperty(name = "it.http.client", havingValue = "jdk")
+  OutboxPublisher jdkHttpPublisher(
+      OutboxProperties properties,
+      ObjectProvider<OutboxClientProfileResolver> profiles,
+      ObjectMapper objectMapper,
+      Environment environment) {
+    return JdkPlainHttpPublisher.create(
+        properties,
+        profiles.getIfAvailable(),
+        objectMapper,
+        environment.getProperty("spring.application.name", "unknown"));
   }
 
   /**

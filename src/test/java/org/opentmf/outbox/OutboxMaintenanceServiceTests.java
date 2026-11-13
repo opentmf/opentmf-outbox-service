@@ -389,4 +389,48 @@ class OutboxMaintenanceServiceTests {
         .isThrownBy(() -> service.inspect(99L))
         .withMessageContaining("99");
   }
+
+  /** 1.11.1: with the sensitive text kept off the views, inspect and the lists carry neither. */
+  @Test
+  void withTheSensitiveTextOffTheViews_inspectAndTheLists_carryNeither_thePayloadPathBoth() {
+    OutboxProperties properties = new OutboxProperties();
+    properties.getOps().setSensitiveInViews(false);
+    OutboxMaintenanceService guarded = new OutboxMaintenanceService(repository, properties, events);
+    OutboxEvent parked = row(7L, 10, null);
+    parked.setLastError("HttpClientErrorException.BadRequest: 400 Bad Request: {\"echo\":1}");
+    when(repository.findById(7L)).thenReturn(Optional.of(parked));
+    when(repository.findAll(any(Predicate.class), any(Pageable.class)))
+        .thenReturn(new PageImpl<>(List.of(parked)));
+
+    OutboxRowView inspected = guarded.inspect(7L);
+    OutboxRowView listed =
+        guarded.list(null, OutboxStateFilter.PARKED, PageRequest.of(0, 20)).getContent().get(0);
+    OutboxRowPayload payload = guarded.payload(7L);
+
+    for (OutboxRowView view : List.of(inspected, listed)) {
+      assertThat(view.payload()).isNull();
+      assertThat(view.lastError()).isEqualTo("HttpClientErrorException.BadRequest"); // kind only
+    }
+    assertThat(payload)
+        .isEqualTo(new OutboxRowPayload(7L, "{}", parked.getLastError())); // never the headers
+  }
+
+  /** By default the views stay as they were, and the payload path serves the same text too. */
+  @Test
+  void byDefault_theViewsCarryTheText_andThePayloadPathServesIt() {
+    OutboxEvent parked = row(7L, 10, null);
+    parked.setLastError("boom");
+    when(repository.findById(7L)).thenReturn(Optional.of(parked));
+
+    assertThat(service.inspect(7L).lastError()).isEqualTo("boom");
+    assertThat(service.payload(7L)).isEqualTo(new OutboxRowPayload(7L, "{}", "boom"));
+  }
+
+  @Test
+  void thePayloadOfAnUnknownRow_isAnIllegalArgument() {
+    when(repository.findById(99L)).thenReturn(Optional.empty());
+    assertThatIllegalArgumentException()
+        .isThrownBy(() -> service.payload(99L))
+        .withMessageContaining("99");
+  }
 }

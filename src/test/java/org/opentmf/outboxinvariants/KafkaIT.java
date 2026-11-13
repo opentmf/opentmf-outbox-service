@@ -10,7 +10,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
+import io.micrometer.core.instrument.Gauge;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxAppend;
 import org.opentmf.outbox.OutboxPublisher.Lane;
@@ -18,7 +20,7 @@ import org.opentmf.outboxinvariants.Receiver.Delivery;
 
 /**
  * E - the library's own Kafka publisher against a real broker: an outage on both lanes, an outage
- * mid-stream on two pods, and a send timeout against the lease.
+ * mid-stream on two pods, a send timeout against the lease, and sends that outrun their bound.
  */
 class KafkaIT {
 
@@ -147,5 +149,78 @@ class KafkaIT {
       f.figure("startup refused: kafka.lease must exceed send-timeout");
       f.assertNone();
     }
+  }
+
+  /** The pod's {@code claims.paused} gauge for the Kafka transport; NaN while it has none. */
+  private static double kafkaClaimsPaused(Pod pod) {
+    Gauge gauge =
+        pod.registry().find("opentmf.outbox.claims.paused").tag("transport", "kafka").gauge();
+    return gauge == null ? Double.NaN : gauge.value();
+  }
+
+  /**
+   * E4 (OUTBOX-INTERRUPTED-SEND-COUNTS-FOR-PAUSE-1): a pod whose transactional producer hangs in
+   * {@code initTransactions} - the broker healthy - outruns every send's bound, and the heartbeat
+   * interrupts each. Those failures count: the pod's Kafka claims pause within a bound or two.
+   * Released, a probe succeeds, the pause ends and every row reaches the topic. Up to 1.11.0 the
+   * interrupt (Kafka's {@code InterruptException}) never counted: the pod never paused.
+   */
+  @Test
+  void e4_sendsThatOutrunTheirBound_pauseTheClaims_andAProbeResumesThem() {
+    String topic = "topic-e4-" + UUID.randomUUID();
+    KafkaHeldInit.hold();
+    try (Scenario s =
+            Scenario.start(
+                "E4-interrupted-sends-pause",
+                1,
+                kafka(
+                    "CONCURRENT",
+                    "it.kafka.held-init=true",
+                    "spring.kafka.producer.transaction-id-prefix=inv-e4-",
+                    "spring.kafka.producer.properties[delivery.timeout.ms]=3000",
+                    "spring.kafka.producer.properties[request.timeout.ms]=2000",
+                    "spring.kafka.producer.properties[linger.ms]=0",
+                    "spring.kafka.producer.properties[max.block.ms]=2000",
+                    "opentmf.outbox.claim-pause.max=4s"));
+        KafkaTap tap = new KafkaTap(topic, Lane.CONCURRENT)) {
+      Pod pod = s.pod(0);
+      for (int i = 0; i < 12; i++) {
+        pod.append(OutboxAppend.of("it", "agg-" + i, "it.e4.v1", topic, Map.of("i", i)));
+      }
+      Findings f;
+      try {
+        long started = System.nanoTime();
+        boolean paused =
+            waitFor(() -> kafkaClaimsPaused(pod) == 1d, Duration.ofSeconds(60));
+        long pausedAfter = (System.nanoTime() - started) / 1_000_000;
+        KafkaHeldInit.release();
+        boolean resumed = waitFor(() -> kafkaClaimsPaused(pod) == 0d, Duration.ofSeconds(30));
+        await()
+            .atMost(Duration.ofMinutes(1))
+            .until(
+                () -> Receiver.deliveries().stream().map(Delivery::rowId).distinct().count() >= 12);
+        f = s.finish(Duration.ofMinutes(1), Expect.strict().skipStarvation());
+        if (!paused) {
+          f.add("E4", "sends that outran their bound for 60 s never paused the kafka claims");
+        } else if (!resumed) {
+          f.add("E4", "the kafka claims stayed paused 30 s after the producer was released");
+        }
+        f.figure("paused after %d ms, resumed=%s".formatted(paused ? pausedAfter : -1, resumed));
+      } finally {
+        KafkaHeldInit.release();
+      }
+      f.assertNone();
+    }
+  }
+
+  private static boolean waitFor(BooleanSupplier condition, Duration atMost) {
+    long deadline = System.nanoTime() + atMost.toNanos();
+    while (System.nanoTime() < deadline) {
+      if (condition.getAsBoolean()) {
+        return true;
+      }
+      await().pollDelay(Duration.ofMillis(200)).atMost(Duration.ofSeconds(1)).until(() -> true);
+    }
+    return condition.getAsBoolean();
   }
 }

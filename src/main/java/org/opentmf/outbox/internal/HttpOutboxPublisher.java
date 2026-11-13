@@ -23,7 +23,10 @@ import tools.jackson.databind.ObjectMapper;
  *
  * <p>Stored headers are forwarded first; the relay headers are then SET (replacing a stored
  * header of the same name - the Kafka leg does the same). The row's {@code reference} is
- * never sent.
+ * never sent. A row that stored a {@code traceparent} is POSTed inside the relay span ({@link
+ * OutboxRelayObservation}, 1.11.1): a profile client whose {@code RestClient} observation is on
+ * stamps its own client span's header, a child in the stored trace - up to 1.11.0 a new trace's
+ * root. The plain client has no observation and forwards the stored header as it is.
  *
  * <p>Only a 2xx relays. A 4xx or 5xx throws (RestClient's default error handling) and a 3xx
  * throws too (1.9.0 - booked RELAYED before, though the receiver never processed the request);
@@ -44,20 +47,34 @@ import tools.jackson.databind.ObjectMapper;
 @Slf4j
 class HttpOutboxPublisher implements OutboxPublisher {
 
+  /** The relay span's transport tag; HTTP names no claim-pause transport. */
+  static final String TRANSPORT = "http";
+
   private final RestClient plainClient;
   private final OutboxClientProfileResolver profileResolver;
   private final ObjectMapper objectMapper;
   private final String serviceName;
+  private final OutboxRelayObservation relayObservation;
 
   HttpOutboxPublisher(
       RestClient plainClient,
       OutboxClientProfileResolver profileResolver,
       ObjectMapper objectMapper,
       String serviceName) {
+    this(plainClient, profileResolver, objectMapper, serviceName, OutboxRelayObservation.NONE);
+  }
+
+  HttpOutboxPublisher(
+      RestClient plainClient,
+      OutboxClientProfileResolver profileResolver,
+      ObjectMapper objectMapper,
+      String serviceName,
+      OutboxRelayObservation relayObservation) {
     this.plainClient = plainClient;
     this.profileResolver = profileResolver;
     this.objectMapper = objectMapper;
     this.serviceName = serviceName;
+    this.relayObservation = relayObservation;
   }
 
   @Override
@@ -81,6 +98,10 @@ class HttpOutboxPublisher implements OutboxPublisher {
   public void publish(OutboxEvent event) {
     RestClient client = selectClient(event);
     Map<String, String> stored = storedHeaders(event);
+    relayObservation.around(event, TRANSPORT, stored, () -> post(client, event, stored));
+  }
+
+  private void post(RestClient client, OutboxEvent event, Map<String, String> stored) {
     client
         .post()
         .uri(event.getDestination())

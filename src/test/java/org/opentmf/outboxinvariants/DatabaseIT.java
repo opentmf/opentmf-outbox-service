@@ -102,9 +102,24 @@ class DatabaseIT {
   }
 
   /**
+   * D3's claim bound on the vacuumed 200k-row table, no pod relaying: 1,318 buffers measured three
+   * times (2026-11-14, quiet), and a quarter on top (1.11.1, 2,500 before).
+   */
+  static final int CLAIM_BUFFERS_BOUND = 1650;
+
+  /**
    * D3: 200,000 pending rows - the CONCURRENT claim reads a bounded number of buffers (EXPLAIN
    * ANALYZE BUFFERS of the library's own statement), and the prune running WHILE two pods relay
    * never deletes a row that is not relayed or cancelled.
+   *
+   * <p>The bound is measured on a DETERMINISTIC table (1.11.1, OUTBOX-GATE-INDEPENDENT-OF-MACHINE-
+   * LOAD-1): no pod relays while it is taken, and {@code VACUUM (ANALYZE)} has set the visibility
+   * map. Up to 1.11.0 it was taken right after the insert, a pod relaying beside it: its heap
+   * visits then followed whether autovacuum had come first and how far that pod had booked, both a
+   * matter of timing - 20,466 buffers once against the 2,500 bound on a box at load 14, with no
+   * code changed (1,316 to 1,708 on the same seed, quiet). The bound is now {@link
+   * #CLAIM_BUFFERS_BOUND}: 1,318 measured three times on that table, a quarter on top. That first figure, the table as a burst leaves it, is still printed -
+   * production's real cost, information only.
    */
   @Test
   void d3_twoHundredThousandRows_boundedClaim_andAPruneWhileRelaying() throws Exception {
@@ -118,13 +133,20 @@ class DatabaseIT {
                 "it.claim-probe=" + probeDir.toAbsolutePath());
         DrainProbe probe = DrainProbe.open(probeDir)) {
       Receiver.script("inv:d3/", Script.concurrent());
-      s.startPod("pod-a", "opentmf.outbox.concurrent.max-in-flight=1"); // migrate, barely relay
+      s.startPod("pod-migrate").close(); // the schema only: nothing relays while the claim is read
       Scenario.insertConcurrent("inv:d3/", 20000, 10);
-      Instant eligible = Instant.now(); // every row due from here on
-      probe.eligible(eligible);
       Scenario.sql("analyze outbox");
-      long buffers = claimBuffers(probeDir);
+      long asInserted = claimBuffers(probeDir); // the table as a burst leaves it: information
+      Scenario.sql("vacuum (analyze) outbox");
+      long buffers = claimBuffers(probeDir); // the visibility map set: the bound's measurement
+      System.out.printf( // on every run, green or red - as the throughput test prints its rates
+          "D3-FIGURES: the claim over 200k pending rows read %d buffers after VACUUM, %d as"
+              + " inserted%n",
+          buffers, asInserted);
       Set<Long> before = ids();
+      Instant eligible = Instant.now(); // the relay starts here: every row's wait counts from now
+      probe.eligible(eligible);
+      s.startPod("pod-a", "opentmf.outbox.concurrent.max-in-flight=1");
       s.startPod("pod-b");
       AtomicBoolean pruning = new AtomicBoolean(true);
       AtomicLong pruned = new AtomicLong();
@@ -134,7 +156,7 @@ class DatabaseIT {
                 while (pruning.get()) {
                   long start = System.currentTimeMillis() * 1000;
                   long t0 = System.nanoTime();
-                  OutboxPruneResult result = s.pod(0).maintenance().pruneExpired();
+                  OutboxPruneResult result = s.pod(1).maintenance().pruneExpired();
                   pruned.addAndGet(result.pruned());
                   probe.pruned(start, (System.nanoTime() - t0) / 1000, result.pruned());
                 }
@@ -164,13 +186,14 @@ class DatabaseIT {
       starvedInClaimOrder(f, eligible);
       noPrematureWrap(f, probeDir);
       f.figure(
-          "claim over 200k pending rows read %d buffers; the prune deleted %d rows while relaying"
-              .formatted(buffers, pruned.get()));
-      if (buffers > 2500) {
+          ("claim over 200k pending rows read %d buffers after VACUUM (%d as inserted, a burst's"
+                  + " table: information); the prune deleted %d rows while relaying")
+              .formatted(buffers, asInserted, pruned.get()));
+      if (buffers > CLAIM_BUFFERS_BOUND) {
         f.add(
             "S",
-            "the CONCURRENT claim read %d buffers over 200k pending rows (bound 2,500)"
-                .formatted(buffers));
+            "the CONCURRENT claim read %d buffers over 200k pending rows (bound %d)"
+                .formatted(buffers, CLAIM_BUFFERS_BOUND));
       }
       Set<Long> after = ids();
       Set<Long> delivered =

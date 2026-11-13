@@ -18,7 +18,19 @@ final class KafkaProbe implements AutoCloseable {
   private final KafkaConsumer<String, String> consumer;
 
   KafkaProbe(String bootstrapServers, String... topics) {
+    this(bootstrapServers, false, topics);
+  }
+
+  /** A probe that sees committed transactional records only - never an aborted one. */
+  static KafkaProbe committed(String bootstrapServers, String... topics) {
+    return new KafkaProbe(bootstrapServers, true, topics);
+  }
+
+  private KafkaProbe(String bootstrapServers, boolean readCommitted, String... topics) {
     Properties props = new Properties();
+    if (readCommitted) {
+      props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
+    }
     props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
     props.put(ConsumerConfig.GROUP_ID_CONFIG, "it-" + UUID.randomUUID());
     props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");

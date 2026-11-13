@@ -134,6 +134,11 @@ class OutboxRelayWorkerTests {
   }
 
   private OutboxRelayWorker workerOn(OutboxConcurrentLane onLane) {
+    return workerOn(onLane, orderedLane, OutboxSendHeartbeatFixture.idle());
+  }
+
+  private OutboxRelayWorker workerOn(
+      OutboxConcurrentLane onLane, OutboxOrderedLane onOrdered, OutboxSendHeartbeat heartbeat) {
     return new OutboxRelayWorker(repository,
         new OutboxPublisherRouter(List.of(publisher)),
         new OutboxBackoff(properties),
@@ -143,9 +148,9 @@ class OutboxRelayWorkerTests {
         tx,
         tx,
         onLane,
-        orderedLane,
+        onOrdered,
             strictlyAdvancing(),
-            OutboxSendHeartbeatFixture.idle());
+            heartbeat);
   }
 
   /**
@@ -2244,5 +2249,94 @@ class OutboxRelayWorkerTests {
     OutboxEvent fresh = overKafka(7L);
     relay();
     assertThat(fresh.getAttempts()).isEqualTo(1); // the probe, a fresh row
+  }
+
+  /**
+   * The heartbeat's renewals on the fake table: every lease it renews is kept, its new stamp
+   * written - as the guarded statement does while no other holder took the row.
+   */
+  private void renewalsKept() {
+    when(repository.renewSending(any(), any(), any(), any()))
+        .thenAnswer(
+            inv -> {
+              List<Long> ids = idsOf(inv.getArgument(0));
+              List<String> renewed = keysOf(inv.getArgument(2));
+              for (int i = 0; i < ids.size(); i++) {
+                table.get(ids.get(i)).setClaimedUntil(OffsetDateTime.parse(renewed.get(i)));
+              }
+              return ids;
+            });
+  }
+
+  /** A send that hangs until its thread is interrupted, then fails as a Kafka client does. */
+  private static Object hangUntilInterrupted(CountDownLatch started) {
+    started.countDown();
+    try {
+      new CountDownLatch(1).await();
+    } catch (InterruptedException ex) {
+      Thread.currentThread().interrupt(); // the client leaves the flag set
+      throw new IllegalStateException("interrupted while waiting for the broker", ex);
+    }
+    return null;
+  }
+
+  /**
+   * OUTBOX-INTERRUPTED-SEND-COUNTS-FOR-PAUSE-1: a send over a named transport that outran its
+   * bound - the heartbeat interrupted it - counts towards the pause, whatever the publisher makes
+   * of the interrupt (Kafka's {@code InterruptException} is neither retriable nor a timeout). Up
+   * to 1.11.0 only {@code transportDown} decided, so a transport whose sends hung never paused.
+   */
+  @Test
+  void sendsTheHeartbeatInterruptedAtTheirBound_pauseTheirTransport() {
+    Duration bound = Duration.ofMillis(200);
+    OutboxSendHeartbeat heartbeat =
+        new OutboxSendHeartbeat(repository, tx, OutboxClock.system(), bound);
+    OutboxRelayWorker bounded = workerOn(lane, orderedLane, heartbeat);
+    renewalsKept();
+    transportByDestination();
+    doReturn(bound).when(publisher).lease(any());
+    doReturn(false).when(publisher).transportDown(any(), any()); // the interrupt: not "down"
+    for (long id = 1; id <= 5; id++) {
+      overKafka(id);
+    }
+    doAnswer(inv -> hangUntilInterrupted(new CountDownLatch(1))).when(publisher).deliver(any());
+
+    heartbeat.start();
+    try {
+      bounded.relayBatch(true);
+      orderedIdle();
+    } finally {
+      heartbeat.stop();
+    }
+
+    assertThat(table.values()) // each an ordinary failed attempt, booked by its holder
+        .allSatisfy(row -> assertThat(row.getAttempts()).isEqualTo(1));
+    assertThat(registry.find(OutboxMetrics.CLAIMS_PAUSED).gauge())
+        .as("five sends outran their bound: the transport is paused")
+        .isNotNull();
+    assertThat(claimsPaused("kafka")).isEqualTo(1d);
+  }
+
+  /**
+   * An interrupt the heartbeat did not make - the lane's own at shutdown - counts nothing: the
+   * send did not outrun its bound, the transport said nothing. Even at {@code after-failures: 1}.
+   */
+  @Test
+  void anInterruptAtShutdown_countsNothingTowardsThePause() {
+    properties.getClaimPause().setAfterFailures(1);
+    OutboxOrderedLane closing = new OutboxOrderedLane(Duration.ofMillis(100));
+    OutboxRelayWorker stopping = workerOn(lane, closing, OutboxSendHeartbeatFixture.idle());
+    transportByDestination();
+    doReturn(false).when(publisher).transportDown(any(), any());
+    OutboxEvent row = overKafka(1L);
+    CountDownLatch sending = new CountDownLatch(1);
+    doAnswer(inv -> hangUntilInterrupted(sending)).when(publisher).deliver(any());
+
+    stopping.relayBatch(true);
+    await().atMost(Duration.ofSeconds(5)).until(() -> sending.getCount() == 0);
+    closing.close(); // the grace runs out: the send in flight is interrupted
+
+    await().atMost(Duration.ofSeconds(5)).until(() -> row.getAttempts() == 1);
+    assertThat(registry.find(OutboxMetrics.CLAIMS_PAUSED).gauge()).isNull();
   }
 }

@@ -205,6 +205,32 @@ class KafkaOutboxPublisherTests {
         .isEqualTo(Duration.ofMinutes(11)); // 10 min awaited + 60 s max.block (Kafka's default)
   }
 
+  /**
+   * OUTBOX-TRANSACTIONAL-SEND-BOUND-1 (1.11.1): a TRANSACTIONAL send blocks up to {@code
+   * max.block.ms} in each of three calls - {@code initTransactions} (a new producer), the record's
+   * {@code send} (its metadata) and {@code commitTransaction} - so its bound counts it three times.
+   * Up to 1.11.0 it counted it once, and the heartbeat interrupted a send whose every call was
+   * within the producer's own limits.
+   */
+  @Test
+  void aTransactionalSend_countsMaxBlockForEachOfItsBlockingCalls() {
+    KafkaTemplate<Object, Object> transactional =
+        producedWith(
+            Map.of(
+                ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 3_000,
+                ProducerConfig.LINGER_MS_CONFIG, 0,
+                ProducerConfig.MAX_BLOCK_MS_CONFIG, 5_000));
+    when(transactional.isTransactional()).thenReturn(true);
+    OutboxProperties properties = new OutboxProperties();
+    properties.setSendTimeout(Duration.ofSeconds(1));
+
+    KafkaOutboxPublisher configured =
+        new KafkaOutboxPublisher(transactional, properties, new ObjectMapper(), "svc");
+
+    assertThat(configured.sendTimeout(event("topic", null)))
+        .isEqualTo(Duration.ofMillis(3_000 + 1_000 + 3 * 5_000));
+  }
+
   @Test
   @SuppressWarnings("unchecked")
   void publish_ackTimeout_throwsForTheRelay() {
