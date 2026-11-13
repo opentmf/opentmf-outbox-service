@@ -108,11 +108,14 @@ public class OutboxAutoConfiguration {
     // No registry bean (a consumer without actuator) = a simple local registry: the relay
     // keeps working, the gauges just have no exporter. Consumers with actuator get the real
     // one automatically.
-    return new OutboxMetrics(
-        registry.getIfAvailable(io.micrometer.core.instrument.simple.SimpleMeterRegistry::new),
-        repository,
-        properties.getMetricsRefresh(),
-        clock);
+    OutboxMetrics metrics =
+        new OutboxMetrics(
+            registry.getIfAvailable(io.micrometer.core.instrument.simple.SimpleMeterRegistry::new),
+            repository,
+            properties.getMetricsRefresh(),
+            clock);
+    metrics.shutdownJoin(properties.getShutdownJoin());
+    return metrics;
   }
 
   @Bean

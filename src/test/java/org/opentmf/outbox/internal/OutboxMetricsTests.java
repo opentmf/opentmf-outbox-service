@@ -220,4 +220,28 @@ class OutboxMetricsTests {
 
     verifyNoInteractions(repository);
   }
+
+  /**
+   * 1.11.1: a stop waits for the refresh in flight - its queries and their connection - before it
+   * returns. Up to 1.11.0 it returned at once and the query went on while the pool closed.
+   */
+  @Test
+  void aStop_waitsForTheRefreshInFlight() throws Exception {
+    CountDownLatch querying = new CountDownLatch(1);
+    when(repository.countOpenNotParked())
+        .thenAnswer(
+            invocation -> {
+              querying.countDown();
+              UninterruptibleHold.hold(Duration.ofMillis(300)); // a query, slow
+              return counts(0, 0);
+            });
+    metrics.start();
+    assertThat(querying.await(5, TimeUnit.SECONDS)).isTrue();
+
+    metrics.stop();
+
+    assertThat(registry.get(OutboxMetrics.METRICS_AGE).gauge().value())
+        .as("the refresh in flight ended before the stop returned")
+        .isNotNaN();
+  }
 }

@@ -72,11 +72,20 @@ public class OutboxProperties {
   @NotNull private Duration lease = Duration.ofMinutes(2);
 
   /**
-   * How long a stopping relay lets in-flight sends finish (and book) before it gives up on
-   * them; a send still running then is booked by nobody and its row is redelivered once its
-   * lease lapses. Default 10s.
+   * How long a stopping relay lets in-flight claims, batches and sends finish (and book) before it
+   * gives up on them; a send still running then is booked by nobody and its row is redelivered
+   * once its lease lapses. Since 1.11.1 ONE grace for the whole relay (up to 1.11.0 one per
+   * executor, in turn). Default 10s.
    */
   @NotNull private Duration shutdownGrace = Duration.ofSeconds(10);
+
+  /**
+   * After the grace, how long a stopping relay waits for its interrupted threads to END (1.11.1) -
+   * the relay, the lanes, the heartbeat and the gauges' refresher - so none borrows a connection
+   * while the application's pool closes; a thread still running then is named in one warning.
+   * The whole stop takes at most {@code shutdown-grace + shutdown-join}. Default 5s.
+   */
+  @NotNull private Duration shutdownJoin = Duration.ofSeconds(5);
 
   /**
    * How often the gauges (pending, parked, in-flight, relay-lag) are re-read from the database. A

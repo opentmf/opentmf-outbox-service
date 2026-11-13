@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.time.Duration;
@@ -16,6 +17,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxProperties;
 import org.opentmf.outbox.internal.OutboxRelayWorker.Batch;
+import org.springframework.context.SmartLifecycle;
 
 /**
  * One relay thread; pokes drain and coalesce - however many arrive during a pass, ONE follow-up
@@ -378,5 +380,62 @@ class OutboxRelayTests {
     relay.relayPass();
 
     assertThat(withOrdered).containsExactly(true, false, true);
+  }
+
+  /**
+   * 1.11.1: the relay is a SmartLifecycle between the web server's stop and the Kafka producers'.
+   * It stops ONCE, on one deadline: the grace for what runs, then the worker closed (nothing more
+   * is booked), the interrupt, and a join, so no thread of it is alive when the stop returns.
+   */
+  @Test
+  void theRelay_stopsOnce_onOneDeadline_andNoThreadOfItOutlivesTheStop() throws Exception {
+    assertThat(OutboxRelay.PHASE)
+        .isLessThan(SmartLifecycle.DEFAULT_PHASE - 2048) // after the web server's stop
+        .isGreaterThan(Integer.MIN_VALUE); // before Spring Kafka's producer factory
+    OutboxRelayWorker worker = mock(OutboxRelayWorker.class);
+    when(worker.relayBatch(anyBoolean())).thenReturn(EMPTY);
+    OutboxProperties properties = new OutboxProperties();
+    properties.setShutdownGrace(Duration.ofMillis(200));
+    properties.setShutdownJoin(Duration.ofSeconds(2));
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(2, 10, false, Duration.ofMillis(200));
+    OutboxRelay relay =
+        new OutboxRelay(
+            worker,
+            properties,
+            lane,
+            orderedLane(),
+            OutboxSendHeartbeatFixture.idle(),
+            OutboxClock.system());
+    relay.start();
+    assertThat(relay.isRunning()).isTrue();
+    assertThat(relay.getPhase()).isEqualTo(OutboxRelay.PHASE);
+    CountDownLatch sending = new CountDownLatch(1);
+    lane.submit(
+        () -> {
+          sending.countDown();
+          try {
+            new CountDownLatch(1).await(); // a send, until the stop interrupts it
+          } catch (InterruptedException ex) {
+            UninterruptibleHold.hold(Duration.ofMillis(300)); // then its late booking
+          }
+        });
+    assertThat(sending.await(5, TimeUnit.SECONDS)).isTrue();
+
+    long started = System.nanoTime();
+    relay.stop();
+    Duration took = Duration.ofNanos(System.nanoTime() - started);
+    relay.stop(); // the @PreDestroy safety net after the lifecycle stop: nothing more
+
+    verify(worker).close(); // from the grace's end nothing is booked
+    assertThat(relay.isRunning()).isFalse();
+    assertThat(lane.alive()).as("no send worker alive after the stop").isEmpty();
+    assertThat(
+            Thread.getAllStackTraces().keySet().stream()
+                .filter(Thread::isAlive)
+                .map(Thread::getName)
+                .filter(name -> name.equals("opentmf-outbox-relay")))
+        .as("the relay thread ended")
+        .isEmpty();
+    assertThat(took).isLessThan(Duration.ofMillis(200 + 2000 + 500)); // within grace + join
   }
 }

@@ -2,7 +2,6 @@ package org.opentmf.outbox.internal;
 
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
-import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import java.time.Duration;
 import java.time.Instant;
@@ -18,6 +17,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.opentmf.outbox.internal.OutboxEventRepository.LaneCounts;
 import org.opentmf.outbox.internal.OutboxEventRepository.LaneSince;
+import org.springframework.context.SmartLifecycle;
 
 /**
  * The outbox meter family under the LIBRARY-STABLE names ({@code opentmf.outbox.*}
@@ -59,7 +59,7 @@ import org.opentmf.outbox.internal.OutboxEventRepository.LaneSince;
  * oldest open row's instant, so it keeps growing between refreshes.
  */
 @Slf4j
-class OutboxMetrics {
+class OutboxMetrics implements SmartLifecycle {
 
   static final String PENDING = "opentmf.outbox.pending";
   static final String PARKED = "opentmf.outbox.parked";
@@ -101,6 +101,11 @@ class OutboxMetrics {
   private final AtomicReference<Instant> lastRefreshed = new AtomicReference<>();
   private final Map<String, AtomicBoolean> claimsPaused = new ConcurrentHashMap<>();
   private ScheduledExecutorService refresher;
+  private final AtomicBoolean running = new AtomicBoolean();
+  private final AtomicBoolean stopped = new AtomicBoolean();
+
+  /** How long a stop waits for a refresh in flight ({@code shutdown-join}, 1.11.1). */
+  private Duration shutdownJoin = Duration.ofSeconds(5);
 
   OutboxMetrics(MeterRegistry registry, OutboxEventRepository repository, Duration refreshEvery) {
     this(registry, repository, refreshEvery, OutboxClock.system());
@@ -141,9 +146,20 @@ class OutboxMetrics {
         .register(registry);
   }
 
-  /** Starts the refresher: the first refresh now, then every {@code metrics-refresh}. */
-  @PostConstruct
-  void start() {
+  /** How long a stop waits for a refresh in flight ({@code shutdown-join}). */
+  void shutdownJoin(Duration join) {
+    this.shutdownJoin = join;
+  }
+
+  /**
+   * Starts the refresher: the first refresh now, then every {@code metrics-refresh}. A {@link
+   * SmartLifecycle} in the relay's phase (1.11.1; a {@code @PostConstruct} up to 1.11.0).
+   */
+  @Override
+  public void start() {
+    if (stopped.get() || !running.compareAndSet(false, true)) {
+      return;
+    }
     refresher =
         Executors.newSingleThreadScheduledExecutor(
             runnable -> {
@@ -155,11 +171,40 @@ class OutboxMetrics {
         this::refresh, 0, refreshEvery.toMillis(), TimeUnit.MILLISECONDS);
   }
 
-  /** Stops the refresher. */
+  @Override
+  public boolean isRunning() {
+    return running.get();
+  }
+
+  @Override
+  public int getPhase() {
+    return OutboxRelay.PHASE;
+  }
+
+  /**
+   * Stops the refresher in the context's lifecycle stop, before the DataSource is destroyed, and
+   * waits up to {@code shutdown-join} for a refresh in flight - its queries and their connection
+   * (1.11.1: up to 1.11.0 it returned at once and a query in flight went on while the pool
+   * closed). Once only; {@code @PreDestroy} is the safety net of a context that never ran its
+   * lifecycle stop.
+   */
+  @Override
   @PreDestroy
-  void stop() {
-    if (refresher != null) {
+  public void stop() {
+    if (!stopped.compareAndSet(false, true)) {
+      return;
+    }
+    running.set(false);
+    if (refresher == null) {
+      return;
+    }
+    refresher.shutdown(); // no refresh from now on; the one in flight ends
+    if (!OutboxStops.awaitUntil(refresher, System.nanoTime() + shutdownJoin.toNanos())) {
       refresher.shutdownNow();
+      log.warn(
+          "Outbox gauges' refresher still running after the shutdown join ({}) - a query that"
+              + " ignores interrupts",
+          shutdownJoin);
     }
   }
 

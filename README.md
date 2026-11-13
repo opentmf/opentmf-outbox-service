@@ -464,11 +464,31 @@ sequenceDiagram
   throwable leaves a relay, lane or heartbeat thread. Up to 1.8.0 an `Error`
   killed the sending thread and booked nothing, and a hook that threw on every
   booking booked nothing either: both rows were re-sent every lease, forever.
-- **Shutdown.** The relay stops claiming, drops the rows still queued unsent,
-  gives the sends in flight `shutdown-grace` (default 10 s) to finish and book,
-  and abandons the rest: they book nothing, and their rows (like the dropped
-  queued ones) are redelivered once their leases lapse — the dropped queued
-  rows were never sent, so their lapse costs them no attempt. **Counters
+- **Shutdown (one deadline, every thread joined, since 1.11.1).** The relay and
+  the gauges' refresher are `SmartLifecycle`s in a phase after the web server's
+  stop (nothing new is appended over HTTP meanwhile) and before Spring Kafka's
+  producers' (still open while the sends drain), so they stop in the context's
+  lifecycle stop, BEFORE the DataSource is destroyed. The relay stops claiming,
+  drops the rows still queued unsent, and gives the claims, the ORDERED batch and
+  the sends in flight `shutdown-grace` (default 10 s) - together, one deadline -
+  to finish and book. Then it books nothing more: a send that returns later
+  leaves its row to its lease, redelivered once it lapses (the dropped queued
+  rows were never sent, so their lapse costs them no attempt). What still runs
+  is interrupted, and the stop waits `shutdown-join` (default 5 s) for every
+  thread of the library to END - the heartbeat's tick and a gauge query in
+  flight included - so none holds or borrows a connection while the pool
+  closes; a thread a blocking call keeps past that is named in one warning.
+  **At most `shutdown-grace + shutdown-join`, 15 s with the defaults** - keep it
+  under `spring.lifecycle.timeout-per-shutdown-phase` (30 s by default) and the
+  pod's termination grace less the web server's drain. Up to 1.11.0 the stop
+  took up to three graces in turn (30 s with the defaults: the relay thread,
+  the ORDERED lane, the CONCURRENT lane) and then returned without waiting for
+  its threads: a send woken by the interrupt was still running after the
+  context had closed, and the heartbeat's renewal and the refresher's query
+  borrowed connections while the pool closed. **A send that completes at
+  the instant of shutdown can therefore be delivered twice** - it reached its
+  receiver, its booking did not happen, its row is redelivered: at-least-once,
+  unchanged in kind, the idempotency key as ever. **Counters
   booked during the drain:** Spring Boot closes the meter registry at
   `ContextClosedEvent`, before the relay's beans stop, so a `relayed` counter
   first created for a destination during the drain is not kept (the
@@ -597,6 +617,7 @@ opentmf:
     send-timeout: 10s        # the shortest bound a send has before it is presumed hung (1.9.0)
     lease: 2m                # CONCURRENT lane default lease - renewed while a send runs
     shutdown-grace: 10s      # how long a stopping relay lets sends in flight finish
+    shutdown-join: 5s        # then how long it waits for its threads to end (1.11.1)
     metrics-refresh: 15s     # how often the gauges are re-read (a scrape never queries)
     claim-pause:             # a pod whose transport is down leaves its rows to others (1.11.0)
       after-failures: 5      # failed sends over a transport in a row that pause it; 0 = never
@@ -640,7 +661,8 @@ opentmf:
 | `kafka.lane`     | `ORDERED`/`CONCURRENT` | `ORDERED` | The default Kafka publisher's lane (1.5.0). `CONCURRENT` = per-aggregate order across pods (see "Running several relays with Kafka"). Stamped at append. |
 | `kafka.ordering-key` | `AGGREGATE_ID`/`NONE` | `AGGREGATE_ID` | On `CONCURRENT`: what orders a Kafka row. Ignored on `ORDERED`. The record key is the `aggregateId` either way. |
 | `kafka.lease`    | `Duration` | `15s`   | On `CONCURRENT`: a Kafka row's lease. Must exceed `send-timeout` (validated at boot). Ignored on `ORDERED`. |
-| `shutdown-grace` | `Duration` | `10s`   | On stop: the relay thread's, the ORDERED batch's and the in-flight CONCURRENT sends' time to finish (each in turn); the rest lapse by lease. |
+| `shutdown-grace` | `Duration` | `10s`   | On stop: the time the relay thread, the ORDERED batch and the in-flight CONCURRENT sends get, together, to finish and book (one deadline since 1.11.1; each in turn before); the rest lapse by lease. |
+| `shutdown-join`  | `Duration` | `5s`    | On stop, after the grace (1.11.1): how long the relay waits for its interrupted threads - the lanes, the heartbeat, the gauges' refresher - to end, so none uses the pool while it closes. The whole stop takes at most `shutdown-grace + shutdown-join`. |
 | `metrics-refresh` | `Duration` | `15s`  | How often the gauges are re-read from the database; a scrape reads the last values. |
 | `claim-pause.after-failures` | `int` | `5` | Failed sends over one transport in a row (the publisher says the transport was out of reach), with no success between them, after which this pod leaves that transport's rows to the other pods (1.11.0; see "A pod whose transport is down"). `0` switches the pause off. |
 | `claim-pause.max` | `Duration` | `1m` | While paused, the pod takes one probe row: the first `backoff-base` after the pause, each next one twice as long after the one before, never longer apart than this. A paused transport's row due for longer than this is taken anyway - no pod is sending it. Positive (validated at boot). |

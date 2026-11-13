@@ -146,6 +146,13 @@ class OutboxRelayWorker {
   private final Map<String, OutboxClaimPause> pauses = new ConcurrentHashMap<>();
 
   /**
+   * Set when a stopping relay's grace has run out (1.11.1): from then on nothing is sent or booked
+   * - a send that returns afterwards books nothing, and its row is redelivered once its lease
+   * lapses, so no thread of the relay borrows a connection while the application's pool closes.
+   */
+  private volatile boolean closed;
+
+  /**
    * One claimed row: its publisher, the lease value this holder stamped, and when - and, while it
    * is sent, what the {@link OutboxSendHeartbeat} needs (under {@link #lock}, which the booking
    * takes too).
@@ -521,6 +528,9 @@ class OutboxRelayWorker {
   @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void relayConcurrent(Leased row) {
     queuedHere.remove(row.event.getId()); // it leaves the queue: from here on a claim may see it
+    if (closed) {
+      return; // the relay is stopping: not sent; its lease lapses
+    }
     try {
       if (row.lapsedSending) {
         book(laneTx, row, lapsed(row), () -> NOTHING); // counted, not sent: backoff first
@@ -618,6 +628,9 @@ class OutboxRelayWorker {
   private void relayOrdered(List<Leased> ordered) {
     for (int i = 0; i < ordered.size(); i++) {
       Leased row = ordered.get(i);
+      if (closed) {
+        return; // the relay is stopping: the rest of the batch waits for its leases to lapse
+      }
       if (row.lost) {
         continue;
       }
@@ -735,6 +748,11 @@ class OutboxRelayWorker {
 
   // ---------------------------------------------------------------- booking
 
+  /** The stopping relay's grace has run out: nothing more is sent or booked (1.11.1). */
+  void close() {
+    closed = true;
+  }
+
   /**
    * Books one attempt in its own short transaction; {@code alsoInTx} rides the same transaction
    * and returns what to apply once it committed. A refused RELAYED booking (a hook or listener
@@ -745,6 +763,14 @@ class OutboxRelayWorker {
   @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void book(
       TransactionOperations via, Leased row, Attempt attempt, Supplier<Runnable> alsoInTx) {
+    if (closed) {
+      log.info(
+          "Outbox row {} to {} - not booked: the relay is stopping; it is redelivered once its"
+              + " lease lapses",
+          row.event.getId(),
+          row.event.getDestination());
+      return;
+    }
     RuntimeException failure = attempt.failure();
     if (failure == null) {
       try {

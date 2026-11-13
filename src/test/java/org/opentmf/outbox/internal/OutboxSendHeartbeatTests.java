@@ -260,4 +260,35 @@ class OutboxSendHeartbeatTests {
       heartbeat.finished(row);
     }
   }
+
+  /**
+   * 1.11.1: a stop waits for the tick in flight - its clock measure, its renewal and their
+   * connection - before it returns. Up to 1.11.0 it returned at once and the tick went on while
+   * the application's pool closed.
+   */
+  @Test
+  void aStop_waitsForTheTickInFlight() throws Exception {
+    CountDownLatch measuring = new CountDownLatch(1);
+    AtomicBoolean tickEnded = new AtomicBoolean();
+    OutboxSendHeartbeat slow =
+        new OutboxSendHeartbeat(
+            repository,
+            TransactionOperations.withoutTransaction(),
+            new OutboxClock(
+                Clock.systemUTC(),
+                () -> {
+                  measuring.countDown();
+                  UninterruptibleHold.hold(Duration.ofMillis(100)); // a round trip, slow
+                  return Instant.now();
+                }),
+            Duration.ofSeconds(10));
+    slow.onBeat(() -> tickEnded.set(true));
+    slow.start();
+    assertThat(measuring.await(5, TimeUnit.SECONDS)).isTrue();
+
+    List<String> alive = slow.stopUntil(System.nanoTime() + Duration.ofSeconds(5).toNanos());
+
+    assertThat(tickEnded).as("the tick in flight ended before the stop returned").isTrue();
+    assertThat(alive).isEmpty();
+  }
 }

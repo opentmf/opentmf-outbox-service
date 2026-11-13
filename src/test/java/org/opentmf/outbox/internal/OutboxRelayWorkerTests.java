@@ -1489,6 +1489,32 @@ class OutboxRelayWorkerTests {
     verify(repository, never()).lockLeased(anyLong(), any()); // no renewal, no failure
   }
 
+  /**
+   * 1.11.1: once a stopping relay's grace has run out the worker books NOTHING - a send that
+   * returns afterwards leaves its row to its lease, redelivered once it lapses - so no booking
+   * borrows a connection while the application's pool closes; the rest of an ORDERED batch is not
+   * sent at all.
+   */
+  @Test
+  void aSendThatReturnsAfterTheGrace_booksNothing_andTheBatchStops() {
+    OutboxEvent returningLate = pending(1L, 0);
+    OutboxEvent next = pending(2L, 0);
+    doAnswer(
+            inv -> {
+              worker.close(); // the grace runs out while this send is under way
+              return null;
+            })
+        .when(publisher)
+        .deliver(returningLate);
+
+    relay();
+
+    assertThat(returningLate.getRelayedOn()).as("booked by nobody").isNull();
+    assertThat(returningLate.getAttempts()).isZero();
+    verify(publisher, never()).deliver(next); // the batch's rest is not sent
+    verify(repository, never()).bookRelayed(anyLong(), any(), any());
+  }
+
   // ------------------------------------------------------------ a queued row's lease
 
   /** A one-slot lane whose first send (row 1) holds the slot until the gate opens. */
