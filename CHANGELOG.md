@@ -17,6 +17,14 @@
 
 ### Fixed
 
+- **The plain HTTP client follows no redirect on Jetty either** (OUTBOX-JETTY-FOLLOWS-NO-REDIRECT-1).
+  Jetty's client follows a 3xx by default and Spring's factory left it so: for a consumer with
+  Jetty (and no Apache HttpClient) on its classpath a redirect was followed into a second request,
+  whose 2xx booked the row RELAYED although the receiver never processed the first - the 1.9.0
+  promise "a 3xx is never followed" held only for the JDK's and Reactor's clients. The library now
+  builds the Jetty client itself (`jetty-client` is an optional dependency of the library; a
+  consumer brings it, as before): redirects off, its timeouts as before, `concurrent.max-in-flight`
+  connections per destination.
 - **A send that outran its bound now counts towards the claim pause**
   (OUTBOX-INTERRUPTED-SEND-COUNTS-FOR-PAUSE-1). The send heartbeat interrupts a send still
   running at its bound; the Kafka publisher then fails with Kafka's `InterruptException`, which

@@ -6,6 +6,7 @@ import static org.mockito.Mockito.mock;
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.OutboxWriter;
 import org.springframework.beans.factory.config.BeanDefinition;
@@ -63,21 +64,21 @@ class KafkaLessStartupTests {
   /** Child-first for the library (main + test classes), parent-first otherwise, hidden: none. */
   static final class ConsumerClassLoader extends URLClassLoader {
 
-    private final String hiddenPackage;
+    private final List<String> hiddenPackages;
 
-    ConsumerClassLoader(String hiddenPackage) {
+    ConsumerClassLoader(String... hiddenPackages) {
       super(
           new URL[] {
             OutboxAutoConfiguration.class.getProtectionDomain().getCodeSource().getLocation(),
             KafkaLessStartupTests.class.getProtectionDomain().getCodeSource().getLocation()
           },
           KafkaLessStartupTests.class.getClassLoader());
-      this.hiddenPackage = hiddenPackage;
+      this.hiddenPackages = List.of(hiddenPackages);
     }
 
     @Override
     protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
-      if (name.startsWith(hiddenPackage)) {
+      if (hiddenPackages.stream().anyMatch(name::startsWith)) {
         throw new ClassNotFoundException(name + " is not on this consumer's classpath");
       }
       if (!name.startsWith(LIBRARY_PACKAGE)) {

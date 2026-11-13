@@ -970,7 +970,7 @@ from the classpath, its timeouts set:
 | Client (picked in this order) | Connect timeout | Read timeout | Past the send bound | Redirects, retries, connections |
 |---|---|---|---|---|
 | Apache HttpClient 5 | set on its connections (1.11.1; Apache's own 3 min before) | **per read** (inactivity) | the connect and each read end in time; a receiver that drips its response slower than the read timeout but never stops can outlast the bound, and on a platform thread the blocking read ignores the interrupt - virtual threads (Boot's `spring.threads.virtual.enabled`) honour it | the library builds it (1.11.1): a 3xx is **not followed**, Apache **never retries** (the relay does), and its pool holds `concurrent.max-in-flight` connections per route and in all |
-| Jetty | set | a **total** from the request's queueing, the connect included | ends in time | Jetty's defaults (it follows a 3xx) |
+| Jetty | set | a **total** from the request's queueing, the connect included | ends in time | the library builds it (1.11.1): a 3xx is **not followed** (Jetty's own default follows it), it never retries, and it holds `concurrent.max-in-flight` connections per destination |
 | Reactor Netty | set | after the request is sent | the two add up, and the check above keeps the sum in the bound | Reactor's defaults (no redirect, no retry) |
 | the JDK's (none of the above present) | set | a **total** from the request's start, the connect included | ends in time | the JDK's defaults (no redirect, no retry, no pool limit) |
 
@@ -1000,7 +1000,10 @@ send's bound and its lapse counts as a failed attempt.
 **Only a 2xx relays (1.9.0).** A 4xx or 5xx fails the attempt (RestClient's
 own exceptions), and so does a 3xx — a `RestClientResponseException` naming
 the status and the `Location`; a redirect is never followed into a second
-POST (up to 1.8.0 a 3xx was booked RELAYED).
+POST (up to 1.8.0 a 3xx was booked RELAYED). Up to 1.11.0 that held for the
+JDK's and Reactor's clients only: Apache HttpClient and Jetty, the plain
+client's other two, followed a 3xx by their own defaults; since 1.11.1 the
+library builds both with redirects off.
 
 ### Post-relay bookkeeping (`OutboxRelayedListener`)
 
