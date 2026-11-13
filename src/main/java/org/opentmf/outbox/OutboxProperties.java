@@ -4,6 +4,7 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Null;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import java.time.Duration;
@@ -113,10 +114,30 @@ public class OutboxProperties {
     return lease.compareTo(sendTimeout) >= 0 ? lease : sendTimeout;
   }
 
+  /** The connect timeout of the plain HTTP client when none is set, and its most (1.11.1). */
+  static final Duration DEFAULT_HTTP_CONNECT_TIMEOUT = Duration.ofSeconds(10);
+
+  /**
+   * The plain HTTP client's connect timeout: {@code http.connect-timeout} when set, else ten
+   * seconds or a quarter of the send bound, the shorter (1.11.1; a fixed ten seconds before) - so
+   * the connect and the read together end before the bound also when the bound is short.
+   */
+  public Duration httpConnectTimeout() {
+    if (http.connectTimeout != null) {
+      return http.connectTimeout;
+    }
+    Duration quarter = sendBound().dividedBy(4);
+    return quarter.compareTo(DEFAULT_HTTP_CONNECT_TIMEOUT) < 0
+        ? quarter
+        : DEFAULT_HTTP_CONNECT_TIMEOUT;
+  }
+
   /**
    * The plain HTTP client's read timeout: {@code http.read-timeout} when set, else the send bound
-   * less a tenth of it (at least one second) - so an HTTP call that hangs fails as an attempt of
-   * its own before its lease is left to lapse.
+   * less the connect timeout and a tenth of the bound (at least one second) - so an HTTP call that
+   * hangs, in its connect or in its response, fails as an attempt of its own before its lease is
+   * left to lapse. Up to 1.11.0 the connect timeout was not taken off (108 s on the defaults, now
+   * 98 s), and a connect plus a read could outlast the bound.
    */
   public Duration httpReadTimeout() {
     if (http.readTimeout != null) {
@@ -124,7 +145,9 @@ public class OutboxProperties {
     }
     Duration bound = sendBound();
     Duration margin = bound.dividedBy(10);
-    return bound.minus(margin.compareTo(Duration.ofSeconds(1)) >= 0 ? margin : Duration.ofSeconds(1));
+    return bound
+        .minus(httpConnectTimeout())
+        .minus(margin.compareTo(Duration.ofSeconds(1)) >= 0 ? margin : Duration.ofSeconds(1));
   }
 
   /** The plain HTTP client's connect timeout must be positive. */
@@ -150,6 +173,36 @@ public class OutboxProperties {
     }
     return positive(http.readTimeout) && http.readTimeout.compareTo(sendBound()) < 0;
   }
+
+  /**
+   * The plain HTTP client's connect and read timeouts must END BEFORE the send bound together
+   * (1.11.1): the send heartbeat interrupts a send at its bound, and a client whose connect or read
+   * ignores the interrupt keeps running while the lease lapses and another relay sends the row.
+   * Only what the consumer SET can fail here - the defaults always fit: null when they fit, else
+   * the computed figures, which the boot failure shows as the rejected value.
+   */
+  @Null(
+      message =
+          "opentmf.outbox.http.connect-timeout plus opentmf.outbox.http.read-timeout must end"
+              + " before the send bound, the larger of opentmf.outbox.lease and"
+              + " opentmf.outbox.send-timeout - lower the set timeouts, or unset them to derive"
+              + " both from the bound")
+  public String getHttpTimeoutsBeyondTheSendBound() {
+    if (lease == null
+        || sendTimeout == null
+        || (http.connectTimeout != null && !positive(http.connectTimeout))
+        || (http.readTimeout != null && !positive(http.readTimeout))) {
+      return null; // left to their own constraints
+    }
+    Duration bound = sendBound();
+    Duration connect = httpConnectTimeout();
+    Duration read = httpReadTimeout();
+    if (positive(read) && connect.plus(read).compareTo(bound) < 0) {
+      return null;
+    }
+    return "connect %s + read %s is not below the send bound %s".formatted(connect, read, bound);
+  }
+
   /**
    * The ORDERED lease must outlast one Kafka send, or a row whose acknowledgement is slow is
    * re-claimed while it is still being sent.
@@ -272,13 +325,17 @@ public class OutboxProperties {
   @Setter
   public static class Http {
 
-    /** Connect timeout of the plain client; positive. Default 10s. */
-    @NotNull private Duration connectTimeout = Duration.ofSeconds(10);
+    /**
+     * Connect timeout of the plain client; positive. Unset (the default, 1.11.1) = 10s or a
+     * quarter of the send bound - the larger of {@code lease} and {@code send-timeout} - the
+     * shorter; a fixed 10s up to 1.11.0.
+     */
+    private Duration connectTimeout;
 
     /**
-     * Read timeout of the plain client; unset (the default) = the larger of {@code lease} and
-     * {@code send-timeout}, less a tenth (at least one second). When set, it must be below that
-     * larger value.
+     * Read timeout of the plain client; unset (the default) = the send bound less the connect
+     * timeout and a tenth of the bound (at least one second). When set, it must be below the bound,
+     * and the connect and read timeouts together must end before it.
      */
     private Duration readTimeout;
   }

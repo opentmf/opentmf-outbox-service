@@ -44,6 +44,38 @@
   as before; the plain HTTP client, which has no observation, still forwards the stored header as
   it is. Where the application's `ObservationRegistry` has a meter handler, the span is also the
   timer `opentmf.outbox.relay`, for those rows only.
+- **The HTTP publisher's plain client ends within the send bound, the connect included**
+  (OUTBOX-HTTP-CONNECT-TIMEOUT-WITHIN-SEND-BOUND-1). Its read timeout was kept below the bound
+  (the larger of `lease` and `send-timeout`), but its connect timeout only had to be positive: a
+  connect plus a read could outlast the bound, where the send heartbeat interrupts the send and
+  lets its lease lapse. With **Apache HttpClient 5** on the classpath it was worse: Spring 7's
+  factory takes the read timeout only, so the connect ran Apache's own three minutes, past the
+  default bound, and its blocking connect ignores the interrupt on a platform thread - the lease
+  lapsed while the connect went on, another relay sent the row, and the first could still POST
+  it: the row delivered twice, two sends to one receiver in flight at once. The JDK's and Jetty's
+  clients were not exposed (their read timeout is a total from the request's start). Now:
+  - the library builds the Apache client itself, with the connect timeout set on its connections
+    (`httpclient5` is an optional dependency of the library; a consumer brings it, as before). Its
+    read timeout remains per read: README, "Timeouts".
+  - and turns off three of Apache's own defaults, each a 1.11.0 defect for every consumer with
+    Apache on its classpath (the library's plain client was Apache's system client): **a 503 or a
+    429 was sent twice inside one attempt** (Apache's retry strategy; the relay's budget never
+    counted the second POST), **a 3xx was followed** into a second request whose 2xx booked the row
+    RELAYED, and **at most five sends per receiver host were in flight** (Apache's pool), the lane's
+    other slots waiting for a connection inside their send. Now no redirect is followed, Apache
+    never retries (the relay does), and the pool holds `concurrent.max-in-flight` connections per
+    route and in all. A profile client the consumer builds on Apache must do the same (README,
+    "Timeouts").
+  - **The default connect timeout scales down with a short bound**: unset, it is 10 s or a
+    quarter of the bound, the shorter (a fixed 10 s before).
+  - **The plain client's default read timeout is shorter by the connect time**: the bound less the
+    connect timeout and a tenth of the bound - **98 s on the defaults (108 s before)**.
+  - **Refused at boot now**: explicitly SET timeouts that cannot end before the bound - an
+    `http.connect-timeout` at or past the bound, an `http.connect-timeout` plus an
+    `http.read-timeout` (set, or derived from a set connect) at or past it, or an
+    `http.read-timeout` set so close to the bound that the derived connect timeout no longer fits
+    (a 30 s bound with a 29 s read timeout: 7.5 s + 29 s). The rejected value names the figures.
+    Every configuration that leaves both timeouts unset boots as before.
 
 ## 1.11.0 - 2026-11-03
 

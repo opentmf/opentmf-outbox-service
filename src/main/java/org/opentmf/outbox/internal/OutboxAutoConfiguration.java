@@ -290,7 +290,9 @@ public class OutboxAutoConfiguration {
         ObjectProvider<ObservationRegistry> observationRegistry) {
       return new HttpOutboxPublisher(
           OutboxHttpClients.plain(
-              properties.getHttp().getConnectTimeout(), properties.httpReadTimeout()),
+              properties.httpConnectTimeout(),
+              properties.httpReadTimeout(),
+              properties.getConcurrent().getMaxInFlight()),
           profileResolver.getIfAvailable(),
           objectMapper,
           environment.getProperty("spring.application.name", "unknown"),

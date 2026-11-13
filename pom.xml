@@ -137,6 +137,15 @@
          A consumer wanting NAMED authenticated clients brings the
          opentmf-http-clients starter itself and implements the resolver - the
          library stays free of that starter's mandatory configuration surface. -->
+    <!-- Apache HttpClient 5 - OPTIONAL, compiled against only: when a consumer has it on its
+         classpath, RestClient (and the HTTP publisher's plain client) pick it, and the library
+         builds that client itself so its CONNECT timeout is set (Spring 7's factory takes the
+         read timeout only; Apache's own connect timeout is three minutes). -->
+    <dependency>
+      <groupId>org.apache.httpcomponents.client5</groupId>
+      <artifactId>httpclient5</artifactId>
+      <optional>true</optional>
+    </dependency>
 
     <!-- ================================================================ -->
     <!-- The /ops trio: REST + the TMF630 toolkit list (the list endpoint  -->

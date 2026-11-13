@@ -17,6 +17,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -28,6 +29,7 @@ import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -126,7 +128,18 @@ class Profile681HubIT {
     @Bean
     @Order(Ordered.HIGHEST_PRECEDENCE)
     OutboxPublisher hubSender(ObjectMapper objectMapper) {
-      RestClient client = RestClient.create();
+      // the consumer's own client, built on Apache HttpClient as the README advises (1.11.1):
+      // Apache's defaults would re-send the hub's 503 inside the call and follow a 3xx - the
+      // budget below would then count one attempt for two POSTs
+      RestClient client =
+          RestClient.builder()
+              .requestFactory(
+                  new HttpComponentsClientHttpRequestFactory(
+                      HttpClients.custom()
+                          .disableAutomaticRetries()
+                          .disableRedirectHandling()
+                          .build()))
+              .build();
       return new OutboxPublisher() {
         @Override
         public boolean supports(OutboxEvent event) {

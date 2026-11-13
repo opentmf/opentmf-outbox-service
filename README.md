@@ -612,8 +612,8 @@ opentmf:
       ordering-key: AGGREGATE_ID  # on CONCURRENT: AGGREGATE_ID | NONE
       lease: 15s             # on CONCURRENT: a Kafka row's lease, > send-timeout
     http:                    # the HTTP publisher's plain client (1.9.0)
-      connect-timeout: 10s
-      read-timeout:          # unset: max(lease, send-timeout) less a tenth (108 s here)
+      connect-timeout:       # unset: 10 s, or a quarter of max(lease, send-timeout) if shorter
+      read-timeout:          # unset: that bound less the connect and a tenth (98 s here)
     ops-endpoints: true      # serve the /ops surface (see below) - a conditional switch,
                              # not a field of OutboxProperties
 ```
@@ -629,8 +629,8 @@ opentmf:
 | `retention`      | `Duration` | `7d`    | Used by the prune (`OutboxMaintenanceService.prune()`): relayed AND cancelled rows. |
 | `send-timeout`   | `Duration` | `10s`   | A send's bound is the larger of its lease and this (or its publisher's `sendTimeout(event)`): the heartbeat renews a running send's lease up to it, then the send is presumed hung (1.9.0). The Kafka publisher awaits at least this long. |
 | `lease`          | `Duration` | `2m`    | Lease of a CONCURRENT row when its publisher declares none: how long a claimed row stays its holder's without a word from it. Renewed every third of it while a send runs (1.9.0); up to 1.8.0 it had to exceed the lane's longest call. |
-| `http.connect-timeout` | `Duration` | `10s` | The HTTP publisher's plain client (1.9.0; none before). Positive (validated at boot). |
-| `http.read-timeout` | `Duration` | unset | The plain client's read timeout (1.9.0; none before). Unset = the larger of `lease` and `send-timeout`, less a tenth (at least 1 s). When set it must be below that larger value (validated at boot). A profile's client keeps its own. |
+| `http.connect-timeout` | `Duration` | unset | The HTTP publisher's plain client (1.9.0; none before). Unset (1.11.1) = 10 s, or a quarter of the send bound - the larger of `lease` and `send-timeout` - when that is shorter; a fixed 10 s up to 1.11.0. Positive when set (validated at boot). |
+| `http.read-timeout` | `Duration` | unset | The plain client's read timeout (1.9.0; none before). Unset = the send bound less the connect timeout and a tenth of the bound (at least 1 s) - 98 s on the defaults (1.11.1; 108 s up to 1.11.0). When set it must be below the bound, and **the connect and read timeouts together must end before it** (1.11.1; validated at boot - see "Timeouts"). A profile's client keeps its own. |
 | `ordered.lease`  | `Duration` | `15s`   | Lease of an ORDERED row when its publisher declares none. Short on purpose: after a pod stop the row waits this long. Must exceed `send-timeout` (validated at boot). |
 | `concurrent.max-in-flight` | `int` | `8` | CONCURRENT sends in flight per pod (also the thread bound). Since 1.6.0 the claim runs ahead of the slots, so this is the lever for the lane's throughput; each send holds a connection while it books, so the pool must exceed it. |
 | `kafka.lane`     | `ORDERED`/`CONCURRENT` | `ORDERED` | The default Kafka publisher's lane (1.5.0). `CONCURRENT` = per-aggregate order across pods (see "Running several relays with Kafka"). Stamped at append. |
@@ -948,15 +948,47 @@ client. **A row that NAMES a profile the resolver does not know (1.9.0)** —
 goes out through the plain client, without the profile's authentication (up
 to 1.8.0 it did).
 
-**Timeouts (1.9.0).** The plain client has a connect timeout
-(`opentmf.outbox.http.connect-timeout`, 10 s) and a read timeout
-(`opentmf.outbox.http.read-timeout`; by default the larger of `lease` and
-`send-timeout` less a tenth — 108 s with the defaults — and when set it must
-be below that larger value, validated at startup). It is the client
-`RestClient.create()` picks from the classpath (Apache HttpClient 5, Jetty,
-Reactor Netty, else the JDK's), its timeouts set; Apache takes the read
-timeout only. Up to 1.8.0 the plain client had no timeout: a receiver that
-never answered held its send and its lease. **A profile's client keeps its
+**Timeouts (1.9.0; within the send bound since 1.11.1).** The plain client has
+a connect timeout (`opentmf.outbox.http.connect-timeout`) and a read timeout
+(`opentmf.outbox.http.read-timeout`), and **together they end before the send
+bound**, the larger of `lease` and `send-timeout`: at the bound the send
+heartbeat interrupts the send and lets its lease lapse, and a client that
+ignores the interrupt would go on while another relay sends the row. Unset,
+the connect timeout is 10 s, or a quarter of the bound when that is shorter,
+and the read timeout is the bound less the connect timeout and a tenth of the
+bound (at least 1 s): 10 s + 98 s against the default 2 min. A configuration
+that SETS them so that they cannot end before the bound is refused at
+startup; the rejected value names the figures (`connect PT10S + read PT25S is
+not below the send bound PT30S`). It is the client `RestClient.create()` picks
+from the classpath, its timeouts set:
+
+| Client (picked in this order) | Connect timeout | Read timeout | Past the send bound | Redirects, retries, connections |
+|---|---|---|---|---|
+| Apache HttpClient 5 | set on its connections (1.11.1; Apache's own 3 min before) | **per read** (inactivity) | the connect and each read end in time; a receiver that drips its response slower than the read timeout but never stops can outlast the bound, and on a platform thread the blocking read ignores the interrupt - virtual threads (Boot's `spring.threads.virtual.enabled`) honour it | the library builds it (1.11.1): a 3xx is **not followed**, Apache **never retries** (the relay does), and its pool holds `concurrent.max-in-flight` connections per route and in all |
+| Jetty | set | a **total** from the request's queueing, the connect included | ends in time | Jetty's defaults (it follows a 3xx) |
+| Reactor Netty | set | after the request is sent | the two add up, and the check above keeps the sum in the bound | Reactor's defaults (no redirect, no retry) |
+| the JDK's (none of the above present) | set | a **total** from the request's start, the connect included | ends in time | the JDK's defaults (no redirect, no retry, no pool limit) |
+
+**Apache HttpClient 5's own defaults, up to 1.11.0** (the client
+`HttpClients.createSystem()` builds, which Spring's factory used), were each a
+defect for a consumer with Apache on its classpath: a 503 or a 429 was **sent
+twice inside one attempt** (its retry strategy re-sends them once, and the
+relay's budget never counted the second POST); a 3xx was **followed** into a
+second request, whose 2xx booked the row RELAYED although the receiver never
+processed it; and **at most five sends per receiver host** were in flight
+(its pool's per-route limit), the rest of the lane's slots waiting for a
+connection inside their send, lease and slot held. **A profile's client built
+on Apache must do the same**: `disableRedirectHandling()`,
+`disableAutomaticRetries()`, and a pool of at least `concurrent.max-in-flight`
+per route - the library cannot reach a client the consumer builds.
+
+Up to 1.11.0 the default read timeout did not leave room for the connect (a
+30 s lease: 10 s + 27 s), and with Apache the connect ran Apache's own three
+minutes, past the default bound: the lease lapsed while the connect went on,
+another relay sent the row, and the first could still POST it - the row
+delivered twice, and two sends to one receiver in flight at once. Up to 1.8.0
+the plain client had no timeout: a receiver that never answered held its send
+and its lease. **A profile's client keeps its
 own timeouts — set them below its rows' lease**, or a hung call runs to the
 send's bound and its lapse counts as a failed attempt.
 
@@ -1509,7 +1541,7 @@ Accepted survivors, each reviewed:
 | `OutboxRelayWorker.renew` | a lapsed ORDERED row's `return true` → `false` | Harmless: the booking then renews the NEXT row one turn early - nothing is sent out of turn, and the lapsed row is still counted, never sent |
 | `OutboxSendHeartbeat.finished` | removed `unlock` | Equivalent: a finished row leaves the sending set and is never locked by the heartbeat again |
 | `OutboxSendHeartbeat` thread factory | removed `setDaemon` | As the other factories: asserted where the thread runs, missed by PIT's per-line mapping |
-| `OutboxHttpClients` | the Apache, Jetty and Reactor branches (no coverage); the JDK client's read timeout; `present` → false | None of those clients is on the unit-test classpath, by design (and `present` false is that classpath's own answer); the read timeout is the suite's F4 |
+| `OutboxHttpClients` | the Jetty and Reactor branches (no coverage); the clients' read timeouts; `present` → false | Neither client is on the unit-test classpath, by design; Apache's (picked here since 1.11.1) and the JDK's connect timeouts are the stalled-connect cells of `OutboxHttpClientsTests`, their read timeouts the suite's F4 on both clients |
 
 `NO_COVERAGE` entries (the Kafka publisher bean method) are exercised by the
 Testcontainers ITs, which the posture deliberately keeps out of PIT (unit tests
