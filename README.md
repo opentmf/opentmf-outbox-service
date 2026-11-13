@@ -616,6 +616,8 @@ opentmf:
       read-timeout:          # unset: that bound less the connect and a tenth (98 s here)
     ops-endpoints: true      # serve the /ops surface (see below) - a conditional switch,
                              # not a field of OutboxProperties
+    ops:
+      sensitive-in-views: true  # false: views drop the payload, lastError = the kind only (1.11.1)
 ```
 
 | Property         | Type       | Default | Notes                                                                 |
@@ -643,6 +645,7 @@ opentmf:
 | `maintenance.batch-size` | `int`    | `5000`  | Rows per batch of a bulk operation (prune, unpark by filter); each batch is its own transaction, no entity loaded. |
 | `maintenance.time-budget` | `Duration` | `10s` | One bulk call stops after this; the answer says `moreToPrune` / `moreToUnpark` and the caller calls again. |
 | `ops-endpoints`  | `boolean`  | `true`  | `false` removes the library's `/ops` controller entirely. A `@ConditionalOnProperty` key read at boot, not a bound field. |
+| `ops.sensitive-in-views` | `boolean` | `true` | Whether the row views (inspect and the three lists) carry the row's sensitive text (1.11.1). `false`: `payload` null and `lastError` the failure's kind only, the full text on `GET /ops/outbox/{id}/payload` - see "Ops endpoints". |
 
 ## Metrics
 
@@ -1040,7 +1043,22 @@ surface):
 | GET    | `/ops/outbox`                 | TMF630 triage list (attribute filtering + paging), payloads omitted; `?state=` (1.4.0) narrows it to one derived-state leg like the path form below |
 | GET    | `/ops/outbox/state/{state}`   | The list narrowed to one derived-state leg (`pending`, `parked`, `relayed`, `cancelled`; unknown → 400), same filtering + paging on top |
 | GET    | `/ops/outbox/parked`          | Runbook alias of `/ops/outbox/state/parked`                           |
-| GET    | `/ops/outbox/{id}`            | One row in full — payload + `last_error`, the pre-unpark forensic read (behind the consumer's admin role, by ruling) |
+| GET    | `/ops/outbox/{id}`            | One row in full — payload + `last_error`, the pre-unpark forensic read (behind the consumer's admin role, by ruling); without them under `ops.sensitive-in-views=false` |
+| GET    | `/ops/outbox/{id}/payload`    | The row's sensitive text alone, on its own path (1.11.1): `{"id", "payload", "lastError"}` - the stored payload and the full failure text; never the stored headers |
+
+**The sensitive text on its own path (1.11.1).** A row's payload is the customer's data, and so
+is its `lastError`: it is the failure's message, and for an HTTP 4xx or 5xx Spring puts the
+receiver's whole response body into it - a receiver that echoes the request echoes the
+customer. Up to 1.11.0 an administrator who could read the views read both: the payload on the
+inspect, `lastError` on every list. `GET /ops/outbox/{id}/payload` now serves them on a path of
+their own, and with `opentmf.outbox.ops.sensitive-in-views=false` **the views no longer carry
+them**: `payload` is null, and `lastError` holds the failure's kind only - the exception's type
+name, the leading token of the stored text when it has that shape (`unclassified` for any
+other text, never a piece of it), so list triage still sees what failed. The values are not in
+the response record at all, so a `fields=` selection cannot bring them back. The default,
+`true`, leaves every view exactly as it was. The library adds no security: the consumer gives
+the payload path its stricter role in its own rules, **matching `/ops/outbox/*/payload` before
+`/ops/outbox/*`** (Spring Security takes the first match).
 
 The row routes take an id of **digits only** (`{id:\d+}`, 1.7.0). A literal sibling segment
 is never read as an id: `GET /ops/outbox/unpark` is the 405 of a path that serves POST only
@@ -1153,9 +1171,9 @@ problem-detail mapper).
 | Code | On | Answered by | Component |
 |---|---|---|---|
 | 400 | the three lists | the toolkit (`Tmf630Error`, application/json) - with its undeclared-query-parameter guard on REJECT also for Spring's `page` / `size`; an unknown state leg: the library, rendered by the consumer (problem) | `outboxBadRequest` |
-| 400 | the three row routes | Spring's binding: digits beyond int64 (problem); on the inspect GET also the toolkit guard on REJECT: an undeclared query parameter (`Tmf630Error`) | `outboxRowIdOutOfRange` on the POSTs, `outboxInspectBadRequest` on the GET |
+| 400 | the four row routes | Spring's binding: digits beyond int64 (problem); on the two GETs (inspect, payload) also the toolkit guard on REJECT: an undeclared query parameter (`Tmf630Error`) | `outboxRowIdOutOfRange` on the POSTs, `outboxInspectBadRequest` on the GETs |
 | 400 | the bulk unpark | the library (no destination) or Spring (unreadable body) | `outboxUnparkFilterBadRequest` |
-| 404 | the three row routes | the library (no such row); an id that is not digits matches no route | `outboxRowNotFound` |
+| 404 | the four row routes | the library (no such row); an id that is not digits matches no route | `outboxRowNotFound` |
 | 409 | the single unpark and cancel | the library (the row is not in the state the action needs) | `outboxUnparkConflict`, `outboxCancelConflict` |
 | 416 | the three lists | the toolkit (`Tmf630Error`) | `outboxRangeNotSatisfiable` |
 | 401, 403, 503 | every operation | the consumer's security | `outboxUnauthorized`, `outboxForbidden`, `outboxServiceUnavailable` |

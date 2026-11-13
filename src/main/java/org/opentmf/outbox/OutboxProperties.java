@@ -106,6 +106,9 @@ public class OutboxProperties {
   /** The library's HTTP publisher's plain client ({@code opentmf.outbox.http.*}, 1.9.0). */
   @Valid private final Http http = new Http();
 
+  /** The /ops surface's row views ({@code opentmf.outbox.ops.*}, 1.11.1). */
+  @Valid private final Ops ops = new Ops();
+
   /**
    * The longest a CONCURRENT send of the library's default lease runs before it is presumed hung:
    * the larger of {@code lease} and {@code send-timeout} - the send heartbeat renews no further.
@@ -338,6 +341,26 @@ public class OutboxProperties {
      * and the connect and read timeouts together must end before it.
      */
     private Duration readTimeout;
+  }
+
+  /**
+   * The /ops surface's row views (1.11.1, OUTBOX-OPS-PAYLOAD-OWN-PATH-1). A row's payload and its
+   * {@code last_error} are the customer's data: the payload whole, and {@code last_error} as the
+   * failure's message - for an HTTP 4xx or 5xx that is the receiver's whole response body.
+   */
+  @Getter
+  @Setter
+  public static class Ops {
+
+    /**
+     * Whether the row views - the single-row inspect and the three lists - carry the row's
+     * sensitive text: {@code payload} (inspect only) and {@code lastError}. {@code true} (the
+     * default) = the views as up to 1.11.0. {@code false} = {@code payload} null and {@code
+     * lastError} holding the failure's kind only (its exception's type name) in every view, the
+     * full text served only by {@code GET /ops/outbox/{id}/payload} - so the consumer's path rules
+     * can give that path a stricter role than the views. That path serves it either way.
+     */
+    private boolean sensitiveInViews = true;
   }
 
   /** What orders a Kafka row on the CONCURRENT lane ({@code opentmf.outbox.kafka.ordering-key}). */

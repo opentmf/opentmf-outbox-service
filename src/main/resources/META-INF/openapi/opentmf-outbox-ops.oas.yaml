@@ -73,7 +73,7 @@
 openapi: 3.1.0
 info:
   title: opentmf-outbox-service /ops/outbox fragment
-  version: 1.11.0
+  version: 1.11.1
   description: >-
     Paste-in contract for the outbox ops surface served by opentmf-outbox-service.
     Not a standalone API document — a fragment the consumer's OAS absorbs. The library's
@@ -196,14 +196,45 @@ paths:
       operationId: inspectOutboxRow
       security: [{ bearerAuth: [] }]
       summary: One row in full (payload + lastError — the pre-unpark forensic read)
+      description: >-
+        With `opentmf.outbox.ops.sensitive-in-views=false` (1.11.1) `payload` is null here and
+        `lastError` holds the failure's kind only; `GET /ops/outbox/{id}/payload` serves the
+        full text, so the consumer's path rules can give that path a stricter role.
       parameters:
         - $ref: '#/components/parameters/outboxRowId'
       responses:
         '200':
-          description: The row, payload included
+          description: The row, payload included (unless the sensitive text is kept off the views)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OutboxRow' }
+        '400': { $ref: '#/components/responses/outboxInspectBadRequest' }
+        '401': { $ref: '#/components/responses/outboxUnauthorized' }
+        '403': { $ref: '#/components/responses/outboxForbidden' }
+        '404': { $ref: '#/components/responses/outboxRowNotFound' }
+        '405': { $ref: '#/components/responses/outboxMethodNotAllowed' }
+        '406': { $ref: '#/components/responses/outboxNotAcceptable' }
+        '503': { $ref: '#/components/responses/outboxServiceUnavailable' }
+
+  /ops/outbox/{id}/payload:
+    get:
+      operationId: getOutboxRowPayload
+      security: [{ bearerAuth: [] }]
+      summary: One row's sensitive text - its payload and lastError - on its own path (1.11.1)
+      description: >-
+        The customer's data of a row: the stored payload, and `lastError`, the failure's
+        message - for an HTTP 4xx or 5xx the receiver's whole response body. On its own path so
+        the consumer's path rules can give it a stricter role than the row views (match it
+        before `/ops/outbox/{id}`); served whatever `opentmf.outbox.ops.sensitive-in-views`
+        says. The stored headers are never served.
+      parameters:
+        - $ref: '#/components/parameters/outboxRowId'
+      responses:
+        '200':
+          description: The row's payload and lastError
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OutboxRowPayload' }
         '400': { $ref: '#/components/responses/outboxInspectBadRequest' }
         '401': { $ref: '#/components/responses/outboxUnauthorized' }
         '403': { $ref: '#/components/responses/outboxForbidden' }
@@ -630,8 +661,27 @@ components:
           description: The relay's lease (1.3.0) - in the future while the row is in flight.
         relayedOn: { type: [string, 'null'], format: date-time }
         cancelledOn: { type: [string, 'null'], format: date-time }
-        lastError: { type: [string, 'null'] }
+        lastError:
+          type: [string, 'null']
+          description: >-
+            The last failure's message; with `opentmf.outbox.ops.sensitive-in-views=false`
+            (1.11.1) its kind only - the exception's type name, `unclassified` for a text not led
+            by one - and the full text is on `GET /ops/outbox/{id}/payload`.
+        payload:
+          type: [string, 'null']
+          description: >-
+            The stored payload, on the single-row inspect only; null with
+            `opentmf.outbox.ops.sensitive-in-views=false` (1.11.1).
+
+    OutboxRowPayload:
+      type: object
+      description: >-
+        A row's sensitive text (`OutboxRowPayload`, 1.11.1): the stored payload and the last
+        failure's message. Never the stored headers.
+      properties:
+        id: { type: integer, format: int64 }
         payload: { type: [string, 'null'] }
+        lastError: { type: [string, 'null'] }
 
     OutboxOpsAck:
       type: object

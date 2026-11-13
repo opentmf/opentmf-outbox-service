@@ -48,6 +48,8 @@ class OutboxOpsWireConformanceTests {
   void rowsAreMissingOrInTheWrongState() {
     when(maintenance.inspect(anyLong()))
         .thenThrow(new IllegalArgumentException("Outbox row 9 not found"));
+    when(maintenance.payload(anyLong()))
+        .thenThrow(new IllegalArgumentException("Outbox row 9 not found"));
     doThrow(new IllegalArgumentException("Outbox row 9 not found")).when(maintenance).unpark(9L);
     doThrow(new IllegalStateException("Outbox row 7 is not parked")).when(maintenance).unpark(7L);
     doThrow(new IllegalArgumentException("Outbox row 9 not found")).when(maintenance).cancel(9L);
@@ -65,6 +67,7 @@ class OutboxOpsWireConformanceTests {
     assertThat(
             List.of(
                 answers("GET /ops/outbox/{id}", get("/ops/outbox/9"), 404),
+                answers("GET /ops/outbox/{id}/payload", get("/ops/outbox/9/payload"), 404),
                 answers("POST /ops/outbox/{id}/unpark", post("/ops/outbox/9/unpark"), 404),
                 answers("POST /ops/outbox/{id}/cancel", post("/ops/outbox/9/cancel"), 404),
                 answers("GET /ops/outbox/{id}", get("/ops/outbox/abc"), 404))) // no route takes it
@@ -76,6 +79,10 @@ class OutboxOpsWireConformanceTests {
     assertThat(
             List.of(
                 answers("GET /ops/outbox/{id}", get("/ops/outbox/" + TOO_BIG), 400),
+                answers(
+                    "GET /ops/outbox/{id}/payload",
+                    get("/ops/outbox/" + TOO_BIG + "/payload"),
+                    400),
                 answers(
                     "POST /ops/outbox/{id}/unpark",
                     post("/ops/outbox/" + TOO_BIG + "/unpark"),

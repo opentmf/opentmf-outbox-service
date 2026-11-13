@@ -31,6 +31,9 @@ import org.springframework.transaction.annotation.Transactional;
 @Slf4j
 public class OutboxMaintenanceService {
 
+  /** The refusal of an action on an id no row has. */
+  private static final String NOT_FOUND = "Outbox row %d not found";
+
   /** The open ends of an unpark range: before any row was parked, after any will be. */
   private static final OffsetDateTime OPEN_FROM = OffsetDateTime.parse("1970-01-01T00:00:00Z");
 
@@ -245,7 +248,7 @@ public class OutboxMaintenanceService {
     return repository
         .lockById(outboxId)
         .orElseThrow(
-            () -> new IllegalArgumentException("Outbox row %d not found".formatted(outboxId)));
+            () -> new IllegalArgumentException(NOT_FOUND.formatted(outboxId)));
   }
 
   /**
@@ -271,7 +274,7 @@ public class OutboxMaintenanceService {
     }
     return repository
         .findAll(composed, pageable)
-        .map(event -> OutboxRowView.of(event, false, clock.now()));
+        .map(event -> OutboxRowView.of(event, false, sensitiveInViews(), clock.now()));
   }
 
   /**
@@ -284,8 +287,28 @@ public class OutboxMaintenanceService {
   public OutboxRowView inspect(long outboxId) {
     return repository
         .findById(outboxId)
-        .map(event -> OutboxRowView.of(event, true, clock.now()))
+        .map(event -> OutboxRowView.of(event, true, sensitiveInViews(), clock.now()))
         .orElseThrow(
-            () -> new IllegalArgumentException("Outbox row %d not found".formatted(outboxId)));
+            () -> new IllegalArgumentException(NOT_FOUND.formatted(outboxId)));
+  }
+
+  /**
+   * One row's sensitive text - its payload and {@code last_error} - on its own (1.11.1): what the
+   * row views leave out with {@code opentmf.outbox.ops.sensitive-in-views=false}, served whatever
+   * that says.
+   *
+   * @throws IllegalArgumentException when no row has the given id
+   */
+  @Transactional(readOnly = true)
+  public OutboxRowPayload payload(long outboxId) {
+    return repository
+        .findById(outboxId)
+        .map(event -> new OutboxRowPayload(event.getId(), event.getPayload(), event.getLastError()))
+        .orElseThrow(
+            () -> new IllegalArgumentException(NOT_FOUND.formatted(outboxId)));
+  }
+
+  private boolean sensitiveInViews() {
+    return properties.getOps().isSensitiveInViews();
   }
 }

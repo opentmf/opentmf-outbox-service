@@ -2,6 +2,19 @@
 
 ## 1.11.1 - 2026-11-12
 
+### Added
+
+- **A row's sensitive text has a path of its own, and the views can leave it out**
+  (OUTBOX-OPS-PAYLOAD-OWN-PATH-1). `GET /ops/outbox/{id}/payload` serves a row's stored payload
+  and its full `lastError` - the failure's message, which for an HTTP 4xx or 5xx carries the
+  receiver's whole response body. With the new `opentmf.outbox.ops.sensitive-in-views=false` the
+  row views - inspect and the three lists - no longer carry them: `payload` is null and
+  `lastError` holds the failure's kind only (the exception's type name, `unclassified` for any
+  other text), so a consumer's path rules can give the payload path a stricter role than the
+  views. The default, `true`, leaves every response exactly as it was; `OutboxRowView` keeps its
+  shape. The ops OAS fragment gains the operation (`getOutboxRowPayload`, schema
+  `OutboxRowPayload`): re-paste it.
+
 ### Fixed
 
 - **A send that outran its bound now counts towards the claim pause**

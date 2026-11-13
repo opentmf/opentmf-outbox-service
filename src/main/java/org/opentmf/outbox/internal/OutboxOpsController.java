@@ -9,6 +9,7 @@ import lombok.RequiredArgsConstructor;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxMaintenanceService;
 import org.opentmf.outbox.OutboxPruneResult;
+import org.opentmf.outbox.OutboxRowPayload;
 import org.opentmf.outbox.OutboxRowView;
 import org.opentmf.outbox.OutboxStateFilter;
 import org.opentmf.outbox.OutboxUnparkResult;
@@ -236,11 +237,22 @@ public class OutboxOpsController {
   /**
    * One row in full (payload + last_error) - the pre-unpark forensic read. The payload rides
    * here by ruling: this surface sits behind the consumer's admin role; the LIST stays
-   * metadata-only.
+   * metadata-only. With {@code opentmf.outbox.ops.sensitive-in-views=false} (1.11.1) neither
+   * rides here: {@link #payload} serves them.
    */
   @GetMapping(path = "/outbox/{id:\\d+}", produces = MediaType.APPLICATION_JSON_VALUE)
   public OutboxRowView inspect(@PathVariable(name = "id") long id) {
     return mapped(() -> maintenance.inspect(id));
+  }
+
+  /**
+   * One row's sensitive text - payload and last_error - on its own path (1.11.1), so the
+   * consumer's path rules can give it a stricter role than the row views; served whatever {@code
+   * sensitive-in-views} says. Never the stored headers.
+   */
+  @GetMapping(path = "/outbox/{id:\\d+}/payload", produces = MediaType.APPLICATION_JSON_VALUE)
+  public OutboxRowPayload payload(@PathVariable(name = "id") long id) {
+    return mapped(() -> maintenance.payload(id));
   }
 
   private static <T> T mapped(Supplier<T> action) {
