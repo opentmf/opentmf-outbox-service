@@ -61,7 +61,7 @@ class OutboxConcurrentLane {
   private final Semaphore permits;
   private final int maxInFlight;
   private final int capacity;
-  private final SimpleAsyncTaskExecutor executor;
+  private final AtomicReference<SimpleAsyncTaskExecutor> executor;
   private final boolean virtual;
   private final Queue<Queued> queue = new ConcurrentLinkedQueue<>();
 
@@ -86,10 +86,24 @@ class OutboxConcurrentLane {
     this.maxInFlight = maxInFlight;
     this.capacity = capacity;
     this.virtual = virtual;
-    this.executor = new SimpleAsyncTaskExecutor("opentmf-outbox-send-");
-    executor.setDaemon(true);
-    executor.setVirtualThreads(virtual);
+    this.executor = new AtomicReference<>(newExecutor(virtual));
     this.shutdownGrace = shutdownGrace;
+  }
+
+  private static SimpleAsyncTaskExecutor newExecutor(boolean virtual) {
+    SimpleAsyncTaskExecutor created = new SimpleAsyncTaskExecutor("opentmf-outbox-send-");
+    created.setDaemon(true);
+    created.setVirtualThreads(virtual);
+    return created;
+  }
+
+  /**
+   * Takes sends again, on new workers - a restarted relay's, once the previous run's workers have
+   * ended (their slots are back and the stop emptied the queue).
+   */
+  void open() {
+    executor.set(newExecutor(virtual));
+    closed = false;
   }
 
   /** Whether the sends run on virtual threads. */
@@ -199,7 +213,7 @@ class OutboxConcurrentLane {
   private void startWorkers() {
     while (!closed && queued.get() > 0 && permits.tryAcquire()) {
       try {
-        executor.execute(this::work);
+        executor.get().execute(this::work);
       } catch (TaskRejectedException ex) {
         permits.release();
         log.debug("Outbox send worker not started - the concurrent lane is closing", ex);
@@ -279,7 +293,7 @@ class OutboxConcurrentLane {
     if (dropped > 0) {
       log.info("Outbox relay stopping - {} queued rows not sent; their leases lapse", dropped);
     }
-    executor.close(); // refuses new workers; it waits for nothing, the relay joins them
+    executor.get().close(); // refuses new workers; it waits for nothing, the relay joins them
   }
 
   /** Waits until every worker has ended or the deadline passed; whether they all ended. */

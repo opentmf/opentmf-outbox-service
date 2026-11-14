@@ -44,7 +44,13 @@
   started. A bean that relied on the relay already running during its own initialisation (a
   readiness check that waits for a row to be relayed inside `@PostConstruct`, say) must wait for
   the context's start instead (an `ApplicationReadyEvent` listener). A context that is stopped and
-  started again does not restart the relay.
+  started again restarts the relay and the refresher on new threads, Spring's test-context cache
+  among the callers: it pauses a cached context when a test class switches to another one and
+  restarts it when a later class reuses it. The restart waits for nothing: it runs only once every
+  thread of the previous run has ended, and while one still runs (a blocking call that ignored the
+  stop's interrupt) the start is refused with an ERROR naming it. A paused context with sends in
+  flight waits for them as a real stop does, up to `shutdown-grace + shutdown-join`. The new gauge
+  **`opentmf.outbox.relay.running`** reads 1 while this pod's relay runs, else 0.
 - **The plain HTTP client follows no redirect on Jetty either** (OUTBOX-JETTY-FOLLOWS-NO-REDIRECT-1).
   Jetty's client follows a 3xx by default and Spring's factory left it so: for a consumer with
   Jetty (and no Apache HttpClient) on its classpath a redirect was followed into a second request,

@@ -3,8 +3,11 @@ package org.opentmf.outbox.internal;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
@@ -17,9 +20,12 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.opentmf.outbox.internal.OutboxEventRepository.LaneCounts;
 import org.opentmf.outbox.internal.OutboxEventRepository.LaneSince;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 
 /**
  * The gauge family: values from the last REFRESH (pending = open-not-parked + parked), relay-lag
@@ -243,5 +249,85 @@ class OutboxMetricsTests {
     assertThat(registry.get(OutboxMetrics.METRICS_AGE).gauge().value())
         .as("the refresh in flight ended before the stop returned")
         .isNotNaN();
+  }
+
+  /**
+   * OUTBOX-RELAY-RESTARTS-AFTER-A-STOP-1: a start after a stop refreshes again, on a new thread -
+   * up to the fix the refresher stayed stopped and metrics-age grew for good.
+   */
+  @Test
+  void aStoppedRefresher_startedAgain_refreshesAgain() {
+    OutboxMetrics fast = new OutboxMetrics(registry, repository, Duration.ofMillis(50));
+    fast.start();
+    fast.stop();
+    assertThat(fast.isRunning()).isFalse();
+    clearInvocations(repository);
+
+    fast.start();
+    try {
+      assertThat(fast.isRunning()).isTrue();
+      verify(repository, timeout(5000).atLeast(2)).countParked();
+    } finally {
+      fast.stop();
+    }
+  }
+
+  /** The bean's destruction is the end: a start after it is refused, with an ERROR. */
+  @Test
+  @ExtendWith(OutputCaptureExtension.class)
+  void aDestroyedRefresher_isNeverStartedAgain(CapturedOutput output) {
+    metrics.start();
+    metrics.destroy();
+    clearInvocations(repository);
+
+    metrics.start();
+
+    assertThat(metrics.isRunning()).isFalse();
+    assertThat(output).contains("Outbox gauges' refresher NOT started - it was destroyed");
+    verifyNoInteractions(repository);
+  }
+
+  /** A start while the previous run's query still runs is refused, with an ERROR; later it runs. */
+  @Test
+  @ExtendWith(OutputCaptureExtension.class)
+  void aStartWhileTheOldRefreshStillRuns_isRefused_withAnError(CapturedOutput output)
+      throws Exception {
+    CountDownLatch querying = new CountDownLatch(1);
+    when(repository.countParked())
+        .thenAnswer(
+            invocation -> {
+              querying.countDown();
+              UninterruptibleHold.hold(Duration.ofSeconds(1)); // a query that ignores interrupts
+              return counts(0, 0);
+            });
+    metrics.shutdownJoin(Duration.ofMillis(50));
+    metrics.start();
+    assertThat(querying.await(5, TimeUnit.SECONDS)).isTrue();
+    metrics.stop(); // the join runs out: the query still runs
+
+    metrics.start();
+
+    assertThat(metrics.isRunning()).isFalse();
+    assertThat(output).contains("Outbox gauges' refresher NOT restarted").contains("ERROR");
+    await()
+        .atMost(Duration.ofSeconds(10))
+        .untilAsserted(
+            () -> {
+              metrics.start();
+              assertThat(metrics.isRunning()).isTrue();
+            });
+    metrics.stop();
+  }
+
+  /** opentmf.outbox.relay.running: 1 while the watched relay runs, 0 once it does not. */
+  @Test
+  void theRelayRunningGauge_readsTheRelaysState() {
+    OutboxRelay relay = mock(OutboxRelay.class);
+    when(relay.isRunning()).thenReturn(true, false);
+    metrics.watchRelay(relay);
+
+    assertThat(registry.get(OutboxMetrics.RELAY_RUNNING).gauge().value()).isEqualTo(1d);
+    assertThat(registry.get(OutboxMetrics.RELAY_RUNNING).gauge().value()).isZero();
+    verify(relay, atLeastOnce()).isRunning();
   }
 }

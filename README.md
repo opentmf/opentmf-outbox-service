@@ -496,6 +496,19 @@ sequenceDiagram
   load; the `attempts` summary, registered earlier, has them all). A push
   registry's final push misses them; a scrape never sees them anyway. No
   change — recorded so a dashboard's dip at a restart is understood.
+- **A stop is not the end (1.11.1).** A context that is stopped and started
+  again (`stop()`/`start()`, or Spring's test-context cache, which pauses a
+  cached context when a test class switches to another and restarts it when a
+  later class reuses it) restarts the relay and the gauges' refresher on new
+  threads. The restart runs only once every thread of the previous run has
+  ended; while one still runs - a blocking call that ignored the stop's
+  interrupt, already named in the stop's warning - the start is refused with an
+  ERROR naming it, so no send of the old run returns into the new one, and a
+  later start tries again. The bean's destruction is the end: a start after it
+  is refused with an ERROR. **The one cost:** a context paused with sends in
+  flight waits for them as a real stop does, up to `shutdown-grace +
+  shutdown-join` - a test suite that switches contexts under load pays it at
+  the switch. `opentmf.outbox.relay.running` reads 1 while the relay runs.
 - **Publisher routing.** Everything that is not an `http(s)://` URL is a Kafka
   topic (the Kafka publisher registers at lowest precedence as the default).
   HTTP destinations are POSTed the payload with the relay headers. Consumers
@@ -711,6 +724,7 @@ reads the relayed history.
 | `opentmf.outbox.parked`    | gauge by `lane` | Rows with `parked_on` stamped — **alert when > 0** |
 | `opentmf.outbox.metrics-age` | gauge | Seconds since the gauges were last refreshed successfully — **alert when above a few refresh periods** (e.g. > 60 s with the default 15 s): the values above are stale or NaN |
 | `opentmf.outbox.relay-lag` | gauge by `lane` | Seconds the lane's oldest *released* pending row has been deliverable (a held row is not lagging) |
+| `opentmf.outbox.relay.running` | gauge | 1 while THIS pod's relay runs, else 0 (1.11.1) — read in the pod, no database; 0 while the context is stopped or paused, and after a stop whose restart was refused (an ERROR names the thread of the previous run still running); **alert when it reads 0 in a running service** |
 | `opentmf.outbox.claims.paused` | gauge by `transport` | 1 while THIS pod leaves the transport's rows to the other pods after failed sends in a row, else 0 (1.11.0) — read in the pod, no database; a series per transport from its first pause (`kafka` for the library's Kafka publisher); **alert when it stays 1** on one pod while others relay: that pod cannot reach the transport |
 | `opentmf.outbox.relayed`   | counter | Successful relays, tagged by `destination`         |
 | `opentmf.outbox.dropped`   | counter | Rows given up by a publisher's DROP policy, tagged by `destination` (never counted as relayed) |

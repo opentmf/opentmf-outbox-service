@@ -44,6 +44,9 @@ import org.springframework.context.SmartLifecycle;
  *       claims of the transport's rows are paused after failed sends in a row (1.11.0, {@code
  *       claim-pause}), else 0 - read in this pod, no database; one series per transport a
  *       publisher names, from its first pause; alert when it stays 1
+ *   <li>{@code opentmf.outbox.relay.running} - gauge, 1 while this pod's relay runs, else 0 - read
+ *       in this pod, no database; alert when it reads 0 in a running service (1.11.1: a relay that
+ *       was stopped and is not running again)
  *   <li>{@code opentmf.outbox.relayed} - counter by {@code destination} (closed tag set)
  *   <li>{@code opentmf.outbox.dropped} - counter by {@code destination}: rows given up by a
  *       publisher's DROP policy (never delivered, forensics kept)
@@ -67,6 +70,7 @@ class OutboxMetrics implements SmartLifecycle {
   static final String RELAY_LAG = "opentmf.outbox.relay-lag";
   static final String METRICS_AGE = "opentmf.outbox.metrics-age";
   static final String CLAIMS_PAUSED = "opentmf.outbox.claims.paused";
+  static final String RELAY_RUNNING = "opentmf.outbox.relay.running";
   static final String RELAYED = "opentmf.outbox.relayed";
   static final String DROPPED = "opentmf.outbox.dropped";
   static final String ATTEMPTS = "opentmf.outbox.attempts";
@@ -100,9 +104,17 @@ class OutboxMetrics implements SmartLifecycle {
   private final AtomicReference<Snapshot> snapshot = new AtomicReference<>(Snapshot.NONE);
   private final AtomicReference<Instant> lastRefreshed = new AtomicReference<>();
   private final Map<String, AtomicBoolean> claimsPaused = new ConcurrentHashMap<>();
-  private ScheduledExecutorService refresher;
-  private final AtomicBoolean running = new AtomicBoolean();
-  private final AtomicBoolean stopped = new AtomicBoolean();
+  private final AtomicReference<ScheduledExecutorService> refresher = new AtomicReference<>();
+
+  /** NEW until the first start or stop; STOPPED between runs; DESTROYED for good. */
+  private enum State {
+    NEW,
+    RUNNING,
+    STOPPED,
+    DESTROYED
+  }
+
+  private volatile State state = State.NEW;
 
   /** How long a stop waits for a refresh in flight ({@code shutdown-join}, 1.11.1). */
   private Duration shutdownJoin = Duration.ofSeconds(5);
@@ -151,29 +163,53 @@ class OutboxMetrics implements SmartLifecycle {
     this.shutdownJoin = join;
   }
 
+  /** Registers {@code opentmf.outbox.relay.running}: 1 while {@code relay} runs, else 0. */
+  void watchRelay(SmartLifecycle relay) {
+    Gauge.builder(RELAY_RUNNING, relay, r -> r.isRunning() ? 1d : 0d)
+        .description("1 while this pod's outbox relay runs - alert when 0 in a running service")
+        .register(registry);
+  }
+
   /**
    * Starts the refresher: the first refresh now, then every {@code metrics-refresh}. A {@link
-   * SmartLifecycle} in the relay's phase (1.11.1; a {@code @PostConstruct} up to 1.11.0).
+   * SmartLifecycle} in the relay's phase (1.11.1; a {@code @PostConstruct} up to 1.11.0). Again
+   * after a stop, on a new thread, once the previous one has ended (the relay's rule,
+   * OUTBOX-RELAY-RESTARTS-AFTER-A-STOP-1); refused, with an ERROR, while it still runs and after
+   * the bean's destruction.
    */
   @Override
-  public void start() {
-    if (stopped.get() || !running.compareAndSet(false, true)) {
+  public synchronized void start() {
+    if (state == State.RUNNING) {
       return;
     }
-    refresher =
+    if (state == State.DESTROYED) {
+      log.error("Outbox gauges' refresher NOT started - it was destroyed");
+      return;
+    }
+    ScheduledExecutorService previous = refresher.get();
+    if (previous != null && !previous.isTerminated()) {
+      log.error(
+          "Outbox gauges' refresher NOT restarted - its previous thread (opentmf-outbox-metrics)"
+              + " still runs a query that ignored the stop's interrupt; metrics-age grows until a"
+              + " later start finds it ended");
+      return;
+    }
+    state = State.RUNNING;
+    ScheduledExecutorService started =
         Executors.newSingleThreadScheduledExecutor(
             runnable -> {
               Thread thread = new Thread(runnable, "opentmf-outbox-metrics");
               thread.setDaemon(true);
               return thread;
             });
-    refresher.scheduleWithFixedDelay(
+    started.scheduleWithFixedDelay(
         this::refresh, 0, refreshEvery.toMillis(), TimeUnit.MILLISECONDS);
+    refresher.set(started);
   }
 
   @Override
   public boolean isRunning() {
-    return running.get();
+    return state == State.RUNNING;
   }
 
   @Override
@@ -184,28 +220,35 @@ class OutboxMetrics implements SmartLifecycle {
   /**
    * Stops the refresher in the context's lifecycle stop, before the DataSource is destroyed, and
    * waits up to {@code shutdown-join} for a refresh in flight - its queries and their connection
-   * (1.11.1: up to 1.11.0 it returned at once and a query in flight went on while the pool
-   * closed). Once only; {@code @PreDestroy} is the safety net of a context that never ran its
-   * lifecycle stop.
+   * (1.11.1: up to 1.11.0 it returned at once and a query in flight went on while the pool closed).
+   * Once per run; {@link #destroy} is the safety net of a context that never ran its lifecycle
+   * stop.
    */
   @Override
-  @PreDestroy
-  public void stop() {
-    if (!stopped.compareAndSet(false, true)) {
+  public synchronized void stop() {
+    if (state == State.STOPPED || state == State.DESTROYED) {
       return;
     }
-    running.set(false);
-    if (refresher == null) {
+    state = State.STOPPED;
+    ScheduledExecutorService current = refresher.get();
+    if (current == null) {
       return;
     }
-    refresher.shutdown(); // no refresh from now on; the one in flight ends
-    if (!OutboxStops.awaitUntil(refresher, System.nanoTime() + shutdownJoin.toNanos())) {
-      refresher.shutdownNow();
+    current.shutdown(); // no refresh from now on; the one in flight ends
+    if (!OutboxStops.awaitUntil(current, System.nanoTime() + shutdownJoin.toNanos())) {
+      current.shutdownNow();
       log.warn(
           "Outbox gauges' refresher still running after the shutdown join ({}) - a query that"
               + " ignores interrupts",
           shutdownJoin);
     }
+  }
+
+  /** The bean's destruction: the stop, if the lifecycle never ran it - and the end. */
+  @PreDestroy
+  synchronized void destroy() {
+    stop();
+    state = State.DESTROYED;
   }
 
   /**

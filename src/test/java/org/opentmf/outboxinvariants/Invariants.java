@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import org.awaitility.core.ConditionTimeoutException;
 import org.opentmf.outbox.OutboxPublisher.ExhaustionOutcome;
@@ -790,13 +791,19 @@ final class Invariants {
     }
   }
 
-  /** Submits a task to a pod bean's executor field; whether it runs within 10 s. */
+  /**
+   * Submits a task to a pod bean's executor field - or to the executor it holds, when the field is
+   * an {@link AtomicReference} - and reports whether the task runs within 10 s.
+   */
   private static boolean runsATask(Pod pod, String bean, String field) {
     try {
       Object target = pod.context.getBean(bean);
       Field executorField = target.getClass().getDeclaredField(field);
       executorField.setAccessible(true);
       Object executor = executorField.get(target);
+      if (executor instanceof AtomicReference<?> current) {
+        executor = current.get(); // a restartable relay's executor of the current run (1.11.1)
+      }
       if (executor == null) {
         return true; // never started (the ORDERED lane before its first batch): nothing died
       }

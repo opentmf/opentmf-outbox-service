@@ -8,6 +8,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.opentmf.outbox.OutboxProperties;
@@ -43,6 +44,14 @@ import org.springframework.context.SmartLifecycle;
  * ran on after the context had closed, and a heartbeat tick in flight borrowed a connection while
  * the pool closed. {@code
  * @PreDestroy} remains as the safety net of a context that never ran its lifecycle stop.
+ *
+ * <p>A stop is not the end (OUTBOX-RELAY-RESTARTS-AFTER-A-STOP-1): a {@code start} after a {@code
+ * stop} runs the relay again on new threads - the context's {@code stop()}/{@code start()}, and
+ * Spring's test-context cache pausing a cached context on a switch and restarting it on reuse. It
+ * restarts only once every thread of the previous run has ended; while one still runs (a blocking
+ * call that ignored the stop's interrupt), the start is refused with an ERROR naming it, so no send
+ * of the old run returns into the new one. The bean's destruction is the end: a start after it is
+ * refused with an ERROR. {@code opentmf.outbox.relay.running} reads 1 while the relay runs.
  */
 @Slf4j
 @RequiredArgsConstructor
@@ -54,6 +63,8 @@ class OutboxRelay implements SmartLifecycle {
    */
   static final int PHASE = DEFAULT_PHASE - 4096;
 
+  private static final String RELAY_THREAD = "opentmf-outbox-relay";
+
   private final OutboxRelayWorker worker;
   private final OutboxProperties properties;
   private final OutboxConcurrentLane lane;
@@ -63,39 +74,81 @@ class OutboxRelay implements SmartLifecycle {
   private final AtomicBoolean passQueued = new AtomicBoolean();
   private final AtomicBoolean orderedDue = new AtomicBoolean(true);
 
-  private ScheduledExecutorService executor;
-  private final AtomicBoolean running = new AtomicBoolean();
-  private final AtomicBoolean stopped = new AtomicBoolean();
+  private final AtomicBoolean beatHooked = new AtomicBoolean();
+
+  /** NEW until the first start or stop; STOPPED between runs; DESTROYED for good. */
+  private enum State {
+    NEW,
+    RUNNING,
+    STOPPED,
+    DESTROYED
+  }
+
+  private final AtomicReference<ScheduledExecutorService> executor = new AtomicReference<>();
+  private volatile State state = State.NEW;
 
   /**
-   * Starts the single relay thread and schedules the sweep - after measuring the clock against
-   * the database (1.9.0), so no claim ever runs on the pod's own clock when the database answers -
-   * and the send heartbeat.
+   * Starts the single relay thread and schedules the sweep - after measuring the clock against the
+   * database (1.9.0), so no claim ever runs on the pod's own clock when the database answers - and
+   * the send heartbeat. After a stop it opens the lanes and the worker again, on new threads, once
+   * every thread of the previous run has ended; refused, with an ERROR, while one still runs and
+   * after the bean's destruction.
    */
   @Override
-  public void start() {
-    if (stopped.get() || !running.compareAndSet(false, true)) {
-      return;
+  public synchronized void start() {
+    switch (state) {
+      case RUNNING -> {
+        return;
+      }
+      case DESTROYED -> {
+        log.error(
+            "Outbox relay NOT started - it was destroyed; nothing is relayed by this context");
+        return;
+      }
+      case STOPPED -> {
+        List<String> alive = alive();
+        if (!alive.isEmpty()) {
+          log.error(
+              "Outbox relay NOT restarted - {} of its previous run still running (a blocking call"
+                  + " that ignored the stop's interrupt); nothing is relayed by this pod until a"
+                  + " later start finds them ended",
+              alive);
+          return;
+        }
+        worker.open();
+        orderedLane.open();
+        lane.open();
+        passQueued.set(false);
+        orderedDue.set(true); // a new run's first pass claims the ORDERED lane too
+      }
+      case NEW -> {
+        // the first run: the lanes and the worker are open from their construction
+      }
     }
+    state = State.RUNNING;
     clock.measure();
-    heartbeat.onBeat(worker::giveBackStranded); // a stranded hand-off queue goes back, 1.9.0
+    if (beatHooked.compareAndSet(false, true)) {
+      heartbeat.onBeat(worker::giveBackStranded); // a stranded hand-off queue goes back, 1.9.0
+    }
     heartbeat.start();
-    executor =
+    ScheduledExecutorService started =
         Executors.newSingleThreadScheduledExecutor(
             runnable -> {
-              Thread thread = new Thread(runnable, "opentmf-outbox-relay");
+              Thread thread = new Thread(runnable, RELAY_THREAD);
               thread.setDaemon(true);
               return thread;
             });
     long sweepMillis = properties.getSweepInterval().toMillis();
-    executor.scheduleWithFixedDelay(this::sweep, sweepMillis, sweepMillis, TimeUnit.MILLISECONDS);
+    started.scheduleWithFixedDelay(this::sweep, sweepMillis, sweepMillis, TimeUnit.MILLISECONDS);
+    executor.set(started);
     lane.onRoom(this::poke); // room in the hand-off queue: time for the next CONCURRENT claim
     orderedLane.onIdle(this::poke); // an ORDERED batch is done: the next one may be claimed
   }
 
   /** Enqueues an immediate relay pass (the after-commit nudge); safe to call anytime. */
   public void poke() {
-    if (executor == null) {
+    ScheduledExecutorService current = executor.get();
+    if (current == null) {
       log.debug("Outbox relay poke ignored - relay not started");
       return;
     }
@@ -103,7 +156,7 @@ class OutboxRelay implements SmartLifecycle {
       return; // a queued pass will see this row too
     }
     try {
-      executor.execute(this::relayPass);
+      current.execute(this::relayPass);
     } catch (RejectedExecutionException ex) {
       passQueued.set(false);
       log.debug("Outbox relay poke ignored - relay is shut down", ex);
@@ -148,7 +201,7 @@ class OutboxRelay implements SmartLifecycle {
 
   @Override
   public boolean isRunning() {
-    return running.get();
+    return state == State.RUNNING;
   }
 
   @Override
@@ -164,35 +217,32 @@ class OutboxRelay implements SmartLifecycle {
    * and the stop waits for every thread of the relay to END - the heartbeat's tick in flight
    * included, the heartbeat stopping last so the drained sends keep their leases - up to {@code
    * shutdown-join}. A thread still running then is named in one warning. At most {@code
-   * shutdown-grace + shutdown-join} in all; once only, whichever of the lifecycle stop and the
-   * {@code @PreDestroy} safety net comes first.
+   * shutdown-grace + shutdown-join} in all; once per run - a stop of a stopped relay returns at
+   * once, the {@code @PreDestroy} safety net after the lifecycle stop among them.
    */
   @Override
-  @PreDestroy
-  public void stop() {
-    if (!stopped.compareAndSet(false, true)) {
+  public synchronized void stop() {
+    if (state == State.STOPPED || state == State.DESTROYED) {
       return;
     }
-    running.set(false);
+    state = State.STOPPED;
+    ScheduledExecutorService current = executor.get();
     long graceEnd = System.nanoTime() + properties.getShutdownGrace().toNanos();
-    if (executor != null) {
-      executor.shutdown();
+    if (current != null) {
+      current.shutdown();
     }
     orderedLane.shutdown();
     lane.shutdown();
     awaitAll(graceEnd);
     worker.close();
-    if (executor != null) {
-      executor.shutdownNow();
+    if (current != null) {
+      current.shutdownNow();
     }
     orderedLane.interrupt();
     lane.interrupt();
     long joinEnd = System.nanoTime() + properties.getShutdownJoin().toNanos();
     awaitAll(joinEnd);
-    List<String> alive = new ArrayList<>();
-    if (executor != null && !executor.isTerminated()) {
-      alive.add("opentmf-outbox-relay");
-    }
+    List<String> alive = new ArrayList<>(relayThreadAlive());
     alive.addAll(orderedLane.alive());
     alive.addAll(lane.alive());
     alive.addAll(heartbeat.stopUntil(joinEnd)); // last: the drained sends kept their leases
@@ -207,10 +257,36 @@ class OutboxRelay implements SmartLifecycle {
     }
   }
 
+  /**
+   * The bean's destruction: the stop, if the context never ran its lifecycle stop - and the end; a
+   * start from now on is refused.
+   */
+  @PreDestroy
+  synchronized void destroy() {
+    stop();
+    state = State.DESTROYED;
+  }
+
+  /** The threads of the relay still running: the relay thread, both lanes', the heartbeat's. */
+  private List<String> alive() {
+    List<String> alive = new ArrayList<>(relayThreadAlive());
+    alive.addAll(orderedLane.alive());
+    alive.addAll(lane.alive());
+    alive.addAll(heartbeat.alive());
+    return alive;
+  }
+
+  /** The relay thread, while it still runs. */
+  private List<String> relayThreadAlive() {
+    ScheduledExecutorService current = executor.get();
+    return current == null || current.isTerminated() ? List.of() : List.of(RELAY_THREAD);
+  }
+
   /** Waits for the relay thread and both lanes until the deadline. */
   private void awaitAll(long deadline) {
-    if (executor != null) {
-      OutboxStops.awaitUntil(executor, deadline);
+    ScheduledExecutorService current = executor.get();
+    if (current != null) {
+      OutboxStops.awaitUntil(current, deadline);
     }
     orderedLane.awaitUntil(deadline);
     lane.awaitUntil(deadline);
