@@ -178,7 +178,7 @@ class OutboxRelayRestartIT {
     OutboxMaintenanceService maintenance = context.getBean(OutboxMaintenanceService.class);
     String key =
         OutboxHeaders.idempotencyKey(
-            context.getEnvironment().getProperty("spring.application.name"), row.getId());
+            context.getEnvironment().getProperty("spring.application.name"), row);
     await(when)
         .atMost(Duration.ofSeconds(15))
         .untilAsserted(

@@ -317,6 +317,16 @@ public final class Receiver {
     }
   }
 
+  /**
+   * The row id an {@code x-idempotency-key} names: the number after {@code :outbox:} - {@code
+   * <service>:outbox:<id>:<key_token>} since 1.11.1, {@code <service>:outbox:<id>} before.
+   */
+  static long rowIdOf(String key) {
+    String afterPrefix = key.substring(key.indexOf(":outbox:") + ":outbox:".length());
+    int end = afterPrefix.indexOf(':');
+    return Long.parseLong(end < 0 ? afterPrefix : afterPrefix.substring(0, end));
+  }
+
   /** The stamp the row's first send carried, if a scripted publisher sent it. */
   static OffsetDateTime firstStamp(long rowId) {
     return FIRST_STAMP.get(rowId);

@@ -88,7 +88,7 @@ final class HttpReceiver implements AutoCloseable {
     Answer answer = answers.getOrDefault(path, i -> Answer.ok()).apply(n);
     String key = exchange.getRequestHeaders().getFirst(OutboxHeaders.IDEMPOTENCY_KEY);
     if (key != null) {
-      Receiver.started(Long.parseLong(key.substring(key.lastIndexOf(':') + 1)));
+      Receiver.started(Receiver.rowIdOf(key));
     }
     boolean interrupted = false;
     try {
@@ -115,7 +115,7 @@ final class HttpReceiver implements AutoCloseable {
     } finally {
       exchange.close();
       if (key != null) {
-        long rowId = Long.parseLong(key.substring(key.lastIndexOf(':') + 1));
+        long rowId = Receiver.rowIdOf(key);
         // a 2xx status line is the receiver's acceptance, whether or not it ever sends the body
         boolean ok = answer.status() >= 200 && answer.status() < 300;
         Receiver.recordDelivery(

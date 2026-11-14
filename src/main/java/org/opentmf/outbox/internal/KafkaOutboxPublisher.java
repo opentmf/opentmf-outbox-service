@@ -208,7 +208,7 @@ class KafkaOutboxPublisher implements OutboxPublisher {
     setHeader(
         producerRecord,
         OutboxHeaders.IDEMPOTENCY_KEY,
-        OutboxHeaders.idempotencyKey(serviceName, event.getId()));
+        OutboxHeaders.idempotencyKey(serviceName, event));
     setHeader(producerRecord, OutboxHeaders.EVENT_TYPE, event.getEventType());
     setHeader(producerRecord, OutboxHeaders.PRODUCER, serviceName);
     return producerRecord;

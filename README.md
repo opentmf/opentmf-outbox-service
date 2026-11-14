@@ -340,10 +340,15 @@ sequenceDiagram
   and `delivery.timeout.ms` together to shorten both.
 - **At-least-once, consumer-dedupable.** A crash between delivery and booking
   means redelivery once the row's lease lapses (seconds on the ORDERED lane,
-  up to the lease on the CONCURRENT lane); `x-idempotency-key = <spring.application.name>:outbox:<id>`
-  makes consumer dedup trivial. **The key format is a cross-service contract**
-  (downstream dedup tables key on it) — it never changes shape; the constants
-  and the formatter are public in `OutboxHeaders`. Set
+  up to the lease on the CONCURRENT lane); `x-idempotency-key =
+  <spring.application.name>:outbox:<id>:<key_token>` makes consumer dedup
+  trivial. The key token is a random value minted per row at booking (1.11.1),
+  so an `id` that repeats - a recreated table, a restore to a point in time -
+  never repeats a key; a row booked before 1.11.1 has none and keeps
+  `<spring.application.name>:outbox:<id>`. **The key is a cross-service
+  contract** (downstream dedup tables key on it): store and compare it as an
+  opaque string, never parse it; the constants and the formatter
+  (`OutboxHeaders.idempotencyKey(serviceName, event)`) are public. Set
   `spring.application.name`: without it the prefix (and `x-producer`) is the
   literal `unknown`.
 - **Backoff, then park — or drop — by the publisher's policy.** A failed row
@@ -772,8 +777,10 @@ and `003-outbox-policy-reference-onboarding` (1.2.0: `parked_on`, `reference`,
 the onboarding adds below, the index recreated to the 1.2.0 predicate),
 `004-outbox-claim-lease` (1.3.0: `claimed_until`, `lane`, `ordering_key` and the
 lanes' claim indexes), `005-outbox-gauge-and-prune-indexes` (1.3.0) and
-`006-outbox-lane-gauge-indexes` (1.4.0: the per-lane gauge indexes). 004–006
-build their indexes `CONCURRENTLY`.
+`006-outbox-lane-gauge-indexes` (1.4.0: the per-lane gauge indexes),
+`007-outbox-sending-since` and `008-outbox-claim-plan-fences` (1.9.0) and
+`009-outbox-key-token` (1.11.1: `key_token`, part of the idempotency key).
+004–006 and 008 build their indexes `CONCURRENTLY`.
 
 **Upgrading** needs no consumer change at any step: the included changelog
 applies the missing changesets on the next start (nullable columns only, no
@@ -863,7 +870,7 @@ outcome — three default methods, so an existing publisher is unaffected:
 OutboxPublisher hubSender(RestClient hub) {
   return new OutboxPublisher() {
     public boolean supports(OutboxEvent e) { return e.getDestination().contains("/hub/"); }
-    public void publish(OutboxEvent e) { /* POST, attaching OutboxHeaders.idempotencyKey(...) */ }
+    public void publish(OutboxEvent e) { /* POST, attaching OutboxHeaders.idempotencyKey(app, e) */ }
     public int maxAttempts(OutboxEvent e) { return 3; }                     // 0 = library max-attempts
     public Duration backoff(OutboxEvent e, int attempt) { return Duration.ofMinutes(1); } // null = library backoff
     public ExhaustionOutcome onExhausted(OutboxEvent e) { return ExhaustionOutcome.DROP; }  // default PARK
@@ -1386,6 +1393,40 @@ The library is self-contained for consumer testing — no test-jar needed:
   lease, lane, backlog and onboarding ITs — the contracts above are pinned there, so a consumer gap
   is a red library build, not a discovery after the cut.
 
+### Upgrading to 1.11.1
+
+1. **The idempotency key names the row** (OUTBOX-IDEMPOTENCY-KEY-REPEATS-AFTER-RESTORE-1).
+   Up to 1.11.0 the key was `<service>:outbox:<id>`, and an `id` repeats once
+   the table is recreated or the database is restored to a point in time: a
+   consumer that already held the key dropped the NEW event as a duplicate,
+   without a word. A row booked from 1.11.1 on carries a random key token, and
+   its key is `<service>:outbox:<id>:<key_token>` (about 37 characters
+   longer: `dnms-email-adapter:outbox:123:<36-character uuid>` is 66 characters;
+   at most the service name + 64, for a 19-digit id). A row booked before keeps
+   its 1.11.0 key, so a retry across the upgrade is still recognised; a row
+   pending at the restore point and sent again keeps its key too.
+2. **The schema: changeset `009-outbox-key-token`**, ONE statement,
+   `alter table outbox add column if not exists key_token uuid;` - nullable,
+   no default, no table rewrite (6 ms on a million rows).
+   - **Changelog included by reference** (the documented way, above):
+     **nothing to do** - Liquibase applies 009 at the first start of 1.11.1,
+     before anything reads the table.
+   - **Changelog run out of band** (a migration job, `spring.liquibase.enabled=false`):
+     **apply that one statement before 1.11.1 starts.** A 1.11.1 pod that starts
+     on the 1.11.0 schema refuses to start, with one error naming changeset 009
+     and the statement - the column is mapped, so every read and every booking
+     would fail otherwise.
+3. **A rolling start costs at most one duplicate per row, and only for rows a
+   1.11.1 pod booked and both versions sent** (a retry or a lapsed lease that
+   crosses versions): a 1.11.0 pod sends such a row under `<service>:outbox:<id>`,
+   a 1.11.1 pod under the token key. A row a 1.11.0 pod booked has no token and
+   both versions key it alike. Roll at a low backlog.
+4. **A publisher of your own** that calls `OutboxHeaders.idempotencyKey(serviceName,
+   id)` still sends the 1.11.0 key and stays exposed to the repeat: switch to
+   `OutboxHeaders.idempotencyKey(serviceName, event)` (the old method is
+   deprecated, unchanged). A consumer that PARSES the key - the last segment
+   as the id, say - must stop: the key is opaque.
+
 ### Upgrading to 1.9.0
 
 1. Changeset `007-outbox-sending-since` adds one nullable column (no index, no
@@ -1482,16 +1523,17 @@ Kafka-only consumers change nothing but the version.
 1. Include the library changelog **after** your own `outbox` changesets (see
    "Adopting with an existing `outbox` table" above): the library onboards the
    table in place; only your own constraints/defaults and extra columns need a
-   cut-over changeset of yours. Prefer that over a schema rebuild —
-   **sharp edge — the id sequence IS the idempotency key.** A schema rebuild
-   restarts the identity at 1, so new rows REUSE old
-   `<service>:outbox:<id>` keys — and every idempotency-disciplined consumer will
-   silently drop your new events as replays (no error, no lag, no reaction). After any table
-   rebuild in an environment with live consumers, restart the identity above
-   the used range:
+   cut-over changeset of yours. Prefer that over a schema rebuild. A rebuild
+   restarts the identity at 1; since 1.11.1 the rows the library books carry a
+   key token, so their keys never repeat, but rows a hand-written writer booked
+   had `<service>:outbox:<id>` keys, and a consumer that still remembers them
+   would drop a new row whose key matched one. After a table rebuild in an
+   environment with live consumers, restart the identity above the used range
+   all the same:
    `alter table outbox alter column id restart with <safely-high-value>;`
 2. Replace your writer/relay/park classes with `OutboxWriter` + configuration.
-   The idempotency-key format is `<spring.application.name>:outbox:<id>`.
+   The idempotency-key format is `<spring.application.name>:outbox:<id>:<key_token>`
+   (`OutboxHeaders.idempotencyKey(serviceName, event)`).
 3. Move dashboards and alerts to the library-stable metric names above.
 4. Point ops runbooks at the `/ops` surface; direct DB reads are a
    missing-module smell.

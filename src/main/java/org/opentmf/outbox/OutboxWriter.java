@@ -2,6 +2,7 @@ package org.opentmf.outbox;
 
 import java.time.OffsetDateTime;
 import java.util.Map;
+import java.util.UUID;
 import java.util.function.Supplier;
 import org.opentmf.outbox.internal.OutboxAppended;
 import org.opentmf.outbox.internal.OutboxClock;
@@ -145,6 +146,7 @@ public class OutboxWriter {
     event.setNextAttemptOn(now);
     event.setReleaseAt(request.releaseAt());
     event.setReference(request.reference());
+    event.setKeyToken(UUID.randomUUID()); // the row's own part of its idempotency key (1.11.1)
     OutboxLaneStamper stamper = laneStamper.get();
     if (stamper != null) {
       stamper.stamp(event);

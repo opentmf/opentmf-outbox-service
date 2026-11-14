@@ -170,7 +170,7 @@ class Profile681HubIT {
                     stored.forEach(headers::set); // wire headers: forwarded, as the contract says
                     headers.set(
                         OutboxHeaders.IDEMPOTENCY_KEY,
-                        OutboxHeaders.idempotencyKey("dnms-681", event.getId()));
+                        OutboxHeaders.idempotencyKey("dnms-681", event));
                     headers.set(OutboxHeaders.EVENT_TYPE, event.getEventType());
                   })
               .body(event.getPayload())
@@ -272,7 +272,8 @@ class Profile681HubIT {
     Map<String, String> wire = HUB_SEEN.get(0);
     assertThat(wire)
         .containsEntry("x-schema-version", "3")
-        .containsEntry(OutboxHeaders.IDEMPOTENCY_KEY, "dnms-681:outbox:" + delivered.getId());
+        .containsEntry(
+            OutboxHeaders.IDEMPOTENCY_KEY, OutboxHeaders.idempotencyKey("dnms-681", delivered));
     assertThat(wire.toString()).doesNotContain("subscription-secret");
     assertThat(maintenance.inspect(delivered.getId()).reference())
         .isEqualTo("subscription-secret-2");

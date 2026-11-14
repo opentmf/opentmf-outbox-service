@@ -4,6 +4,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.observation.ObservationRegistry;
 import java.time.Clock;
 import java.util.List;
+import javax.sql.DataSource;
 import org.opentmf.outbox.OutboxClientProfileResolver;
 import org.opentmf.outbox.OutboxEvent;
 import org.opentmf.outbox.OutboxMaintenanceService;
@@ -19,6 +20,8 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.jpa.autoconfigure.EntityManagerFactoryDependsOnPostProcessor;
+import org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitialization;
 import org.springframework.boot.thread.Threading;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
@@ -55,6 +58,27 @@ import tools.jackson.databind.ObjectMapper;
 @AutoConfigurationPackage(basePackageClasses = OutboxEvent.class)
 @EnableConfigurationProperties(OutboxProperties.class)
 public class OutboxAutoConfiguration {
+
+  /** The bean name of the start-time schema check, which the EntityManagerFactory waits for. */
+  static final String SCHEMA_CHECK = "outboxSchemaCheck";
+
+  /**
+   * Refuses the start when the library's newest changeset has not been applied (1.11.1): after
+   * the database initialisation (Liquibase applies the included changelog first), before the
+   * EntityManagerFactory - see {@link OutboxSchemaCheck}. No single DataSource: nothing to check.
+   */
+  @Bean(SCHEMA_CHECK)
+  @DependsOnDatabaseInitialization
+  OutboxSchemaCheck outboxSchemaCheck(ObjectProvider<DataSource> dataSource) {
+    DataSource unique = dataSource.getIfUnique();
+    return unique == null ? null : OutboxSchemaCheck.check(unique);
+  }
+
+  /** The EntityManagerFactory starts after the schema check, so its error is the one shown. */
+  @Bean
+  static EntityManagerFactoryDependsOnPostProcessor outboxSchemaCheckBeforeJpa() {
+    return new EntityManagerFactoryDependsOnPostProcessor(SCHEMA_CHECK);
+  }
 
   @Bean
   public OutboxWriter outboxWriter(

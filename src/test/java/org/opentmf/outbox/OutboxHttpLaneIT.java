@@ -286,11 +286,11 @@ class OutboxHttpLaneIT {
             .filter(
                 arrival ->
                     List.of(first.getId(), second.getId(), other.getId()).stream()
-                        .anyMatch(id -> arrival.endsWith(":outbox:" + id)))
+                        .anyMatch(id -> arrival.contains(":outbox:" + id + ":")))
             .toList();
-    String firstKeyed = "keyed:outbox-lane-it:outbox:" + first.getId();
-    String secondKeyed = "keyed:outbox-lane-it:outbox:" + second.getId();
-    String fast = "fast:outbox-lane-it:outbox:" + other.getId();
+    String firstKeyed = "keyed:" + OutboxHeaders.idempotencyKey("outbox-lane-it", first);
+    String secondKeyed = "keyed:" + OutboxHeaders.idempotencyKey("outbox-lane-it", second);
+    String fast = "fast:" + OutboxHeaders.idempotencyKey("outbox-lane-it", other);
     assertThat(mine).containsExactlyInAnyOrder(firstKeyed, secondKeyed, fast);
     // one receiver: id order; the other receiver overtakes the second of them (whether it also
     // beats the first depends on whether both went out in one claim - no cross-key order)

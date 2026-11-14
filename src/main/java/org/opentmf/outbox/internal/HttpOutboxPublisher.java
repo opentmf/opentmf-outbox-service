@@ -111,7 +111,7 @@ class HttpOutboxPublisher implements OutboxPublisher {
               stored.forEach(headers::set);
               headers.set(
                   OutboxHeaders.IDEMPOTENCY_KEY,
-                  OutboxHeaders.idempotencyKey(serviceName, event.getId()));
+                  OutboxHeaders.idempotencyKey(serviceName, event));
               headers.set(OutboxHeaders.EVENT_TYPE, event.getEventType());
               headers.set(OutboxHeaders.PRODUCER, serviceName);
             })
