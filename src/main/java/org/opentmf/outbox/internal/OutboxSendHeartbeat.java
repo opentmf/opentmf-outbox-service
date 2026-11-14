@@ -14,6 +14,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import lombok.extern.slf4j.Slf4j;
 import org.opentmf.outbox.internal.OutboxRelayWorker.Leased;
 import org.springframework.transaction.support.TransactionOperations;
@@ -45,13 +46,15 @@ class OutboxSendHeartbeat {
   /** How often the sends in flight are looked at - a fraction of the shortest sensible lease. */
   static final Duration TICK = Duration.ofMillis(200);
 
+  private static final String HEARTBEAT_THREAD = "opentmf-outbox-heartbeat";
+
   private final OutboxEventRepository repository;
   private final TransactionOperations tx;
   private final OutboxClock clock;
   private final Duration sendTimeout;
   private final Set<Leased> sending = ConcurrentHashMap.newKeySet();
   private final List<Runnable> onBeat = new CopyOnWriteArrayList<>();
-  private ScheduledExecutorService executor;
+  private final AtomicReference<ScheduledExecutorService> executor = new AtomicReference<>();
 
   OutboxSendHeartbeat(
       OutboxEventRepository repository,
@@ -64,23 +67,25 @@ class OutboxSendHeartbeat {
     this.sendTimeout = sendTimeout;
   }
 
-  /** Starts the heartbeat thread. */
+  /** Starts the heartbeat thread - again after a stop, on a new one (a restarted relay). */
   void start() {
-    executor =
+    ScheduledExecutorService started =
         Executors.newSingleThreadScheduledExecutor(
             runnable -> {
-              Thread thread = new Thread(runnable, "opentmf-outbox-heartbeat");
+              Thread thread = new Thread(runnable, HEARTBEAT_THREAD);
               thread.setDaemon(true);
               return thread;
             });
-    executor.scheduleWithFixedDelay(
+    started.scheduleWithFixedDelay(
         this::beat, TICK.toMillis(), TICK.toMillis(), TimeUnit.MILLISECONDS);
+    executor.set(started);
   }
 
   /** Stops it at once (a test's teardown); a stopping relay uses {@link #stopUntil}. */
   void stop() {
-    if (executor != null) {
-      executor.shutdownNow();
+    ScheduledExecutorService current = executor.get();
+    if (current != null) {
+      current.shutdownNow();
     }
   }
 
@@ -91,14 +96,21 @@ class OutboxSendHeartbeat {
    * application's pool closed); its thread, while it still runs.
    */
   List<String> stopUntil(long deadline) {
-    if (executor == null) {
+    ScheduledExecutorService current = executor.get();
+    if (current == null) {
       return List.of();
     }
-    executor.shutdown(); // no tick from now on; the one in flight ends
-    if (!OutboxStops.awaitUntil(executor, deadline)) {
-      executor.shutdownNow();
+    current.shutdown(); // no tick from now on; the one in flight ends
+    if (!OutboxStops.awaitUntil(current, deadline)) {
+      current.shutdownNow();
     }
-    return executor.isTerminated() ? List.of() : List.of("opentmf-outbox-heartbeat");
+    return alive();
+  }
+
+  /** Its thread, while it still runs (none before its first start). */
+  List<String> alive() {
+    ScheduledExecutorService current = executor.get();
+    return current == null || current.isTerminated() ? List.of() : List.of(HEARTBEAT_THREAD);
   }
 
   /**

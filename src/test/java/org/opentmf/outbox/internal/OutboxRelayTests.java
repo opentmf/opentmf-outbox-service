@@ -4,7 +4,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -15,8 +19,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.opentmf.outbox.OutboxProperties;
 import org.opentmf.outbox.internal.OutboxRelayWorker.Batch;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.context.SmartLifecycle;
 
 /**
@@ -424,7 +431,8 @@ class OutboxRelayTests {
     long started = System.nanoTime();
     relay.stop();
     Duration took = Duration.ofNanos(System.nanoTime() - started);
-    relay.stop(); // the @PreDestroy safety net after the lifecycle stop: nothing more
+    relay.stop(); // a stop of a stopped relay: nothing more
+    relay.destroy(); // the @PreDestroy safety net after the lifecycle stop: nothing more
 
     verify(worker).close(); // from the grace's end nothing is booked
     assertThat(relay.isRunning()).isFalse();
@@ -437,5 +445,136 @@ class OutboxRelayTests {
         .as("the relay thread ended")
         .isEmpty();
     assertThat(took).isLessThan(Duration.ofMillis(200 + 2000 + 500)); // within grace + join
+  }
+
+  private static long relayThreads() {
+    return Thread.getAllStackTraces().keySet().stream()
+        .filter(Thread::isAlive)
+        .filter(thread -> thread.getName().equals("opentmf-outbox-relay"))
+        .count();
+  }
+
+  /**
+   * OUTBOX-RELAY-RESTARTS-AFTER-A-STOP-1: a start after a stop runs the relay again - the worker
+   * and both lanes open, new threads, the nudge and the sweep pass again (the context's stop and
+   * start; Spring's test-context cache pausing and restarting a cached context).
+   */
+  @Test
+  void aStoppedRelay_startedAgain_relaysAgain_onNewThreads() throws Exception {
+    OutboxRelayWorker worker = mock(OutboxRelayWorker.class);
+    when(worker.relayBatch(anyBoolean())).thenReturn(EMPTY);
+    OutboxProperties properties = new OutboxProperties();
+    properties.setSweepInterval(Duration.ofHours(1)); // every pass here is a nudge
+    OutboxConcurrentLane lane = lane();
+    OutboxOrderedLane orderedLane = orderedLane();
+    OutboxRelay relay =
+        new OutboxRelay(
+            worker,
+            properties,
+            lane,
+            orderedLane,
+            OutboxSendHeartbeatFixture.idle(),
+            OutboxClock.system());
+    relay.start();
+    relay.stop();
+    assertThat(relay.isRunning()).isFalse();
+    assertThat(lane.submit(() -> {})).isFalse(); // stopped: the lanes take nothing
+    await().atMost(Duration.ofSeconds(5)).until(() -> relayThreads() == 0);
+    clearInvocations(worker);
+
+    relay.start();
+    try {
+      assertThat(relay.isRunning()).isTrue();
+      verify(worker).open();
+      relay.poke();
+      verify(worker, timeout(5000)).relayBatch(true); // the new run's first pass: ORDERED too
+      CountDownLatch sent = new CountDownLatch(1);
+      CountDownLatch batch = new CountDownLatch(1);
+      assertThat(lane.submit(sent::countDown)).isTrue();
+      assertThat(orderedLane.submit(batch::countDown)).isTrue();
+      assertThat(sent.await(5, TimeUnit.SECONDS)).as("the lane sends again").isTrue();
+      assertThat(batch.await(5, TimeUnit.SECONDS)).as("the ordered lane sends again").isTrue();
+      assertThat(relayThreads()).isEqualTo(1);
+    } finally {
+      relay.stop();
+    }
+  }
+
+  /**
+   * A stop that left a thread running (a call that ignored its interrupt) is followed by no new
+   * run while it runs: the start is refused with an ERROR naming it - so no send of the old run
+   * returns into the new one - and a later start, once it has ended, runs.
+   */
+  @Test
+  @ExtendWith(OutputCaptureExtension.class)
+  void aStartWhileAThreadOfThePreviousRunStillRuns_isRefused_withAnError(CapturedOutput output)
+      throws Exception {
+    OutboxRelayWorker worker = mock(OutboxRelayWorker.class);
+    when(worker.relayBatch(anyBoolean())).thenReturn(EMPTY);
+    OutboxProperties properties = new OutboxProperties();
+    properties.setShutdownGrace(Duration.ofMillis(100));
+    properties.setShutdownJoin(Duration.ofMillis(100));
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(1, 10, false, Duration.ofMillis(100));
+    OutboxRelay relay =
+        new OutboxRelay(
+            worker,
+            properties,
+            lane,
+            orderedLane(),
+            OutboxSendHeartbeatFixture.idle(),
+            OutboxClock.system());
+    relay.start();
+    CountDownLatch sending = new CountDownLatch(1);
+    lane.submit(
+        () -> {
+          sending.countDown();
+          UninterruptibleHold.hold(Duration.ofSeconds(2)); // the stop's interrupt changes nothing
+        });
+    assertThat(sending.await(5, TimeUnit.SECONDS)).isTrue();
+    relay.stop();
+    assertThat(lane.alive()).isNotEmpty();
+
+    relay.start();
+
+    assertThat(relay.isRunning()).as("refused while the old send runs").isFalse();
+    verify(worker, never()).open();
+    assertThat(output)
+        .contains("Outbox relay NOT restarted")
+        .contains("opentmf-outbox-send-")
+        .contains("ERROR");
+    await().atMost(Duration.ofSeconds(10)).until(() -> lane.alive().isEmpty());
+    relay.start();
+    try {
+      assertThat(relay.isRunning()).as("the old send ended: the next start runs").isTrue();
+      verify(worker).open();
+    } finally {
+      relay.stop();
+    }
+  }
+
+  /** The bean's destruction is the end: a start after it is refused, with an ERROR. */
+  @Test
+  @ExtendWith(OutputCaptureExtension.class)
+  void aDestroyedRelay_isNeverStartedAgain(CapturedOutput output) {
+    OutboxRelayWorker worker = mock(OutboxRelayWorker.class);
+    OutboxConcurrentLane lane = lane();
+    OutboxRelay relay =
+        new OutboxRelay(
+            worker,
+            new OutboxProperties(),
+            lane,
+            orderedLane(),
+            OutboxSendHeartbeatFixture.idle(),
+            OutboxClock.system());
+    relay.start();
+    relay.destroy();
+
+    relay.start();
+
+    assertThat(relay.isRunning()).isFalse();
+    verify(worker, atLeastOnce()).close();
+    verify(worker, never()).open();
+    assertThat(lane.submit(() -> {})).isFalse();
+    assertThat(output).contains("Outbox relay NOT started - it was destroyed").contains("ERROR");
   }
 }

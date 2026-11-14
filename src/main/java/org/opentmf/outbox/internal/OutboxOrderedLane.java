@@ -23,20 +23,32 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 class OutboxOrderedLane {
 
-  private final ExecutorService executor;
+  private final AtomicReference<ExecutorService> executor;
   private final Duration shutdownGrace;
   private final AtomicBoolean busy = new AtomicBoolean();
   private final AtomicReference<Runnable> onIdle = new AtomicReference<>(() -> {});
 
   OutboxOrderedLane(Duration shutdownGrace) {
     this.shutdownGrace = shutdownGrace;
-    this.executor =
-        Executors.newSingleThreadExecutor(
-            runnable -> {
-              Thread thread = new Thread(runnable, "opentmf-outbox-ordered");
-              thread.setDaemon(true);
-              return thread;
-            });
+    this.executor = new AtomicReference<>(newExecutor());
+  }
+
+  private static ExecutorService newExecutor() {
+    return Executors.newSingleThreadExecutor(
+        runnable -> {
+          Thread thread = new Thread(runnable, "opentmf-outbox-ordered");
+          thread.setDaemon(true);
+          return thread;
+        });
+  }
+
+  /**
+   * Takes batches again, on a new thread - a restarted relay's, once the previous run's thread has
+   * ended. A batch the stop dropped before it ran left the lane marked busy; it is idle again.
+   */
+  void open() {
+    executor.set(newExecutor());
+    busy.set(false);
   }
 
   /** Called after each batch, once the lane is idle again: time for the next ORDERED claim. */
@@ -60,7 +72,7 @@ class OutboxOrderedLane {
       return false;
     }
     try {
-      executor.execute(() -> run(batch));
+      executor.get().execute(() -> run(batch));
       return true;
     } catch (RejectedExecutionException ex) {
       busy.set(false);
@@ -91,28 +103,28 @@ class OutboxOrderedLane {
    */
   void close() {
     shutdown();
-    OutboxStops.awaitUntil(executor, System.nanoTime() + shutdownGrace.toNanos());
+    OutboxStops.awaitUntil(executor.get(), System.nanoTime() + shutdownGrace.toNanos());
     interrupt();
-    OutboxStops.awaitUntil(executor, System.nanoTime() + shutdownGrace.toNanos());
+    OutboxStops.awaitUntil(executor.get(), System.nanoTime() + shutdownGrace.toNanos());
   }
 
   /** Takes no batch from now on; the one in flight runs on. */
   void shutdown() {
-    executor.shutdown();
+    executor.get().shutdown();
   }
 
   /** Waits until the batch in flight has ended or the deadline passed; whether it ended. */
   boolean awaitUntil(long deadline) {
-    return OutboxStops.awaitUntil(executor, deadline);
+    return OutboxStops.awaitUntil(executor.get(), deadline);
   }
 
   /** Interrupts the batch in flight. */
   void interrupt() {
-    executor.shutdownNow();
+    executor.get().shutdownNow();
   }
 
   /** The lane's thread while it still runs. */
   List<String> alive() {
-    return executor.isTerminated() ? List.of() : List.of("opentmf-outbox-ordered");
+    return executor.get().isTerminated() ? List.of() : List.of("opentmf-outbox-ordered");
   }
 }

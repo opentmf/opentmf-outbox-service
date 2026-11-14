@@ -754,6 +754,16 @@ class OutboxRelayWorker {
   }
 
   /**
+   * A restarted relay's new run, every thread of the previous one ended: sends and bookings go on.
+   * The rows the stop dropped from the hand-off queue are no longer held here - their leases lapse
+   * and a claim takes them again, in this pod or another.
+   */
+  void open() {
+    queuedHere.clear();
+    closed = false;
+  }
+
+  /**
    * Books one attempt in its own short transaction; {@code alsoInTx} rides the same transaction
    * and returns what to apply once it committed. A refused RELAYED booking (a hook or listener
    * threw - its writes roll back with the stamp) is booked as an ordinary failure instead; a

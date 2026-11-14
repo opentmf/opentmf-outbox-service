@@ -219,8 +219,11 @@ public class OutboxAutoConfiguration {
       OutboxConcurrentLane lane,
       OutboxOrderedLane orderedLane,
       OutboxSendHeartbeat heartbeat,
-      OutboxClock clock) {
-    return new OutboxRelay(worker, properties, lane, orderedLane, heartbeat, clock);
+      OutboxClock clock,
+      OutboxMetrics metrics) {
+    OutboxRelay relay = new OutboxRelay(worker, properties, lane, orderedLane, heartbeat, clock);
+    metrics.watchRelay(relay); // opentmf.outbox.relay.running
+    return relay;
   }
 
   @Bean
