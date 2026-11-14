@@ -2,6 +2,8 @@ package org.opentmf.outbox;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * Read-model of one outbox row for the ops surface (the no-direct-DB principle: what an
@@ -45,8 +47,19 @@ public record OutboxRowView(
   /** The longest kind served; a longer leading token is no type name of the relay's. */
   static final int KIND_MAX_LENGTH = 200;
 
-  /** The kind of a stored text that does not start with a type name - never a piece of it. */
+  /** The kind of a stored text not led by a throwable's name - never a piece of the text. */
   static final String UNCLASSIFIED = "unclassified";
+
+  /**
+   * Spring's HTTP-status exceptions whose simple names end neither in {@code Exception} nor in
+   * {@code Error} ({@code BadRequest}, {@code ServiceUnavailable}, ...): the relay stores a 4xx or
+   * 5xx under that name. Read from spring-web where it is on the classpath - by name, so the view
+   * does not need it - and empty where it is not: there the relay writes no such name.
+   */
+  private static final Set<String> SPRING_STATUS_EXCEPTIONS =
+      nestedThrowables(
+          "org.springframework.web.client.HttpClientErrorException",
+          "org.springframework.web.client.HttpServerErrorException");
 
   static OutboxRowView of(OutboxEvent event, boolean withPayload) {
     return of(event, withPayload, true, OffsetDateTime.now(ZoneOffset.UTC));
@@ -88,9 +101,13 @@ public record OutboxRowView(
   }
 
   /**
-   * The failure's kind: the stored text's leading Java type name, ended by {@code :} or the end, at
-   * most {@link #KIND_MAX_LENGTH} characters; {@link #UNCLASSIFIED} for any other text - a consumer
-   * may have stored one of its own - and null for none.
+   * The failure's kind: the stored text's leading throwable name, ended by {@code :} or the end, at
+   * most {@link #KIND_MAX_LENGTH} characters; {@link #UNCLASSIFIED} for any other text, and null
+   * for none. A type name's shape is not enough: a receiver's word, a person's name or a dotted
+   * name before a colon has it too. So the name's last segment must name a throwable as Java names
+   * them - ending in {@code Exception} or {@code Error} - or be one of Spring's HTTP-status
+   * exceptions (1.11.1). A consumer's own exception named otherwise shows as {@link #UNCLASSIFIED};
+   * its full text is on the payload path.
    */
   static String kindOf(String lastError) {
     if (lastError == null) {
@@ -98,7 +115,34 @@ public record OutboxRowView(
     }
     int colon = lastError.indexOf(':');
     String token = colon < 0 ? lastError : lastError.substring(0, colon);
-    return isTypeName(token) ? token : UNCLASSIFIED;
+    return isTypeName(token) && namesAThrowable(token) ? token : UNCLASSIFIED;
+  }
+
+  /** Whether a type name's last segment, after its last dot or dollar, is a throwable's. */
+  private static boolean namesAThrowable(String typeName) {
+    String simple =
+        typeName.substring(Math.max(typeName.lastIndexOf('.'), typeName.lastIndexOf('$')) + 1);
+    return simple.endsWith("Exception")
+        || simple.endsWith("Error")
+        || SPRING_STATUS_EXCEPTIONS.contains(simple);
+  }
+
+  /** The simple names of the throwables nested in these classes; none for a class not present. */
+  private static Set<String> nestedThrowables(String... classNames) {
+    Set<String> names = new HashSet<>();
+    for (String className : classNames) {
+      try {
+        Class<?> outer = Class.forName(className, false, OutboxRowView.class.getClassLoader());
+        for (Class<?> nested : outer.getDeclaredClasses()) {
+          if (Throwable.class.isAssignableFrom(nested)) {
+            names.add(nested.getSimpleName());
+          }
+        }
+      } catch (ClassNotFoundException absent) {
+        // not on this consumer's classpath: nor is the HTTP publisher that would store the name
+      }
+    }
+    return Set.copyOf(names);
   }
 
   /**

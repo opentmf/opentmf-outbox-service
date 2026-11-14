@@ -929,7 +929,8 @@ class OutboxRelayWorker {
     return declared != null ? declared : backoff.delayFor(attempts);
   }
 
-  private static String describe(RuntimeException ex) {
+  /** The stored text of a failure; its leading type name is the kind a view may show alone. */
+  static String describe(RuntimeException ex) {
     return ex.getMessage() == null
         ? ex.toString()
         : ex.getClass().getSimpleName() + ": " + ex.getMessage();

@@ -666,7 +666,8 @@ components:
           description: >-
             The last failure's message; with `opentmf.outbox.ops.sensitive-in-views=false`
             (1.11.1) its kind only - the exception's type name, `unclassified` for a text not led
-            by one - and the full text is on `GET /ops/outbox/{id}/payload`.
+            by a name ending in `Exception` or `Error` or one of Spring's HTTP-status exceptions -
+            and the full text is on `GET /ops/outbox/{id}/payload`.
         payload:
           type: [string, 'null']
           description: >-

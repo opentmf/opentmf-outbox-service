@@ -1,8 +1,11 @@
 package org.opentmf.outbox;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.SoftAssertions.assertSoftly;
 
 import java.time.OffsetDateTime;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -110,9 +113,40 @@ class OutboxRowViewTests {
     assertThat(OutboxRowView.kindOf("905551112233: refused")).isEqualTo("unclassified");
     assertThat(OutboxRowView.kindOf("a..b: two dots")).isEqualTo("unclassified");
     assertThat(OutboxRowView.kindOf("")).isEqualTo("unclassified");
-    assertThat(OutboxRowView.kindOf("A".repeat(201) + ": too long a name"))
-        .isEqualTo("unclassified");
-    assertThat(OutboxRowView.kindOf("A".repeat(200) + ": the longest name"))
-        .isEqualTo("A".repeat(200));
+    String longest = "A".repeat(200 - "Exception".length()) + "Exception";
+    assertThat(OutboxRowView.kindOf("A" + longest + ": too long a name")).isEqualTo("unclassified");
+    assertThat(OutboxRowView.kindOf(longest + ": the longest name")).isEqualTo(longest);
+  }
+
+  @Test
+  void theKind_ofAWordThatNamesNoThrowable_isUnclassified() {
+    String unclassified = OutboxRowView.UNCLASSIFIED;
+    Map<String, String> kinds = new LinkedHashMap<>();
+    // a type name's shape is not enough: a receiver's word, a name or a dotted name before a colon
+    // has it, and the kind is shown to a role that may not read the error (1.11.1)
+    kinds.put("boom", unclassified);
+    kinds.put("boom: x", unclassified);
+    kinds.put("Mueller: not found", unclassified);
+    kinds.put("John.Smith: not found", unclassified);
+    kinds.put("a.b", unclassified);
+    // a consumer's own exception not named ...Exception or ...Error: its text on the payload path
+    kinds.put("Timeout: the consumer's own class", unclassified);
+    kinds.put("Müller: not found", unclassified);
+    kinds.put("4915112345678: rejected", unclassified);
+    kinds.put("no colon at all", unclassified);
+    // a throwable's name stays; "Error" alone carries no value
+    kinds.put("Error: Müller unknown", "Error");
+    kinds.put("TimeoutException: t", "TimeoutException");
+    kinds.put("java.util.concurrent.TimeoutException: t", "java.util.concurrent.TimeoutException");
+    kinds.put(
+        "org.springframework.web.client.HttpClientErrorException$BadRequest: 400 x",
+        "org.springframework.web.client.HttpClientErrorException$BadRequest");
+    kinds.put("BadRequest: 400 Bad Request: \"{}\"", "BadRequest");
+
+    assertSoftly(
+        softly ->
+            kinds.forEach(
+                (text, kind) ->
+                    softly.assertThat(OutboxRowView.kindOf(text)).as(text).isEqualTo(kind)));
   }
 }

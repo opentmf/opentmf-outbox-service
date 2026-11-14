@@ -10,8 +10,8 @@
   receiver's whole response body. With the new `opentmf.outbox.ops.sensitive-in-views=false` the
   row views - inspect and the three lists - no longer carry them: `payload` is null and
   `lastError` holds the failure's kind only (the exception's type name, `unclassified` for any
-  other text), so a consumer's path rules can give the payload path a stricter role than the
-  views. The default, `true`, leaves every response exactly as it was; `OutboxRowView` keeps its
+  other text - also for a consumer's own exception named neither `...Exception` nor `...Error`),
+  so a consumer's path rules can give the payload path a stricter role than the views. The default, `true`, leaves every response exactly as it was; `OutboxRowView` keeps its
   shape. The ops OAS fragment gains the operation (`getOutboxRowPayload`, schema
   `OutboxRowPayload`): re-paste it.
 
