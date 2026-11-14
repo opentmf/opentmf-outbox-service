@@ -1,10 +1,10 @@
 package org.opentmf.outbox.internal;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import lombok.extern.slf4j.Slf4j;
@@ -84,18 +84,35 @@ class OutboxOrderedLane {
   }
 
   /**
-   * Stops taking batches and gives the batch in flight the shutdown grace to finish and book; the
-   * rows it has not sent by then are redelivered once their leases lapse.
+   * Stops taking batches and gives the batch in flight the shutdown grace to finish and book, then
+   * interrupts it and waits once more, as long again; the rows it has not sent by then are
+   * redelivered once their leases lapse. The relay stops the lane in its steps instead ({@link
+   * #shutdown}, {@link #awaitUntil}, {@link #interrupt}), on its one deadline.
    */
   void close() {
+    shutdown();
+    OutboxStops.awaitUntil(executor, System.nanoTime() + shutdownGrace.toNanos());
+    interrupt();
+    OutboxStops.awaitUntil(executor, System.nanoTime() + shutdownGrace.toNanos());
+  }
+
+  /** Takes no batch from now on; the one in flight runs on. */
+  void shutdown() {
     executor.shutdown();
-    try {
-      if (!executor.awaitTermination(shutdownGrace.toMillis(), TimeUnit.MILLISECONDS)) {
-        executor.shutdownNow();
-      }
-    } catch (InterruptedException ignored) {
-      Thread.currentThread().interrupt();
-      executor.shutdownNow();
-    }
+  }
+
+  /** Waits until the batch in flight has ended or the deadline passed; whether it ended. */
+  boolean awaitUntil(long deadline) {
+    return OutboxStops.awaitUntil(executor, deadline);
+  }
+
+  /** Interrupts the batch in flight. */
+  void interrupt() {
+    executor.shutdownNow();
+  }
+
+  /** The lane's thread while it still runs. */
+  List<String> alive() {
+    return executor.isTerminated() ? List.of() : List.of("opentmf-outbox-ordered");
   }
 }

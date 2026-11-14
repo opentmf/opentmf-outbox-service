@@ -2,12 +2,15 @@ package org.opentmf.outbox.internal;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -73,6 +76,11 @@ class OutboxConcurrentLane {
   private final Map<Thread, Long> sendStarted = new ConcurrentHashMap<>();
   private volatile boolean closed;
 
+  /** The lane's worker threads while they run - joined and interrupted by a stopping relay. */
+  private final Set<Thread> workers = new HashSet<>();
+
+  private final Duration shutdownGrace;
+
   OutboxConcurrentLane(int maxInFlight, int capacity, boolean virtual, Duration shutdownGrace) {
     this.permits = new Semaphore(maxInFlight);
     this.maxInFlight = maxInFlight;
@@ -81,7 +89,7 @@ class OutboxConcurrentLane {
     this.executor = new SimpleAsyncTaskExecutor("opentmf-outbox-send-");
     executor.setDaemon(true);
     executor.setVirtualThreads(virtual);
-    executor.setTaskTerminationTimeout(shutdownGrace.toMillis());
+    this.shutdownGrace = shutdownGrace;
   }
 
   /** Whether the sends run on virtual threads. */
@@ -207,6 +215,9 @@ class OutboxConcurrentLane {
    */
   @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void work() {
+    synchronized (workers) {
+      workers.add(Thread.currentThread());
+    }
     try {
       for (Queued next = poll(); next != null; next = poll()) {
         Runnable send = next.send();
@@ -225,6 +236,10 @@ class OutboxConcurrentLane {
       permits.release();
       startWorkers();
       onRoom.get().run();
+      synchronized (workers) {
+        workers.remove(Thread.currentThread());
+        workers.notifyAll();
+      }
     }
   }
 
@@ -240,11 +255,21 @@ class OutboxConcurrentLane {
   }
 
   /**
-   * Stops taking sends and waits up to the shutdown grace for those in flight to finish and book;
-   * queued rows are dropped unsent, and they - like whatever is still running after the grace - are
-   * redelivered once their leases lapse.
+   * Stops taking sends and waits up to the shutdown grace for those in flight to finish and book,
+   * then interrupts them and waits as long again for them to end; queued rows are dropped unsent,
+   * and they - like whatever was still running after the grace - are redelivered once their leases
+   * lapse. The relay stops the lane in its steps instead ({@link #shutdown}, {@link #awaitUntil},
+   * {@link #interrupt}), on its one deadline.
    */
   void close() {
+    shutdown();
+    awaitUntil(System.nanoTime() + shutdownGrace.toNanos());
+    interrupt();
+    awaitUntil(System.nanoTime() + shutdownGrace.toNanos());
+  }
+
+  /** Takes no send from now on and drops the queued ones; the sends in flight run on. */
+  void shutdown() {
     closed = true;
     int dropped = 0;
     while (queue.poll() != null) {
@@ -254,6 +279,37 @@ class OutboxConcurrentLane {
     if (dropped > 0) {
       log.info("Outbox relay stopping - {} queued rows not sent; their leases lapse", dropped);
     }
-    executor.close();
+    executor.close(); // refuses new workers; it waits for nothing, the relay joins them
+  }
+
+  /** Waits until every worker has ended or the deadline passed; whether they all ended. */
+  boolean awaitUntil(long deadline) {
+    synchronized (workers) {
+      for (long left = OutboxStops.left(deadline);
+          !workers.isEmpty() && left > 0;
+          left = OutboxStops.left(deadline)) {
+        try {
+          TimeUnit.NANOSECONDS.timedWait(workers, left);
+        } catch (InterruptedException ex) {
+          Thread.currentThread().interrupt();
+          break;
+        }
+      }
+      return workers.isEmpty();
+    }
+  }
+
+  /** Interrupts the workers still running. */
+  void interrupt() {
+    synchronized (workers) {
+      workers.forEach(Thread::interrupt);
+    }
+  }
+
+  /** The workers still running, by name. */
+  List<String> alive() {
+    synchronized (workers) {
+      return workers.stream().map(Thread::getName).sorted().toList();
+    }
   }
 }

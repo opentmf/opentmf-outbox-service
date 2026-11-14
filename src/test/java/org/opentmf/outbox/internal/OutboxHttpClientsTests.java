@@ -34,6 +34,7 @@ import org.springframework.http.HttpStatusCode;
 import org.springframework.http.client.ClientHttpRequestFactory;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
+import org.springframework.http.client.JettyClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
 
 /**
@@ -55,22 +56,34 @@ class OutboxHttpClientsTests {
     assertThat(OutboxHttpClients.plain(CONNECT, READ, SLOTS)).isNotNull();
   }
 
+  /** A consumer with Jetty and no Apache: Jetty's, as RestClient picks, built by the library. */
+  @Test
+  void withJettyAndNoApache_JettyIsPicked() throws Exception {
+    try (ConsumerClassLoader withoutApache = new ConsumerClassLoader("org.apache.hc.")) {
+      assertThat(requestFactoryIn(withoutApache)).isInstanceOf(JettyClientHttpRequestFactory.class);
+    }
+  }
+
   /**
-   * A consumer without Apache HttpClient: the JDK's client, as RestClient picks - and nothing of
-   * Apache's is linked on the way (the nested holder).
+   * A consumer with neither Apache HttpClient nor Jetty: the JDK's client, as RestClient picks -
+   * and nothing of either is linked on the way (their classes are named on their branches only).
    */
   @Test
-  void withoutApache_theJdkClientIsPicked() throws Exception {
-    try (ConsumerClassLoader withoutApache = new ConsumerClassLoader("org.apache.hc.")) {
-      Method requestFactory =
-          withoutApache
-              .loadClass(OutboxHttpClients.class.getName())
-              .getDeclaredMethod("requestFactory", Duration.class, Duration.class, int.class);
-      requestFactory.setAccessible(true); // package-private, in the consumer's own loader
-      Object factory = requestFactory.invoke(null, CONNECT, READ, SLOTS);
-
-      assertThat(factory).isInstanceOf(JdkClientHttpRequestFactory.class);
+  void withoutApacheAndJetty_theJdkClientIsPicked() throws Exception {
+    try (ConsumerClassLoader neither =
+        new ConsumerClassLoader("org.apache.hc.", "org.eclipse.jetty.")) {
+      assertThat(requestFactoryIn(neither)).isInstanceOf(JdkClientHttpRequestFactory.class);
     }
+  }
+
+  /** The plain client's factory as a consumer with that classpath gets it. */
+  private static Object requestFactoryIn(ConsumerClassLoader consumer) throws Exception {
+    Method requestFactory =
+        consumer
+            .loadClass(OutboxHttpClients.class.getName())
+            .getDeclaredMethod("requestFactory", Duration.class, Duration.class, int.class);
+    requestFactory.setAccessible(true); // package-private, in the consumer's own loader
+    return requestFactory.invoke(null, CONNECT, READ, SLOTS);
   }
 
   // ------------------------------------------------------------ a connect that stalls
@@ -196,6 +209,19 @@ class OutboxHttpClientsTests {
         .build();
   }
 
+  /** A receiver whose {@code /hook} answers a 302 to {@code /elsewhere}, which answers 200. */
+  private String redirectingReceiver() throws IOException {
+    return receiver(
+        exchange -> {
+          if (exchange.getRequestURI().getPath().equals("/hook")) {
+            exchange.getResponseHeaders().add("Location", "/elsewhere");
+            exchange.sendResponseHeaders(302, -1);
+          } else {
+            exchange.sendResponseHeaders(200, -1);
+          }
+        });
+  }
+
   private int hitsOf(String path) {
     AtomicInteger count = hits.get(path);
     return count == null ? 0 : count.get();
@@ -204,22 +230,46 @@ class OutboxHttpClientsTests {
   /** Up to 1.11.0 Apache FOLLOWED a 3xx into a second request: the publisher saw its 2xx. */
   @Test
   void apache_neverFollowsARedirect() throws IOException {
-    String base =
-        receiver(
-            exchange -> {
-              if (exchange.getRequestURI().getPath().equals("/hook")) {
-                exchange.getResponseHeaders().add("Location", "/elsewhere");
-                exchange.sendResponseHeaders(302, -1);
-              } else {
-                exchange.sendResponseHeaders(200, -1);
-              }
-            });
+    String base = redirectingReceiver();
 
     HttpStatusCode status =
         apache(base).post().uri("/hook").body("{}").retrieve().toBodilessEntity().getStatusCode();
 
     assertThat(status.value()).as("the 3xx reaches the publisher's own refusal").isEqualTo(302);
     assertThat(hitsOf("/elsewhere")).as("its Location never requested").isZero();
+  }
+
+  private static RestClient jetty(String base) {
+    return RestClient.builder()
+        .baseUrl(base)
+        .requestFactory(OutboxJettyClient.requestFactory(CONNECT, READ, SLOTS))
+        .build();
+  }
+
+  /** Up to 1.11.0 Jetty FOLLOWED a 3xx into a second request, as Spring's factory leaves it. */
+  @Test
+  void jetty_neverFollowsARedirect() throws IOException {
+    String base = redirectingReceiver();
+
+    HttpStatusCode status =
+        jetty(base).post().uri("/hook").body("{}").retrieve().toBodilessEntity().getStatusCode();
+
+    assertThat(status.value()).as("the 3xx reaches the publisher's own refusal").isEqualTo(302);
+    assertThat(hitsOf("/elsewhere")).as("its Location never requested").isZero();
+  }
+
+  /** Jetty never retried a 503 or a 429 (a control: it did not before 1.11.1 either). */
+  @ParameterizedTest(name = "{0}")
+  @ValueSource(ints = {503, 429})
+  void jetty_neverRetries(int status) throws IOException {
+    String base = receiver(exchange -> exchange.sendResponseHeaders(status, -1));
+
+    Throwable failure =
+        catchThrowable(
+            () -> jetty(base).post().uri("/busy").body("{}").retrieve().toBodilessEntity());
+
+    assertThat(failure).isNotNull();
+    assertThat(hitsOf("/busy")).as("one POST per attempt").isEqualTo(1);
   }
 
   /** Up to 1.11.0 Apache re-sent a 503 (and a 429) once inside the call: one attempt, two POSTs. */

@@ -146,6 +146,14 @@
       <artifactId>httpclient5</artifactId>
       <optional>true</optional>
     </dependency>
+    <!-- Jetty's HTTP client - OPTIONAL, compiled against only, as Apache's above: with it on a
+         consumer's classpath (and no Apache) the library builds that client itself, so it
+         follows no redirect (Jetty's own default follows one). -->
+    <dependency>
+      <groupId>org.eclipse.jetty</groupId>
+      <artifactId>jetty-client</artifactId>
+      <optional>true</optional>
+    </dependency>
 
     <!-- ================================================================ -->
     <!-- The /ops trio: REST + the TMF630 toolkit list (the list endpoint  -->

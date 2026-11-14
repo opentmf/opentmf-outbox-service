@@ -17,6 +17,42 @@
 
 ### Fixed
 
+- **A stopping relay no longer uses the database while the application's pool closes**
+  (OUTBOX-SHUTDOWN-THREADS-BEFORE-DATASOURCE-1). Up to 1.11.0 the relay stopped in its
+  `@PreDestroy` without waiting for its threads: a send woken by the stop's interrupt (a Kafka send
+  blocked on a dead broker, say) was still running after the context had closed, and the send
+  heartbeat's renewal and the gauges' refresh went on and borrowed connections while the pool
+  closed. Now:
+  - the relay and the gauges' refresher are `SmartLifecycle`s in a phase after the web server's
+    stop and before Spring Kafka's producers', so they stop before any bean is destroyed;
+    `@PreDestroy` stays as the safety net and runs the same stop once;
+  - one deadline: `shutdown-grace` for the claims, the ORDERED batch and the sends in flight
+    together, then NOTHING more is booked (a send that returns later is redelivered once its lease
+    lapses), what still runs is interrupted, and the stop waits for every thread of the library to
+    end, up to the new **`opentmf.outbox.shutdown-join`** (default 5 s), with one warning naming a
+    thread still running;
+  - **the worst-case stop is now `shutdown-grace + shutdown-join` = 15 s with the defaults**, its
+    threads ended; up to 1.11.0 it was up to three graces in turn, 30 s with the defaults, and its
+    threads were not waited for. A consumer who sets nothing gets every other default unchanged;
+  - **a send that completes at the instant of shutdown can be delivered twice** (its booking is
+    not made; at-least-once, unchanged in kind).
+
+  **What a consumer can notice:** the relay and the refresher now START when the context starts
+  (its lifecycle start, after every singleton is created) instead of in their `@PostConstruct`. A
+  bean whose own `@PostConstruct` appends a row still has it relayed - the relay's first pass picks
+  it up once started - but nothing is relayed, and the gauges read NaN, until the context has
+  started. A bean that relied on the relay already running during its own initialisation (a
+  readiness check that waits for a row to be relayed inside `@PostConstruct`, say) must wait for
+  the context's start instead (an `ApplicationReadyEvent` listener). A context that is stopped and
+  started again does not restart the relay.
+- **The plain HTTP client follows no redirect on Jetty either** (OUTBOX-JETTY-FOLLOWS-NO-REDIRECT-1).
+  Jetty's client follows a 3xx by default and Spring's factory left it so: for a consumer with
+  Jetty (and no Apache HttpClient) on its classpath a redirect was followed into a second request,
+  whose 2xx booked the row RELAYED although the receiver never processed the first - the 1.9.0
+  promise "a 3xx is never followed" held only for the JDK's and Reactor's clients. The library now
+  builds the Jetty client itself (`jetty-client` is an optional dependency of the library; a
+  consumer brings it, as before): redirects off, its timeouts as before, `concurrent.max-in-flight`
+  connections per destination.
 - **A send that outran its bound now counts towards the claim pause**
   (OUTBOX-INTERRUPTED-SEND-COUNTS-FOR-PAUSE-1). The send heartbeat interrupts a send still
   running at its bound; the Kafka publisher then fails with Kafka's `InterruptException`, which

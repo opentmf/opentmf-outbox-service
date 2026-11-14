@@ -323,4 +323,34 @@ class OutboxConcurrentLaneTests {
     assertThat(lane.submit(() -> {})).isFalse(); // closed: refused
     assertThat(lane.available()).isEqualTo(1);
   }
+
+  /**
+   * 1.11.1: a stopping lane interrupts the sends still running after the grace and JOINS them - a
+   * send that goes on after the interrupt (a booking on its way) ends before the stop returns. Up
+   * to 1.11.0 the stop returned after the interrupt and the send ran on beside a closing pool.
+   */
+  @Test
+  void aStop_joinsTheSendsItInterrupted() throws Exception {
+    // the grace, then the interrupt, then a join as long again (the lane's own close)
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(2, 10, false, Duration.ofMillis(500));
+    CountDownLatch sending = new CountDownLatch(1);
+    AtomicBoolean ended = new AtomicBoolean();
+    lane.submit(
+        () -> {
+          sending.countDown();
+          try {
+            new CountDownLatch(1).await(); // the send, until the stop interrupts it
+          } catch (InterruptedException ex) {
+            UninterruptibleHold.hold(Duration.ofMillis(300)); // then its late booking
+          } finally {
+            ended.set(true);
+          }
+        });
+    assertThat(sending.await(5, TimeUnit.SECONDS)).isTrue();
+
+    lane.close();
+
+    assertThat(ended).as("the interrupted send ended before the stop returned").isTrue();
+    assertThat(lane.alive()).isEmpty();
+  }
 }

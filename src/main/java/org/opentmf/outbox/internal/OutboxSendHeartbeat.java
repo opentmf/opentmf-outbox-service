@@ -77,11 +77,28 @@ class OutboxSendHeartbeat {
         this::beat, TICK.toMillis(), TICK.toMillis(), TimeUnit.MILLISECONDS);
   }
 
-  /** Stops it - after the lanes, so the sends of a graceful stop keep their leases. */
+  /** Stops it at once (a test's teardown); a stopping relay uses {@link #stopUntil}. */
   void stop() {
     if (executor != null) {
       executor.shutdownNow();
     }
+  }
+
+  /**
+   * Stops it - after the lanes, so the sends of a graceful stop keep their leases - and waits for a
+   * tick in flight, its clock measure or its renewal and their connection, up to {@code deadline}
+   * (1.11.1: up to 1.11.0 the stop returned at once and a tick in flight went on while the
+   * application's pool closed); its thread, while it still runs.
+   */
+  List<String> stopUntil(long deadline) {
+    if (executor == null) {
+      return List.of();
+    }
+    executor.shutdown(); // no tick from now on; the one in flight ends
+    if (!OutboxStops.awaitUntil(executor, deadline)) {
+      executor.shutdownNow();
+    }
+    return executor.isTerminated() ? List.of() : List.of("opentmf-outbox-heartbeat");
   }
 
   /**

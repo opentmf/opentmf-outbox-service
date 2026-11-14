@@ -10,7 +10,6 @@ import org.apache.hc.core5.util.Timeout;
 import org.springframework.http.client.ClientHttpRequestFactory;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
-import org.springframework.http.client.JettyClientHttpRequestFactory;
 import org.springframework.http.client.ReactorClientHttpRequestFactory;
 import org.springframework.util.ClassUtils;
 import org.springframework.web.client.RestClient;
@@ -59,10 +58,7 @@ final class OutboxHttpClients {
       return Apache.requestFactory(connectTimeout, readTimeout, maxInFlight);
     }
     if (present("org.eclipse.jetty.client.HttpClient")) {
-      JettyClientHttpRequestFactory factory = new JettyClientHttpRequestFactory();
-      factory.setConnectTimeout(connectTimeout);
-      factory.setReadTimeout(readTimeout);
-      return factory;
+      return OutboxJettyClient.requestFactory(connectTimeout, readTimeout, maxInFlight);
     }
     if (present("reactor.netty.http.client.HttpClient")) {
       ReactorClientHttpRequestFactory factory = new ReactorClientHttpRequestFactory();
