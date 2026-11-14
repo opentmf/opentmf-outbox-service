@@ -1080,8 +1080,13 @@ customer. Up to 1.11.0 an administrator who could read the views read both: the 
 inspect, `lastError` on every list. `GET /ops/outbox/{id}/payload` now serves them on a path of
 their own, and with `opentmf.outbox.ops.sensitive-in-views=false` **the views no longer carry
 them**: `payload` is null, and `lastError` holds the failure's kind only - the exception's type
-name, the leading token of the stored text when it has that shape (`unclassified` for any
-other text, never a piece of it), so list triage still sees what failed. The values are not in
+name, the leading token of the stored text when it names a throwable (`unclassified` for any
+other text, never a piece of it), so list triage still sees what failed. A token that merely
+looks like a type name - a receiver's word or a person's name before a colon - is not shown: the
+name must end in `Exception` or `Error`, or be one of Spring's HTTP-status exceptions
+(`BadRequest`, `ServiceUnavailable`, ...). An exception of the consumer's own that is named
+neither `...Exception` nor `...Error` therefore shows as `unclassified`, its full text on
+`GET /ops/outbox/{id}/payload`. The values are not in
 the response record at all, so a `fields=` selection cannot bring them back. The default,
 `true`, leaves every view exactly as it was. The library adds no security: the consumer gives
 the payload path its stricter role in its own rules, **matching `/ops/outbox/*/payload` before
