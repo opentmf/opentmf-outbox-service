@@ -151,7 +151,7 @@ class OutboxRoundTripIT {
                   assertThat(r.key()).isEqualTo(aggregateId);
                   assertThat(r.value()).contains("outbox");
                   assertThat(new String(r.headers().lastHeader("x-idempotency-key").value()))
-                      .isEqualTo("outbox-it:outbox:" + appended.getId());
+                      .isEqualTo(OutboxHeaders.idempotencyKey("outbox-it", appended));
                   assertThat(new String(r.headers().lastHeader("x-event-type").value()))
                       .isEqualTo("it.event.v1");
                   seen = true;
@@ -347,7 +347,7 @@ class OutboxRoundTripIT {
           .allSatisfy(
               r ->
                   assertThat(KafkaProbe.header(r, OutboxHeaders.IDEMPOTENCY_KEY))
-                      .isEqualTo("outbox-it:outbox:" + row.getId())); // ...same key: dedupable
+                      .isEqualTo(OutboxHeaders.idempotencyKey("outbox-it", row))); // ...same key: dedupable
       await()
           .atMost(Duration.ofSeconds(10))
           .untilAsserted(

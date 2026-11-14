@@ -39,6 +39,8 @@ class OutboxOnboardingIT {
   private static final String RELEASED_1_1_0_CHANGELOG = "db/changelog-1.1.0/opentmf-outbox.sql";
   private static final String RELEASED_1_2_1_CHANGELOG = "db/changelog-1.2.1/opentmf-outbox.sql";
   private static final String RELEASED_1_3_0_CHANGELOG = "db/changelog-1.3.0/opentmf-outbox.sql";
+  private static final String RELEASED_1_11_0_CHANGELOG =
+      "db/changelog-1.11.0/opentmf-outbox.sql";
   private static final List<String> LIBRARY_COLUMNS =
       List.of(
           "client_profile",
@@ -50,7 +52,8 @@ class OutboxOnboardingIT {
           "claimed_until",
           "lane",
           "ordering_key",
-          "sending_since");
+          "sending_since",
+          "key_token");
 
   private static String urlFor(String database) {
     return postgres.getJdbcUrl().replaceAll("/[^/?]+(\\?|$)", "/" + database + "$1");
@@ -211,7 +214,8 @@ class OutboxOnboardingIT {
             Map.entry("005-outbox-gauge-and-prune-indexes", "EXECUTED"),
             Map.entry("006-outbox-lane-gauge-indexes", "EXECUTED"),
             Map.entry("007-outbox-sending-since", "EXECUTED"),
-            Map.entry("008-outbox-claim-plan-fences", "EXECUTED"));
+            Map.entry("008-outbox-claim-plan-fences", "EXECUTED"),
+            Map.entry("009-outbox-key-token", "EXECUTED"));
     assertThat(columnNullability(url)).containsKeys(LIBRARY_COLUMNS.toArray(String[]::new));
     assertThat(pendingIndexPredicate(url))
         .contains("relayed_on IS NULL")
@@ -250,7 +254,8 @@ class OutboxOnboardingIT {
             Map.entry("005-outbox-gauge-and-prune-indexes", "EXECUTED"),
             Map.entry("006-outbox-lane-gauge-indexes", "EXECUTED"),
             Map.entry("007-outbox-sending-since", "EXECUTED"),
-            Map.entry("008-outbox-claim-plan-fences", "EXECUTED"));
+            Map.entry("008-outbox-claim-plan-fences", "EXECUTED"),
+            Map.entry("009-outbox-key-token", "EXECUTED"));
     assertThat(columnNullability(url)).containsKeys(LIBRARY_COLUMNS.toArray(String[]::new));
     assertThat(pendingIndexPredicate(url)).contains("parked_on IS NULL");
     assertThat(indexDefinition(url, "ix_outbox_claimed_until")).isNotNull(); // 1.2.0-F + 004
@@ -289,7 +294,8 @@ class OutboxOnboardingIT {
             Map.entry("005-outbox-gauge-and-prune-indexes", "EXECUTED"),
             Map.entry("006-outbox-lane-gauge-indexes", "EXECUTED"),
             Map.entry("007-outbox-sending-since", "EXECUTED"),
-            Map.entry("008-outbox-claim-plan-fences", "EXECUTED"));
+            Map.entry("008-outbox-claim-plan-fences", "EXECUTED"),
+            Map.entry("009-outbox-key-token", "EXECUTED"));
     Map<String, Boolean> nullability = columnNullability(url);
     assertThat(nullability)
         .containsKeys(LIBRARY_COLUMNS.toArray(String[]::new))
@@ -318,14 +324,14 @@ class OutboxOnboardingIT {
     // the two recorded rows are UNTOUCHED (same filename identity, same checksum, still
     // EXECUTED - not re-run, not re-inserted under another path) and 003 + 004 were added
     List<String> after = rawRows(url);
-    assertThat(after).hasSize(8).startsWith(recordedBy110.toArray(String[]::new));
+    assertThat(after).hasSize(9).startsWith(recordedBy110.toArray(String[]::new));
     assertThat(after.get(2))
         .startsWith("003-outbox-policy-reference-onboarding|")
         .endsWith("|EXECUTED");
     assertThat(columnNullability(url)).containsKeys("parked_on", "reference", "claimed_until");
     // and a second run is a no-op (003/004 are idempotent and recorded)
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
-    assertThat(changelogRows(url)).hasSize(8);
+    assertThat(changelogRows(url)).hasSize(9);
   }
 
   /**
@@ -346,10 +352,11 @@ class OutboxOnboardingIT {
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
 
     List<String> after = rawRows(url);
-    assertThat(after).hasSize(8).startsWith(recordedBy130.toArray(String[]::new));
+    assertThat(after).hasSize(9).startsWith(recordedBy130.toArray(String[]::new));
     assertThat(after.get(5)).startsWith("006-outbox-lane-gauge-indexes|").endsWith("|EXECUTED");
     assertThat(after.get(6)).startsWith("007-outbox-sending-since|").endsWith("|EXECUTED");
     assertThat(after.get(7)).startsWith("008-outbox-claim-plan-fences|").endsWith("|EXECUTED");
+    assertThat(after.get(8)).startsWith("009-outbox-key-token|").endsWith("|EXECUTED");
     assertThat(indexDefinition(url, "ix_outbox_parked_lane"))
         .contains("(lane)")
         .contains("parked_on IS NOT NULL");
@@ -366,7 +373,49 @@ class OutboxOnboardingIT {
     assertThat(indexDefinition(url, "ix_outbox_open_since")).isNull(); // replaced
     assertThat(invalidIndexes(url)).isZero();
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
-    assertThat(changelogRows(url)).hasSize(8);
+    assertThat(changelogRows(url)).hasSize(9);
+  }
+
+  /**
+   * 1.11.1 over a database the RELEASED 1.11.0 changelog migrated (changeset 009,
+   * OUTBOX-IDEMPOTENCY-KEY-REPEATS-AFTER-RESTORE-1): 001-008 keep their recorded checksums and 009
+   * adds the nullable key_token with no default - a row booked before keeps a null token, so its
+   * key is the 1.11.0 one; a second run is a no-op.
+   */
+  @Test
+  void aDatabaseMigratedByTheReleased1110Changelog_gainsTheKeyToken_withItsChecksumsIntact()
+      throws Exception {
+    String url = freshDatabase("from1110");
+    liquibaseUpdate(url, LIBRARY_CHANGELOG, releasedChangelogRoot(RELEASED_1_11_0_CHANGELOG));
+    List<String> recordedBy1110 = rawRows(url);
+    assertThat(recordedBy1110).hasSize(8);
+    execute(
+        url,
+        "insert into outbox (aggregate_type, aggregate_id, event_type, destination, payload,"
+            + " created_on, attempts, next_attempt_on) values ('a', 'b', 'c', 'd', '{}', now(), 0,"
+            + " now())");
+
+    liquibaseUpdate(url, LIBRARY_CHANGELOG);
+
+    List<String> after = rawRows(url);
+    assertThat(after).hasSize(9).startsWith(recordedBy1110.toArray(String[]::new));
+    assertThat(after.get(8)).startsWith("009-outbox-key-token|").endsWith("|EXECUTED");
+    assertThat(columnNullability(url)).containsEntry("key_token", true);
+    try (Connection c =
+            DriverManager.getConnection(url, postgres.getUsername(), postgres.getPassword());
+        Statement st = c.createStatement();
+        ResultSet rs =
+            st.executeQuery(
+                "select count(*) filter (where key_token is null), count(*),"
+                    + " (select column_default from information_schema.columns where table_name ="
+                    + " 'outbox' and column_name = 'key_token') from outbox")) {
+      rs.next();
+      assertThat(rs.getLong(1)).as("a row booked before 009 keeps a null token").isEqualTo(1);
+      assertThat(rs.getLong(2)).isEqualTo(1);
+      assertThat(rs.getString(3)).as("no database default").isNull();
+    }
+    liquibaseUpdate(url, LIBRARY_CHANGELOG);
+    assertThat(changelogRows(url)).hasSize(9);
   }
 
   /**
@@ -386,7 +435,7 @@ class OutboxOnboardingIT {
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
 
     List<String> after = rawRows(url);
-    assertThat(after).hasSize(8).startsWith(recordedBy121.toArray(String[]::new));
+    assertThat(after).hasSize(9).startsWith(recordedBy121.toArray(String[]::new));
     assertThat(after.get(3)).startsWith("004-outbox-claim-lease|").endsWith("|EXECUTED");
     assertThat(after.get(4))
         .startsWith("005-outbox-gauge-and-prune-indexes|")
@@ -423,6 +472,6 @@ class OutboxOnboardingIT {
     assertThat(indexDefinition(url, "ix_outbox_claimed_until")).doesNotContain("cancelled_on");
     assertThat(invalidIndexes(url)).isZero(); // the concurrent builds all completed
     liquibaseUpdate(url, LIBRARY_CHANGELOG);
-    assertThat(changelogRows(url)).hasSize(8);
+    assertThat(changelogRows(url)).hasSize(9);
   }
 }

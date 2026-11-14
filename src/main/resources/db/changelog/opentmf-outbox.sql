@@ -252,3 +252,17 @@ comment on index ix_outbox_concurrent_unkeyed is 'Open CONCURRENT rows without a
 --rollback create index concurrently ix_outbox_concurrent_unkeyed on outbox (id) where lane = 'CONCURRENT' and ordering_key is null and relayed_on is null and cancelled_on is null and parked_on is null;
 --rollback drop index concurrently if exists ix_outbox_concurrent_keyed;
 --rollback create index concurrently ix_outbox_concurrent_keyed on outbox (ordering_key, id) where lane = 'CONCURRENT' and ordering_key is not null and relayed_on is null and cancelled_on is null and parked_on is null;
+
+--changeset opentmf-outbox:009-outbox-key-token
+-- 1.11.1: key_token - a random value the writer mints per row at booking, part of the row's
+-- x-idempotency-key (<service>:outbox:<id>:<key_token>). The id alone repeats once the table is
+-- recreated or the database is restored to a point in time, and a consumer that already holds
+-- the old key drops the new event as a duplicate; a key_token never repeats. Null = booked
+-- before 1.11.1 (or not through OutboxWriter): the row keeps its old key, <service>:outbox:<id>.
+-- ONE statement, nullable, NO default: no table rewrite (measured 6 ms on 1,000,000 rows; an
+-- ADD COLUMN with a volatile default rewrites the table under an exclusive lock - 7.1 s there),
+-- and a row an older pod books during a rolling start stays null, keyed alike by both versions.
+alter table outbox add column if not exists key_token uuid;
+
+comment on column outbox.key_token is 'Minted per row at booking; part of the x-idempotency-key, so a reused id never repeats a key (1.11.1). Null = the key is <service>:outbox:<id>.';
+--rollback alter table outbox drop column if exists key_token;

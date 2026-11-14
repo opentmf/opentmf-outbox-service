@@ -60,7 +60,7 @@ final class KafkaTap implements AutoCloseable {
       return;
     }
     String text = new String(key.value(), StandardCharsets.UTF_8);
-    long rowId = Long.parseLong(text.substring(text.lastIndexOf(':') + 1));
+    long rowId = Receiver.rowIdOf(text);
     Instant position = Instant.EPOCH.plusNanos(r.partition() * 1_000_000_000_000L + r.offset());
     Receiver.recordDelivery(
         new Delivery(

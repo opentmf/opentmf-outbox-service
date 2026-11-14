@@ -98,7 +98,7 @@ class ProfileFlowHttpSideEffectIT {
         @Override
         public Object deliver(OutboxEvent event) {
           assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
-          DELIVERIES.add("adapter:" + OutboxHeaders.idempotencyKey("dnms-flow", event.getId()));
+          DELIVERIES.add("adapter:" + OutboxHeaders.idempotencyKey("dnms-flow", event));
           return OffsetDateTime.now(); // what the receiver answered - the booking records it
         }
 
@@ -152,7 +152,7 @@ class ProfileFlowHttpSideEffectIT {
     // exactly once each - in either order: the bounce rides the CONCURRENT lane
     assertThat(DELIVERIES)
         .containsExactlyInAnyOrder(
-            "adapter:dnms-flow:outbox:" + pi.getId(),
-            "http:dnms-flow:outbox:" + bounce.getId());
+            "adapter:" + OutboxHeaders.idempotencyKey("dnms-flow", pi),
+            "http:" + OutboxHeaders.idempotencyKey("dnms-flow", bounce));
   }
 }

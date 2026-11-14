@@ -12,8 +12,8 @@ import java.time.Duration;
  *
  * <p>Contract: {@link #deliver} (by default: {@link #publish}) either delivers the effect or
  * throws - a normal return is the relay's license to stamp {@code relayed_on}. Idempotency rides
- * the {@link OutboxHeaders#IDEMPOTENCY_KEY} header ({@link OutboxHeaders#idempotencyKey}); a
- * publisher MUST attach it.
+ * the {@link OutboxHeaders#IDEMPOTENCY_KEY} header ({@link OutboxHeaders#idempotencyKey(String,
+ * OutboxEvent)}); a publisher MUST attach it.
  *
  * <p><strong>Lanes and the lease (1.3.0).</strong> Each row rides the {@link #lane} its publisher
  * names. {@link Lane#ORDERED} (the default) is one thread per pod, rows in {@code id} order;

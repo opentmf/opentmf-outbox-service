@@ -17,6 +17,29 @@
 
 ### Fixed
 
+- **A restore or a recreated table no longer makes new events look like duplicates**
+  (OUTBOX-IDEMPOTENCY-KEY-REPEATS-AFTER-RESTORE-1). Up to 1.11.0 the `x-idempotency-key` was
+  `<service>:outbox:<id>`, and the `id` repeats once the outbox table is recreated or the database
+  is restored to a point in time: every new row then carried a key the consumer already held, and
+  the consumer dropped the new event as a duplicate - no error, no lag, nothing in a log (measured
+  on PostgreSQL with a real point-in-time recovery: 100 of 100 rows booked after the restore).
+  Now the writer mints a random key token per row at booking, and the key is
+  `<service>:outbox:<id>:<key_token>`. Upgrade notes (README "Upgrading to 1.11.1"):
+  - **schema:** changeset `009-outbox-key-token`, one statement,
+    `alter table outbox add column if not exists key_token uuid;` - nullable, no default, no
+    rewrite. Nothing to do where the changelog is included by reference. Where it runs out of
+    band, apply that statement before this version starts: a pod started on the 1.11.0 schema
+    refuses to start, with one error naming changeset 009 and the statement;
+  - **rows booked before the upgrade keep their 1.11.0 key**, so a retry across the upgrade is
+    still recognised, and a row pending at a restore point and sent again keeps its key;
+  - **the key is about 37 characters longer** (at most the service name + 64);
+  - **a rolling start costs at most one duplicate per row**, and only for a row a new pod booked
+    and both versions sent; roll at a low backlog;
+  - **`OutboxHeaders.idempotencyKey(serviceName, id)` is deprecated**, unchanged; a consumer's own
+    publisher switches to the new `idempotencyKey(serviceName, event)`, which builds the row's
+    key (the 1.11.0 key for a row without a token). A consumer that parses the key must stop: it
+    is opaque.
+
 - **A stopping relay no longer uses the database while the application's pool closes**
   (OUTBOX-SHUTDOWN-THREADS-BEFORE-DATASOURCE-1). Up to 1.11.0 the relay stopped in its
   `@PreDestroy` without waiting for its threads: a send woken by the stop's interrupt (a Kafka send

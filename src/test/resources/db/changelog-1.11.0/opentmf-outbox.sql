@@ -1,0 +1,254 @@
+--liquibase formatted sql
+
+--changeset opentmf-outbox:001-outbox
+--preconditions onFail:MARK_RAN onError:HALT onFailMessage:outbox table already exists (a pre-library outbox) - changeset 001 marked ran, 003 onboards the table. onErrorMessage:PostgreSQL is the shipped DDL dialect of opentmf-outbox-service (the dialect probe errored - this is not a PostgreSQL database). For other databases see the README (a per-dialect changelog is the extension path).
+--precondition-sql-check expectedResult:0 SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'outbox' AND current_setting('server_version_num') IS NOT NULL
+-- Transactional outbox — the LIBRARY-OWNED table (opentmf-outbox-service). One per owning
+-- service's schema: the
+-- business transaction writes its state change AND one row here in the same local transaction;
+-- the in-service relay delivers the effect at-least-once. State is DERIVED, no status column:
+-- pending = relayed_on is null; parked = pending and attempts >= max-attempts (config, default
+-- 10); relayed = relayed_on is not null. No triggers, no stored procedures, no CDC.
+-- CONSUMERS include this file from their master changelog and NEVER edit it — schema evolution
+-- arrives by library version bump.
+-- ONE clean create and nothing else: no onboarding shims — a consumer with a pre-library
+-- outbox table owns its own transition.
+-- (Comment lines here must never BEGIN with the word "changeset": the strict formatted-SQL
+-- parser reads "-- changeset ..." as a malformed header and refuses the whole file.)
+create table outbox (
+  id              bigint generated always as identity primary key,
+  aggregate_type  varchar(64) not null,
+  aggregate_id    varchar(128) not null,
+  event_type      varchar(100) not null,
+  destination     varchar(200) not null,
+  client_profile  varchar(64),
+  payload         text not null,
+  headers         text,
+  created_on      timestamp with time zone not null,
+  attempts        smallint not null default 0,
+  next_attempt_on timestamp with time zone not null,
+  relayed_on      timestamp with time zone,
+  last_error      text
+);
+
+create index ix_outbox_pending on outbox (next_attempt_on) where relayed_on is null;
+
+comment on table outbox is 'Transactional outbox (library-owned, opentmf-outbox-service): effects frozen at commit, relayed at-least-once in id order. Pending = relayed_on is null; parked = pending and attempts >= max-attempts; relayed rows pruned after the configured retention (default 7 days), parked rows never pruned automatically.';
+comment on column outbox.id is 'Own identity; the relay order — publishes ascend by id.';
+comment on column outbox.aggregate_type is 'Aggregate kind the event belongs to, e.g. party-interaction.';
+comment on column outbox.aggregate_id is 'Aggregate identity; becomes the Kafka message key (preserves per-aggregate order).';
+comment on column outbox.event_type is 'Payload event type, e.g. comm.outcome.v1; copied into the x-event-type header.';
+comment on column outbox.destination is 'Delivery target: a Kafka topic name, or an http(s):// URL for the HTTP publisher.';
+comment on column outbox.client_profile is 'Optional named client profile for HTTP delivery; null = resolver decision (longest-prefix base-url match), else plain POST. Ignored by the Kafka publisher.';
+comment on column outbox.payload is 'Serialized JSON payload — a genuine blob (TEXT, not jsonb); frozen at write time, never re-read by the platform.';
+comment on column outbox.headers is 'Optional serialized header map frozen at write time; the relay stamps x-idempotency-key/x-event-type/x-producer on top.';
+comment on column outbox.created_on is 'Row creation time; feeds the relay-lag gauge (age of oldest pending).';
+comment on column outbox.attempts is 'Failed delivery attempts so far; at max-attempts the row parks (no more retries, alert fires, unparking is an explicit ops action).';
+comment on column outbox.next_attempt_on is 'Earliest next delivery attempt (exponential backoff: base 5s, factor 2, cap 10min by default); now() on insert.';
+comment on column outbox.relayed_on is 'Delivery completion time; null while pending/parked — the derived-state discriminator.';
+comment on column outbox.last_error is 'Last delivery failure (truncated) — ops forensics for parked rows.';
+comment on index ix_outbox_pending is 'Partial index over pending rows only — the relay claim query stays cheap regardless of relayed backlog.';
+--rollback drop table outbox;
+
+--changeset opentmf-outbox:002-outbox-hold-and-cancel
+--preconditions onFail:MARK_RAN onError:HALT onFailMessage:release_at / cancelled_on already exist (a pre-library outbox) - changeset 002 marked ran, 003 adds whichever is missing.
+--precondition-sql-check expectedResult:0 SELECT count(*) FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'outbox' AND column_name IN ('release_at', 'cancelled_on')
+-- 1.1.0, ADDITIVE (001 is never edited): the scheduled-send HOLD and the cancellation of an
+-- unreleased effect. Both nullable; a 1.0.0 consumer upgrades with zero changes. The state
+-- model gains its fourth leg: cancelled = cancelled_on is not null (only unrelayed rows can be
+-- cancelled, so relayed and cancelled never overlap); pending/parked now also require
+-- cancelled_on is null. Neither column is touched by the retry backoff - the hold is frozen at
+-- write time and the failure bookkeeping lives in next_attempt_on alone.
+alter table outbox add column release_at timestamp with time zone;
+alter table outbox add column cancelled_on timestamp with time zone;
+
+comment on table outbox is 'Transactional outbox (library-owned, opentmf-outbox-service): effects frozen at commit, relayed at-least-once in id order. Pending = relayed_on is null and cancelled_on is null; parked = pending and attempts >= max-attempts; relayed = relayed_on is not null; cancelled = cancelled_on is not null. A pending row with a future release_at is HELD (not claimable until then). Relayed and cancelled rows pruned after the configured retention (default 7 days), parked rows never pruned automatically.';
+comment on column outbox.release_at is 'Optional scheduled-send hold, frozen at write time: the row is not claimable before this instant. Null = no hold. Never moved by the retry backoff (that is next_attempt_on).';
+comment on column outbox.cancelled_on is 'Cancellation time of an UNRELEASED effect (ops action); null = not cancelled. A cancelled row is never relayed, is retained for audit and pruned with the relayed retention.';
+--rollback alter table outbox drop column cancelled_on;
+--rollback alter table outbox drop column release_at;
+
+--changeset opentmf-outbox:003-outbox-policy-reference-onboarding
+-- 1.2.0, ADDITIVE and IDEMPOTENT (every ADD COLUMN is IF NOT EXISTS): (a) parked_on - the
+-- explicit park stamp, now that the attempt budget is per publisher and "parked" can no longer
+-- be derived from attempts >= one max; (b) reference - the private per-row correlation, never
+-- a wire header; (c) ONBOARDING of a pre-library outbox table: 001/002 were MARKED RAN because
+-- the table (or its columns) pre-existed, and this changeset brings such a table to the 1.2.0
+-- shape - client_profile / release_at / cancelled_on included for tables that never had them.
+-- Consumer-specific deltas stay the consumer's (e.g. dropping a NOT NULL / DEFAULT on
+-- release_at, or columns the library does not know). The pending index is recreated to the
+-- 1.2.0 claim predicate. (001's own comment block still says "no onboarding shims": it is
+-- HISTORICAL and stays verbatim because a released changeset's body - comments included - is
+-- part of its recorded checksum; this changeset is the onboarding.) The 001/002 preconditions
+-- probe information_schema for current_schema(): the outbox lives in the consumer's own schema.
+alter table outbox add column if not exists client_profile varchar(64);
+alter table outbox add column if not exists release_at timestamp with time zone;
+alter table outbox add column if not exists cancelled_on timestamp with time zone;
+alter table outbox add column if not exists parked_on timestamp with time zone;
+alter table outbox add column if not exists reference varchar(128);
+
+drop index if exists ix_outbox_pending;
+create index ix_outbox_pending on outbox (next_attempt_on) where relayed_on is null and cancelled_on is null and parked_on is null;
+
+comment on table outbox is 'Transactional outbox (library-owned, opentmf-outbox-service): effects frozen at commit, relayed at-least-once in id order. Pending = relayed_on is null and cancelled_on is null; parked = pending and parked_on is not null (a publisher''s delivery budget exhausted with outcome PARK); relayed = relayed_on is not null (also stamped by a DROP exhaustion - last_error tells); cancelled = cancelled_on is not null. A pending row with a future release_at is HELD (not claimable until then). Relayed and cancelled rows pruned after the configured retention (default 7 days), parked rows never pruned automatically.';
+comment on column outbox.client_profile is 'Optional named client profile for HTTP delivery; null = resolver decision (longest-prefix base-url match), else plain POST. Ignored by the Kafka publisher.';
+comment on column outbox.release_at is 'Optional scheduled-send hold, frozen at write time: the row is not claimable before this instant. Null = no hold. Never moved by the retry backoff (that is next_attempt_on).';
+comment on column outbox.cancelled_on is 'Cancellation time of an UNRELEASED effect (ops action); null = not cancelled. A cancelled row is never relayed, is retained for audit and pruned with the relayed retention.';
+comment on column outbox.parked_on is 'Stamped when the publisher''s delivery budget is exhausted with outcome PARK: unclaimable, never auto-pruned, the parked gauge alerts; unpark clears it (ops action). Null while retrying.';
+comment on column outbox.reference is 'Optional PRIVATE correlation (e.g. a subscription id): filterable on the ops list, never forwarded to the wire - wire headers live in headers.';
+comment on column outbox.attempts is 'Failed delivery attempts so far; at the publisher''s budget (library max-attempts by default) the row is exhausted: parked (parked_on) or dropped (relayed_on + last_error).';
+comment on index ix_outbox_pending is 'Partial index over claimable-candidate rows only (not relayed, not cancelled, not parked) - the relay claim query stays cheap regardless of the terminal backlog.';
+--rollback drop index if exists ix_outbox_pending;
+--rollback create index ix_outbox_pending on outbox (next_attempt_on) where relayed_on is null;
+--rollback alter table outbox drop column if exists reference;
+--rollback alter table outbox drop column if exists parked_on;
+
+--changeset opentmf-outbox:004-outbox-claim-lease runInTransaction:false
+-- 1.3.0, ADDITIVE and IDEMPOTENT (IF NOT EXISTS throughout, so it applies to a table onboarded
+-- by 003 as well as to one the library created). Three columns:
+-- claimed_until - the relay's LEASE on a row. The claim stamps now + lease (and moves
+-- next_attempt_on to the same instant, so a pre-1.3.0 relay sees a leased row as not due) and
+-- commits; the send runs in no transaction; the booking writes the outcome guarded on the
+-- stamped value and clears it. Null = not claimed; past = lapsed (claimable again); future = in
+-- flight.
+-- lane / ordering_key - what the row's publisher said at APPEND, frozen like headers: ORDERED
+-- (or null: a row written before 1.3.0, or not through the library's writer) rides the single
+-- relay thread in id order; CONCURRENT rides the parallel lane, where rows sharing an
+-- ordering_key are never in flight together. ordering_key is collate "C" (byte order): the
+-- claim's round-robin cursor compares keys the way the relay does, and the comparisons are
+-- cheap. Each lane claims over its own partial indexes, so neither ever reads through the
+-- other's backlog, and no claim reads the relayed rows: the
+-- ORDERED claim walks ix_outbox_ordered_claim in id order; the CONCURRENT claim reads the
+-- in-flight keys through ix_outbox_claimed_until, skips from key to key through
+-- ix_outbox_concurrent_keyed (one probe per key not in flight - never one per pending row),
+-- and walks ix_outbox_concurrent_unkeyed for rows without a key.
+-- The indexes are built CONCURRENTLY (hence runInTransaction:false): a deploy onto a large
+-- table must not block the appends of the pods still running. Each build is preceded by a
+-- DROP ... IF EXISTS - a failed concurrent build leaves an INVALID index and this changeset
+-- unmarked, and the next run must rebuild it, not skip it. The column additions are
+-- metadata-only (nullable, no default).
+alter table outbox add column if not exists claimed_until timestamp with time zone;
+alter table outbox add column if not exists lane varchar(16);
+alter table outbox add column if not exists ordering_key varchar(255) collate "C";
+
+drop index concurrently if exists ix_outbox_claimed_until;
+create index concurrently ix_outbox_claimed_until on outbox (claimed_until) where claimed_until is not null and relayed_on is null;
+drop index concurrently if exists ix_outbox_ordered_claim;
+create index concurrently ix_outbox_ordered_claim on outbox (id) where (lane is null or lane <> 'CONCURRENT') and relayed_on is null and cancelled_on is null and parked_on is null;
+drop index concurrently if exists ix_outbox_concurrent_keyed;
+create index concurrently ix_outbox_concurrent_keyed on outbox (ordering_key, id) where lane = 'CONCURRENT' and ordering_key is not null and relayed_on is null and cancelled_on is null and parked_on is null;
+drop index concurrently if exists ix_outbox_concurrent_unkeyed;
+create index concurrently ix_outbox_concurrent_unkeyed on outbox (id) where lane = 'CONCURRENT' and ordering_key is null and relayed_on is null and cancelled_on is null and parked_on is null;
+
+comment on column outbox.claimed_until is 'The relay''s lease (1.3.0): stamped now + lease by the claim (next_attempt_on moves with it), cleared by the booking. Future = in flight (not claimable); past = lapsed, claimable again - the late holder''s booking is guarded on the stamped value and books nothing.';
+comment on column outbox.lane is 'The relay lane the row''s publisher named at append (1.3.0), frozen: ORDERED (single relay thread, id order) or CONCURRENT (parallel, keyed). Null = written before 1.3.0 or not through the library writer - rides ORDERED.';
+comment on column outbox.ordering_key is 'CONCURRENT lane (1.3.0): rows sharing this key are never in flight together and are taken in id order on the happy path. Null = independent. Frozen at append; a key over 255 chars is stored as sha256:<hex>.';
+comment on index ix_outbox_claimed_until is 'Partial index over leased unrelayed rows - the CONCURRENT claim reads the keys in flight here (a live lease holds its key even if the row was cancelled meanwhile); backs the in-flight gauge.';
+comment on index ix_outbox_ordered_claim is 'The ORDERED lane''s claim: claimable-candidate rows of that lane only, in id order.';
+comment on index ix_outbox_concurrent_keyed is 'The CONCURRENT lane''s claim, keyed rows: skip-scanned key by key, one head probe per key not in flight.';
+comment on index ix_outbox_concurrent_unkeyed is 'The CONCURRENT lane''s claim, rows without an ordering key, in id order.';
+--rollback drop index concurrently if exists ix_outbox_concurrent_unkeyed;
+--rollback drop index concurrently if exists ix_outbox_concurrent_keyed;
+--rollback drop index concurrently if exists ix_outbox_ordered_claim;
+--rollback drop index concurrently if exists ix_outbox_claimed_until;
+--rollback alter table outbox drop column if exists ordering_key;
+--rollback alter table outbox drop column if exists lane;
+--rollback alter table outbox drop column if exists claimed_until;
+
+--changeset opentmf-outbox:005-outbox-gauge-and-prune-indexes runInTransaction:false
+-- 1.3.0, ADDITIVE: four partial indexes so that neither the metrics gauges nor the retention
+-- prune ever reads the whole table (load test 2026-10-06, findings F-1 and F-2 - on 3.5-4.8 M
+-- row tables the gauges took 7-20 s per scrape and the prune never finished).
+-- ix_outbox_open_since - every open row (not relayed, not cancelled) by the instant it became
+--   deliverable, greatest(created_on, release_at): the pending count reads it index-only, the
+--   relay-lag gauge reads its first entry.
+-- ix_outbox_parked - the parked rows only, by destination and parked_on: the parked gauge
+--   (index-only count) and the unpark by filter (one destination, a parked-on range).
+-- ix_outbox_relayed_on / ix_outbox_cancelled_on - the terminal rows by their stamp: the prune
+--   deletes the oldest expired rows in bounded batches without a full scan.
+-- Built CONCURRENTLY (hence runInTransaction:false) so a deploy onto a large table does not block
+-- the appends of the pods still running. Each build is preceded by a DROP ... IF EXISTS: if a
+-- concurrent build fails it leaves an INVALID index behind and this changeset unmarked, and the
+-- next run must rebuild it rather than skip it.
+drop index concurrently if exists ix_outbox_open_since;
+create index concurrently ix_outbox_open_since on outbox ((greatest(created_on, coalesce(release_at, created_on)))) where relayed_on is null and cancelled_on is null;
+drop index concurrently if exists ix_outbox_parked;
+create index concurrently ix_outbox_parked on outbox (destination, parked_on, id) where parked_on is not null and relayed_on is null and cancelled_on is null;
+drop index concurrently if exists ix_outbox_relayed_on;
+create index concurrently ix_outbox_relayed_on on outbox (relayed_on) where relayed_on is not null;
+drop index concurrently if exists ix_outbox_cancelled_on;
+create index concurrently ix_outbox_cancelled_on on outbox (cancelled_on) where cancelled_on is not null;
+
+comment on index ix_outbox_open_since is 'Open rows (not relayed, not cancelled) by the instant they became deliverable - the pending count (index-only) and the relay-lag gauge (first entry).';
+comment on index ix_outbox_parked is 'Parked rows only, by destination and parked_on - the parked gauge and the unpark by filter.';
+comment on index ix_outbox_relayed_on is 'Relayed rows by relayed_on - the retention prune deletes the oldest expired in bounded batches.';
+comment on index ix_outbox_cancelled_on is 'Cancelled rows by cancelled_on - the retention prune of the other terminal state.';
+--rollback drop index concurrently if exists ix_outbox_cancelled_on;
+--rollback drop index concurrently if exists ix_outbox_relayed_on;
+--rollback drop index concurrently if exists ix_outbox_parked;
+--rollback drop index concurrently if exists ix_outbox_open_since;
+
+--changeset opentmf-outbox:006-outbox-lane-gauge-indexes runInTransaction:false
+-- 1.4.0: the outbox gauges carry a lane label (ORDERED / CONCURRENT), and none may read more
+-- than the open rows of its lane (the F-2 lesson). The pending and in-flight gauges need nothing
+-- new: pending counts the three claim indexes of 004, whose predicates split the open rows by
+-- lane, and in-flight already visits every row of ix_outbox_claimed_until. Two gauges do:
+-- ix_outbox_parked_lane - the parked rows by lane: the parked gauge counts each lane index-only.
+-- ix_outbox_open_since_ordered / ix_outbox_open_since_concurrent - each lane's open rows by the
+--   instant they became deliverable: the relay-lag gauge reads each one's first entry.
+-- They replace ix_outbox_open_since (005), whose one reader was the lane-less relay-lag gauge.
+-- Built CONCURRENTLY (hence runInTransaction:false), each preceded by a DROP ... IF EXISTS, as in
+-- 004 and 005: a failed concurrent build leaves an INVALID index and this changeset unmarked.
+drop index concurrently if exists ix_outbox_parked_lane;
+create index concurrently ix_outbox_parked_lane on outbox (lane) where parked_on is not null and relayed_on is null and cancelled_on is null;
+drop index concurrently if exists ix_outbox_open_since_ordered;
+create index concurrently ix_outbox_open_since_ordered on outbox ((greatest(created_on, coalesce(release_at, created_on)))) where (lane is null or lane <> 'CONCURRENT') and relayed_on is null and cancelled_on is null;
+drop index concurrently if exists ix_outbox_open_since_concurrent;
+create index concurrently ix_outbox_open_since_concurrent on outbox ((greatest(created_on, coalesce(release_at, created_on)))) where lane = 'CONCURRENT' and relayed_on is null and cancelled_on is null;
+drop index concurrently if exists ix_outbox_open_since;
+
+comment on index ix_outbox_parked_lane is 'Parked rows by lane - the parked gauge, one index-only count per lane.';
+comment on index ix_outbox_open_since_ordered is 'Open rows of the ORDERED lane (lane null included) by the instant they became deliverable - that lane''s relay-lag gauge (first entry).';
+comment on index ix_outbox_open_since_concurrent is 'Open rows of the CONCURRENT lane by the instant they became deliverable - that lane''s relay-lag gauge (first entry).';
+--rollback create index concurrently if not exists ix_outbox_open_since on outbox ((greatest(created_on, coalesce(release_at, created_on)))) where relayed_on is null and cancelled_on is null;
+--rollback drop index concurrently if exists ix_outbox_open_since_concurrent;
+--rollback drop index concurrently if exists ix_outbox_open_since_ordered;
+--rollback drop index concurrently if exists ix_outbox_parked_lane;
+
+--changeset opentmf-outbox:007-outbox-sending-since
+-- 1.9.0: sending_since - when the current holder's send was known to be under way (the lease
+-- renewal right before a send, or the send heartbeat a third of the lease in). Every booking and
+-- every claim clears it. A lease that lapses while it is set counts as a failed attempt - so a
+-- send that never ends exhausts its row's budget instead of being re-sent every lease forever -
+-- and a lease that lapses on a row held unsent (claimed into a queue, behind an ORDERED head)
+-- costs the row nothing. No index: it is read only on rows a claim already holds.
+alter table outbox add column if not exists sending_since timestamp with time zone;
+
+comment on column outbox.sending_since is 'When the current holder''s send was known to be under way; a lease lapsing while set counts as a failed attempt (1.9.0).';
+--rollback alter table outbox drop column if exists sending_since;
+
+--changeset opentmf-outbox:008-outbox-claim-plan-fences runInTransaction:false
+-- 1.9.0: the CONCURRENT claim stays bounded whatever the statistics say. An outbox is usually
+-- analysed while its open set is (nearly) empty; when a backlog then piles up - an outage - the
+-- planner believes the open set is one row, and every partial index over open rows looks free.
+-- Up to 1.8.0 two of them ordered the claim's key walk wrong - ix_outbox_pending and, on a table
+-- never analysed, the relay-lag gauge's index - and the claim sorted the whole backlog for every
+-- key: about 36 s for one claim of 100 rows over a 100,000-row backlog. The two CONCURRENT claim
+-- indexes are rebuilt on "open" as ONE expression, coalesce(relayed_on, cancelled_on, parked_on)
+-- is null - the same rows - and the claim states it in that form: the planner cannot prove the
+-- other open-row indexes' predicates (three separate "is null"s) from it, so the claim's own
+-- indexes and the primary key are its only candidates. ix_outbox_pending and the relay-lag
+-- indexes stay as they are. Rebuilt CONCURRENTLY under their names (hence
+-- runInTransaction:false), each create preceded by a DROP ... IF EXISTS, as in 004 to 006; while
+-- 1.8.x pods still run, their CONCURRENT claim (three "is null"s) has no index of its own.
+drop index concurrently if exists ix_outbox_concurrent_keyed;
+create index concurrently ix_outbox_concurrent_keyed on outbox (ordering_key, id) where lane = 'CONCURRENT' and ordering_key is not null and coalesce(relayed_on, cancelled_on, parked_on) is null;
+drop index concurrently if exists ix_outbox_concurrent_unkeyed;
+create index concurrently ix_outbox_concurrent_unkeyed on outbox (id) where lane = 'CONCURRENT' and ordering_key is null and coalesce(relayed_on, cancelled_on, parked_on) is null;
+
+comment on index ix_outbox_concurrent_keyed is 'Open CONCURRENT rows with a key, by key then id - the CONCURRENT claim''s key walk and heads. "Open" as one expression: no other index''s predicate can be proven from the claim (1.9.0).';
+comment on index ix_outbox_concurrent_unkeyed is 'Open CONCURRENT rows without a key, by id - the CONCURRENT claim''s unkeyed rows. "Open" as one expression: no other index''s predicate can be proven from the claim (1.9.0).';
+--rollback drop index concurrently if exists ix_outbox_concurrent_unkeyed;
+--rollback create index concurrently ix_outbox_concurrent_unkeyed on outbox (id) where lane = 'CONCURRENT' and ordering_key is null and relayed_on is null and cancelled_on is null and parked_on is null;
+--rollback drop index concurrently if exists ix_outbox_concurrent_keyed;
+--rollback create index concurrently ix_outbox_concurrent_keyed on outbox (ordering_key, id) where lane = 'CONCURRENT' and ordering_key is not null and relayed_on is null and cancelled_on is null and parked_on is null;

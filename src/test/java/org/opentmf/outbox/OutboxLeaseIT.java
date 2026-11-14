@@ -164,7 +164,7 @@ class OutboxLeaseIT {
           long id = event.getId();
           SENT_IN_TX.add(TransactionSynchronizationManager.isActualTransactionActive());
           List<String> mine = DELIVERED.computeIfAbsent(id, k -> new CopyOnWriteArrayList<>());
-          mine.add(OutboxHeaders.idempotencyKey("outbox-lease-it", id));
+          mine.add(OutboxHeaders.idempotencyKey("outbox-lease-it", event));
           switch (scenario(event)) {
             case "lapse" -> {
               if (mine.size() == 1) {
@@ -399,7 +399,8 @@ class OutboxLeaseIT {
     assertThat(LISTENED.get(row.getId())).hasValue(1); // one booking, one listener call
     assertThat(HOOKED.get(row.getId())).containsExactly(Outcome.RETRY, Outcome.RELAYED);
     // both deliveries carry ONE idempotency key - the receiver dedups the second
-    assertThat(DELIVERED.get(row.getId())).containsOnly("outbox-lease-it:outbox:" + row.getId());
+    assertThat(DELIVERED.get(row.getId()))
+        .containsOnly(OutboxHeaders.idempotencyKey("outbox-lease-it", row));
   }
 
   /**

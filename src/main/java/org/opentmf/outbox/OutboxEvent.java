@@ -9,6 +9,7 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import java.time.OffsetDateTime;
+import java.util.UUID;
 import lombok.Getter;
 import lombok.Setter;
 import org.hibernate.annotations.DynamicInsert;
@@ -171,4 +172,13 @@ public class OutboxEvent {
 
   /** Last delivery failure, truncated — ops forensics for parked rows. */
   private String lastError;
+
+  /**
+   * Minted by {@link OutboxWriter} at booking (1.11.1), frozen: part of the row's {@link
+   * OutboxHeaders#idempotencyKey(String, OutboxEvent) idempotency key}, so a reused {@code id} - a
+   * recreated table, a restore to a point in time - never repeats a key a consumer already holds.
+   * Null = booked before 1.11.1 or not through the writer: the key is the id's alone, as before.
+   */
+  @Column(updatable = false)
+  private UUID keyToken;
 }
