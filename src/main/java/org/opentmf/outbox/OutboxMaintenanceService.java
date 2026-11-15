@@ -7,6 +7,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.opentmf.outbox.internal.OutboxAppended;
 import org.opentmf.outbox.internal.OutboxClock;
 import org.opentmf.outbox.internal.OutboxEventRepository;
+import org.opentmf.outbox.internal.OutboxPruned;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -75,6 +76,21 @@ public class OutboxMaintenanceService {
    * the result says more remains and the caller calls again. Deliberately NOT one transaction:
    * up to 1.2.1 the prune loaded every expired row as an entity in one transaction and, on a
    * multi-million row table, never finished.
+   *
+   * <p>So ONE statement deletes at most {@code batch-size} rows, and ONE call is NOT one batch: it
+   * runs batches for up to {@code time-budget}. A caller whose statement or call limit on this
+   * path is under the budget sets the budget below that limit.
+   *
+   * <p>A batch the database cancels (a {@code statement_timeout}, a cancel - SQLSTATE 57014) ends
+   * the call with Spring's {@code QueryTimeoutException} (package {@code org.springframework.dao}):
+   * that batch is rolled back whole, the batches before it stay deleted, and the next call
+   * continues with the oldest expired rows. The call then answers no count; every committed
+   * batch's rows are on the {@code opentmf.outbox.pruned} counter (1.11.1), by the {@code state}
+   * of the rows deleted.
+   *
+   * <p>A batch is planned on the table's statistics: with them it reads only the expired rows,
+   * through the stamp's index; on a table never analysed PostgreSQL may scan the table and sort
+   * the whole expired backlog for each batch - README "The prune at scale".
    */
   public OutboxPruneResult pruneExpired() {
     OffsetDateTime cutoff = clock.now().minus(properties.getRetention());
@@ -87,10 +103,12 @@ public class OutboxMaintenanceService {
     while ((relayedLeft || cancelledLeft) && System.nanoTime() < deadline) {
       if (relayedLeft) {
         int deleted = repository.deleteRelayedBatch(cutoff, batch);
+        counted(OutboxPruned.RELAYED, deleted);
         relayed += deleted;
         relayedLeft = deleted == batch;
       } else {
         int deleted = repository.deleteCancelledBatch(cutoff, batch);
+        counted(OutboxPruned.CANCELLED, deleted);
         cancelled += deleted;
         cancelledLeft = deleted == batch;
       }
@@ -106,6 +124,13 @@ public class OutboxMaintenanceService {
           result.moreToPrune() ? " - more remain, the time budget is spent" : "");
     }
     return result;
+  }
+
+  /** A batch has committed: its rows go on the {@code opentmf.outbox.pruned} counter (1.11.1). */
+  private void counted(String state, int deleted) {
+    if (deleted > 0) {
+      eventPublisher.publishEvent(new OutboxPruned(state, deleted));
+    }
   }
 
   /**
