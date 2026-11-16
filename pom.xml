@@ -438,8 +438,8 @@
                   <version>[3.9,3.10)</version>
                   <message>This library builds with Maven 3.9.x.</message>
                 </requireMavenVersion>
-                <!-- ESTATE-SNAPSHOT-NORMALIZATION-OFF-IN-EVERY-MAVEN-REPOSITORY-1: .mvn/maven.config
-                     turns the resolver's snapshot normalization off, so a resolved timestamped
+                <!-- Snapshot normalization off: .mvn/maven.config turns the resolver's snapshot
+                     normalization off, so a resolved timestamped
                      snapshot stays its own file and is never copied over the shared
                      <artifactId>-<base>-SNAPSHOT.jar that a second build beside this one rewrites
                      (measured on Maven 3.9.16 / resolver 1.9.27: with the line only the

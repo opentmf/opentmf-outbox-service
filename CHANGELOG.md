@@ -171,8 +171,7 @@
 
 ### Build (contributors)
 
-- **Snapshot normalization is off for every build of this repository**
-  (ESTATE-SNAPSHOT-NORMALIZATION-OFF-IN-EVERY-MAVEN-REPOSITORY-1): `.mvn/maven.config` carries
+- **Snapshot normalization is off for every build of this repository**: `.mvn/maven.config` carries
   `-Daether.artifactResolver.snapshotNormalization=false`, and the enforcer stops a build at
   `validate` when the line is missing or overridden. Two builds beside each other no longer
   rewrite each other's `-SNAPSHOT.jar` base file. The jar is unchanged.
