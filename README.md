@@ -1639,9 +1639,9 @@ Quality gates on this repo:
   `-Dit.test=LeasesIT#b4*`; B5 with `-Dit.clock-corrected=false` shows the
   1.8.0 clock.
 - PIT (`mvn -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage`)
-  on the pinned 1.19.6 hold with incremental history (1.20+ moved free
-  `withHistory` behind the commercial arcmutate plugin). No mutation threshold:
-  survivor review is the unit of work.
+  on pitest-maven 1.30.2 with pitest-junit5-plugin 1.2.3, without incremental history:
+  from 1.20 history needs the commercial arcmutate plugin, so every run is a full run.
+  No mutation threshold: survivor review is the unit of work.
 
 ### Sonar suppressions
 

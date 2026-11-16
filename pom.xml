@@ -73,7 +73,7 @@
     <!-- An opentmf library never imports the opentmf-versions BOM (the BOM
          aggregates the libraries — a library importing it would be a cycle in
          spirit and a lockstep coupling in practice). Direct property pin. -->
-    <tmf630-toolkit.version>3.5.1</tmf630-toolkit.version>
+    <tmf630-toolkit.version>3.5.2</tmf630-toolkit.version>
 
     <!-- Non-BOM-managed pins live here so versions:display-property-updates sees them. -->
     <archunit.version>1.5.1</archunit.version>
@@ -83,14 +83,14 @@
     <!-- jakarta classifier needs the explicit version (shared with querydsl-apt). -->
     <querydsl.version>5.1.0</querydsl.version>
 
-    <!-- Quality-gate branch statement: THIS REPO RUNS THE 1.19.6 HOLD WITH
-         INCREMENTAL HISTORY — a deliberate branch, not a stale version: free
-         withHistory moved behind the
-         commercial arcmutate plugin from 1.20, where the bare flag FAILS the run.
-         The junit5 plugin stays at 1.2.3 WITH it (1.2.1 crashes JDK 25 with
-         "Coverage generation minion exited abnormally"). Quote both versions
-         whenever the pin is. -->
-    <pitest.version>1.19.6</pitest.version>
+    <!-- PIT without incremental history. The 1.19.6 hold (kept for its free
+         withHistory) was lifted on 2026-11-09: from 1.20 incremental history needs the
+         commercial arcmutate plugin, and the bare flag FAILS the run ("History has been
+         enabled but no history plugin has been installed/activated", read in 1.30.2), so
+         the mutation profile sets no history and every run is a full run. The junit5
+         plugin is 1.2.3 (1.2.1 crashes JDK 25 with "Coverage generation minion exited
+         abnormally"). Quote both versions whenever the pin is. -->
+    <pitest.version>1.30.2</pitest.version>
     <pitest-junit5.version>1.2.3</pitest-junit5.version>
 
     <!-- Release machinery (donor: opentmf-db-lock-service). The Boot parent manages
@@ -533,8 +533,8 @@
     </profile>
     <!-- Mutation testing (PIT rides the library from day one).
          Run: mvn -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage
-         Branch statement: the pinned 1.19.6 hold WITH incremental history (see the pin
-         comment in <properties>). NO mutationThreshold - survivor review is the unit
+         No incremental history (see the pin comment in <properties>): every run is a
+         full run. NO mutationThreshold - survivor review is the unit
          of work; the JACOCO 90/90/90 gate is the enforced floor. -->
     <profile>
       <id>mutation</id>
@@ -565,9 +565,6 @@
                 <param>HTML</param>
               </outputFormats>
               <timestampedReports>false</timestampedReports>
-              <!-- withHistory is WHY the 1.19.6 hold exists. KNOWN COST
-                   (the un-retired <=1.19 gotcha): the history file is keyed on mutated-class hashes ONLY — strengthening a TEST does not invalidate an entry, so DELETE the history file before a survivor review or after material test changes. -->
-              <withHistory>true</withHistory>
               <!-- NO mutationThreshold — survivor review is the unit of work. -->
             </configuration>
           </plugin>

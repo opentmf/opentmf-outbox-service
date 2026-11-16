@@ -177,6 +177,10 @@
   rewrite each other's `-SNAPSHOT.jar` base file. The jar is unchanged.
 - The local SonarQube token goes only through the `SONAR_TOKEN` environment variable, never as
   `-Dsonar.token` on a command line (pom comment and README).
+- Every dependency and plugin is current (OTMF-OUTBOX-BUMPS-BEFORE-THE-BATCH-1): tmf630-toolkit
+  3.5.2 (an optional dependency) and pitest-maven 1.30.2. The pitest 1.19.6 hold is lifted. PIT
+  now runs without incremental history - from 1.20 it needs the commercial arcmutate plugin, and
+  the bare `withHistory` flag fails the run - so every run is a full run.
 
 ## 1.11.0 - 2026-11-03
 
