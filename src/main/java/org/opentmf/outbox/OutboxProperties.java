@@ -253,13 +253,13 @@ public class OutboxProperties {
 
   /**
    * A pod whose sends over one TRANSPORT keep failing - its broker out of reach while other pods
-   * may reach it - leaves that transport's rows to the other pods instead of taking every one
-   * into a failed attempt and its backoff (1.11.0, OUTBOX-FAILING-RELAY-CLAIMS-1). While paused it
-   * takes one probe row, the first {@code backoff-base} after the pause, each next one twice as
-   * long after, up to {@code max} - and any of the transport's rows due longer than {@code max},
-   * which no pod is sending; one successful send ends the pause. Per pod and per transport, for
-   * publishers that name one ({@link org.opentmf.outbox.OutboxPublisher#transport}: the library's
-   * Kafka publisher does, its HTTP publisher does not).
+   * may reach it - leaves that transport's rows to the other pods instead of taking every one into
+   * a failed attempt and its backoff (1.11.0). While paused it takes one probe row, the first
+   * {@code backoff-base} after the pause, each next one twice as long after, up to {@code max} -
+   * and any of the transport's rows due longer than {@code max}, which no pod is sending; one
+   * successful send ends the pause. Per pod and per transport, for publishers that name one ({@link
+   * org.opentmf.outbox.OutboxPublisher#transport}: the library's Kafka publisher does, its HTTP
+   * publisher does not).
    */
   @Getter
   @Setter
@@ -353,9 +353,9 @@ public class OutboxProperties {
   }
 
   /**
-   * The /ops surface's row views (1.11.1, OUTBOX-OPS-PAYLOAD-OWN-PATH-1). A row's payload and its
-   * {@code last_error} are the customer's data: the payload whole, and {@code last_error} as the
-   * failure's message - for an HTTP 4xx or 5xx that is the receiver's whole response body.
+   * The /ops surface's row views (1.11.1). A row's payload and its {@code last_error} are the
+   * customer's data: the payload whole, and {@code last_error} as the failure's message - for an
+   * HTTP 4xx or 5xx that is the receiver's whole response body.
    */
   @Getter
   @Setter
