@@ -1422,7 +1422,7 @@ The library is self-contained for consumer testing — no test-jar needed:
 
 ### Upgrading to 1.11.1
 
-1. **The idempotency key names the row** (OUTBOX-IDEMPOTENCY-KEY-REPEATS-AFTER-RESTORE-1).
+1. **The idempotency key names the row.**
    Up to 1.11.0 the key was `<service>:outbox:<id>`, and an `id` repeats once
    the table is recreated or the database is restored to a point in time: a
    consumer that already held the key dropped the NEW event as a duplicate,
@@ -1645,12 +1645,12 @@ Quality gates on this repo:
 
 ### Sonar suppressions
 
-One rule is suppressed, at nine sites, by decision - **decided by Gökhan 2026-10-16** (decision
-#254), never a quiet workaround:
+One rule is suppressed, at eight sites, by a deliberate decision taken for 1.9.0 - never a quiet
+workaround: the relay's threads catch `Throwable`, not only `Exception`.
 
 | Rule | Where | Why |
 |---|---|---|
-| `java:S1181` (catch `Exception` instead of `Throwable`) | `OutboxRelayWorker.route`, `relayConcurrent`, `relayOrdered`, `send`, `book`; `OutboxConcurrentLane.work`; `OutboxOrderedLane.run`; `OutboxRelay.relayPass` | Ruling F-4 (1.9.0): an `Error` a publisher, a booking hook or a relayed listener throws is a failed attempt like any exception, and nothing may leave a relay, lane or heartbeat thread - up to 1.8.0 an `Error` killed the sending thread, booked nothing, and the row was re-sent every lease, forever (`PoliciesIT` C5). Each method carries `@SuppressWarnings("java:S1181")` with the reason on its line. |
+| `java:S1181` (catch `Exception` instead of `Throwable`) | `OutboxRelayWorker.route`, `relayConcurrent`, `relayOrdered`, `send`, `book`; `OutboxConcurrentLane.work`; `OutboxOrderedLane.run`; `OutboxRelay.relayPass` | Since 1.9.0, an `Error` a publisher, a booking hook or a relayed listener throws is a failed attempt like any exception, and nothing may leave a relay, lane or heartbeat thread - up to 1.8.0 an `Error` killed the sending thread, booked nothing, and the row was re-sent every lease, forever (`PoliciesIT` C5). Each method carries `@SuppressWarnings("java:S1181")` with the reason on its line. |
 
 ### PIT survivor review
 
