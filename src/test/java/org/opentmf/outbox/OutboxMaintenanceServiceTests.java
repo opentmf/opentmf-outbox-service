@@ -25,7 +25,9 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.opentmf.outbox.internal.OutboxAppended;
 import org.opentmf.outbox.internal.OutboxEventRepository;
+import org.opentmf.outbox.internal.OutboxPruned;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.dao.QueryTimeoutException;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -276,6 +278,37 @@ class OutboxMaintenanceServiceTests {
 
     assertThat(result.relayed()).isPositive().isLessThan(50_000L);
     assertThat(result.moreToPrune()).isTrue();
+    verify(repository, never()).deleteCancelledBatch(any(), anyInt());
+  }
+
+  /** Every batch that deleted rows is published for the pruned counter; an empty one is not. */
+  @Test
+  void prune_publishesEachBatchThatDeletedRows_withItsStateAndRows() {
+    when(repository.deleteRelayedBatch(any(OffsetDateTime.class), anyInt()))
+        .thenReturn(5_000, 1_200);
+    when(repository.deleteCancelledBatch(any(OffsetDateTime.class), anyInt())).thenReturn(0);
+
+    service.pruneExpired();
+
+    verify(events, times(1)).publishEvent(new OutboxPruned(OutboxPruned.RELAYED, 5_000));
+    verify(events, times(1)).publishEvent(new OutboxPruned(OutboxPruned.RELAYED, 1_200));
+    verify(events, never()).publishEvent(new OutboxPruned(OutboxPruned.CANCELLED, 0));
+  }
+
+  /**
+   * A batch that fails - a statement cancelled by a timeout - ends the call with that batch's
+   * exception, unchanged; the batches before it were published, so their rows are counted.
+   */
+  @Test
+  void prune_aFailingBatch_endsTheCall_afterTheBatchesBeforeItWereCounted() {
+    QueryTimeoutException cancelled = new QueryTimeoutException("canceling statement");
+    when(repository.deleteRelayedBatch(any(OffsetDateTime.class), anyInt()))
+        .thenReturn(5_000)
+        .thenThrow(cancelled);
+
+    assertThatThrownBy(service::pruneExpired).isSameAs(cancelled);
+
+    verify(events).publishEvent(new OutboxPruned(OutboxPruned.RELAYED, 5_000));
     verify(repository, never()).deleteCancelledBatch(any(), anyInt());
   }
 

@@ -1,5 +1,6 @@
 package org.opentmf.outbox.internal;
 
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PreDestroy;
@@ -18,6 +19,7 @@ import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.opentmf.outbox.internal.OutboxEventRepository.LaneCounts;
 import org.opentmf.outbox.internal.OutboxEventRepository.LaneSince;
 import org.springframework.context.SmartLifecycle;
+import org.springframework.context.event.EventListener;
 
 /**
  * The outbox meter family under the LIBRARY-STABLE names ({@code opentmf.outbox.*}
@@ -51,6 +53,10 @@ import org.springframework.context.SmartLifecycle;
  *   <li>{@code opentmf.outbox.dropped} - counter by {@code destination}: rows given up by a
  *       publisher's DROP policy (never delivered, forensics kept)
  *   <li>{@code opentmf.outbox.attempts} - summary, delivery attempts a relayed row took
+ *   <li>{@code opentmf.outbox.pruned} - counter by {@code state} ({@code relayed} / {@code
+ *       cancelled}: the kind of row the retention prune deleted, not an outcome of the prune),
+ *       incremented by every batch that committed (1.11.1) - so the rows a call deleted are
+ *       counted even when a later batch of the call fails
  * </ul>
  *
  * <p><strong>A scrape never touches the database (1.3.0).</strong> The gauges read the last
@@ -74,9 +80,11 @@ class OutboxMetrics implements SmartLifecycle {
   static final String RELAYED = "opentmf.outbox.relayed";
   static final String DROPPED = "opentmf.outbox.dropped";
   static final String ATTEMPTS = "opentmf.outbox.attempts";
+  static final String PRUNED = "opentmf.outbox.pruned";
   static final String TAG_DESTINATION = "destination";
   static final String TAG_LANE = "lane";
   static final String TAG_TRANSPORT = "transport";
+  static final String TAG_STATE = "state";
 
   /** One lane's last values; {@code null} instant = no open row in the lane. */
   record LaneValues(double pending, double parked, double inFlight, Instant openSince) {
@@ -156,6 +164,9 @@ class OutboxMetrics implements SmartLifecycle {
         .baseUnit("seconds")
         .description("Seconds since the outbox gauges were last refreshed successfully")
         .register(registry);
+    for (String rowState : new String[] {OutboxPruned.RELAYED, OutboxPruned.CANCELLED}) {
+      pruned(rowState); // both series from the start: a dashboard reads 0, not "no data"
+    }
   }
 
   /** How long a stop waits for a refresh in flight ({@code shutdown-join}). */
@@ -312,6 +323,19 @@ class OutboxMetrics implements SmartLifecycle {
   public void recordRelayed(String destination, int attempts) {
     registry.counter(RELAYED, TAG_DESTINATION, destination).increment();
     registry.summary(ATTEMPTS).record(attempts);
+  }
+
+  /** Books one committed prune batch: its rows, on the counter of their state (1.11.1). */
+  @EventListener
+  public void recordPruned(OutboxPruned batch) {
+    pruned(batch.state()).increment(batch.rows());
+  }
+
+  private Counter pruned(String rowState) {
+    return Counter.builder(PRUNED)
+        .tag(TAG_STATE, rowState)
+        .description("Outbox rows deleted by the retention prune, by the state they had")
+        .register(registry);
   }
 
   /** Seconds since the last successful refresh; NaN before the first. */

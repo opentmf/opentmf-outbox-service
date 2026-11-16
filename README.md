@@ -685,7 +685,7 @@ opentmf:
 | `claim-pause.after-failures` | `int` | `5` | Failed sends over one transport in a row (the publisher says the transport was out of reach), with no success between them, after which this pod leaves that transport's rows to the other pods (1.11.0; see "A pod whose transport is down"). `0` switches the pause off. |
 | `claim-pause.max` | `Duration` | `1m` | While paused, the pod takes one probe row: the first `backoff-base` after the pause, each next one twice as long after the one before, never longer apart than this. A paused transport's row due for longer than this is taken anyway - no pod is sending it. Positive (validated at boot). |
 | `maintenance.batch-size` | `int`    | `5000`  | Rows per batch of a bulk operation (prune, unpark by filter); each batch is its own transaction, no entity loaded. |
-| `maintenance.time-budget` | `Duration` | `10s` | One bulk call stops after this; the answer says `moreToPrune` / `moreToUnpark` and the caller calls again. |
+| `maintenance.time-budget` | `Duration` | `10s` | One bulk call runs batches until none are left or this is spent - it is not one batch per call; the answer says `moreToPrune` / `moreToUnpark` and the caller calls again. Set it below any statement or call limit on the prune's path. |
 | `ops-endpoints`  | `boolean`  | `true`  | `false` removes the library's `/ops` controller entirely. A `@ConditionalOnProperty` key read at boot, not a bound field. |
 | `ops.sensitive-in-views` | `boolean` | `true` | Whether the row views (inspect and the three lists) carry the row's sensitive text (1.11.1). `false`: `payload` null and `lastError` the failure's kind only, the full text on `GET /ops/outbox/{id}/payload` - see "Ops endpoints". |
 
@@ -734,6 +734,7 @@ reads the relayed history.
 | `opentmf.outbox.relayed`   | counter | Successful relays, tagged by `destination`         |
 | `opentmf.outbox.dropped`   | counter | Rows given up by a publisher's DROP policy, tagged by `destination` (never counted as relayed) |
 | `opentmf.outbox.attempts`  | summary | Delivery attempts a relayed row took               |
+| `opentmf.outbox.pruned`    | counter by `state` | Rows the retention prune deleted (1.11.1), every committed batch's rows as it commits - so a call that ends in an error still has its earlier batches counted. `state` is the kind of ROW deleted, `relayed` or `cancelled` (a row withdrawn by `cancel`), not an outcome of the prune: `state="cancelled"` does not count cancelled prunes |
 | `opentmf.outbox.relay`     | timer   | The `outbox relay` span's observation (1.11.1), tagged by `outbox.transport` and `error`: recorded only when the application's `ObservationRegistry` has a meter handler, and only for rows that stored a `traceparent` - a trace aid, not a throughput figure |
 
 ## Usage
@@ -1131,9 +1132,35 @@ binding refusal, a 400.
   and its rollback does not undo them. While a batch runs, the caller's connection
   stays checked out beside the batch's, so the pool needs one connection to spare. The
   same holds for the unpark by filter.
-- **Bounded.** A call stops after `maintenance.time-budget` and answers `moreToPrune: true`.
-  The CronJob loops while it is true, and a request thread never works through the
-  whole backlog.
+- **Bounded twice** (the two facts adopters get wrong):
+  - ONE STATEMENT deletes at most `opentmf.outbox.maintenance.batch-size` rows (default 5000).
+  - ONE CALL (`pruneExpired()`, `prune()`, `POST /ops/outbox/maintenance/prune`) is NOT one
+    batch: it runs batches until none are left or `opentmf.outbox.maintenance.time-budget`
+    (default 10 s) is spent, then answers `moreToPrune: true`. The CronJob loops while it is
+    true, and a request thread never works through the whole backlog.
+  - **A service whose statement or call limit on the prune's path is under the budget** (a
+    `statement_timeout`, a query timeout, a timeout around the call) **must set
+    `opentmf.outbox.maintenance.time-budget` below that limit** - and, if its limit is per
+    statement, keep one batch well under it (`opentmf.outbox.maintenance.batch-size`).
+- **A batch the database cancels** (a `statement_timeout`, a cancel: SQLSTATE 57014) ends the
+  call with Spring's `org.springframework.dao.QueryTimeoutException`. That batch is rolled back
+  whole (its own transaction); the batches before it in the same call stay deleted, and the
+  next call continues with the oldest expired rows. The call answers no count then: the rows it
+  did delete are on the `opentmf.outbox.pruned` counter (1.11.1), every committed batch's rows
+  as it commits. `OutboxPruneBoundedIT` pins all of this.
+- **Planned on the table's statistics.** With statistics (autovacuum's, or an `ANALYZE`) a
+  batch takes its rows from `ix_outbox_relayed_on` / `ix_outbox_cancelled_on`, never from a scan
+  of the table: in index order (about 70 ms per 5,000-row batch from 200,000 to 1,000,000 rows,
+  whatever the physical order of the rows), or - where the batch is a large share of the
+  expired rows - by reading just those rows through the index and sorting them in memory
+  (`OutboxPrunePlanIT`, both plan modes). A table that has NEVER been analysed is different:
+  PostgreSQL's custom plan then scans the table and sorts the whole expired backlog for every
+  batch - measured 0.12 s at 10,000 rows, 0.4 s at 100,000, 1.8 s at 500,000, 2.7 s at 700,000
+  (PostgreSQL 18.1). Autovacuum analyses a table within about a minute of a bulk load (31 s
+  measured for 200,000 rows), so this meets a prune that runs right after a bulk load or a
+  logical restore, or a database with autovacuum off. **After such a load, run
+  `ANALYZE outbox` before the first prune**; a smaller `maintenance.batch-size` (500) also
+  keeps the index without statistics. The library sets no plan mode and runs no `ANALYZE`.
 - **Measured.** 305,000 expired rows in one 479 ms call in the IT. A 5,000-row batch on
   a 5,000,000-row table takes about 70 ms.
 - **What it costs.** `ix_outbox_relayed_on` is about as large as the primary key:

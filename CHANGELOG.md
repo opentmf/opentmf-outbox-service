@@ -4,6 +4,20 @@
 
 ### Added
 
+- **The rows the retention prune deletes are counted as each batch commits**
+  (OTMF-OUTBOX-PRUNE-STATEMENT-BOUNDED-AND-PLANNED-1): a new counter `opentmf.outbox.pruned`,
+  tagged `state` = `relayed` | `cancelled` - the kind of row deleted, not an outcome of the prune.
+  A prune call whose later batch fails (a statement cancelled by a timeout) answers with the
+  exception and no count; the rows its earlier batches deleted are on the counter. Additive: one
+  new meter and an internal event; no signature, statement, default, result or existing meter
+  changed. The README's "The prune at scale" now says what bounds a call (one statement at most
+  `maintenance.batch-size` rows; one call runs batches until `maintenance.time-budget` is spent -
+  not one batch per call; a service with a statement or call limit under the budget sets the
+  budget below it), what a cancelled batch leaves (rolled back whole, the earlier batches
+  deleted, Spring's `QueryTimeoutException`), and that a batch's plan needs the table's
+  statistics (on a never-analysed table PostgreSQL sorts the whole expired backlog per batch:
+  `ANALYZE outbox` after a bulk load or a logical restore).
+
 - **A row's sensitive text has a path of its own, and the views can leave it out**
   (OUTBOX-OPS-PAYLOAD-OWN-PATH-1). `GET /ops/outbox/{id}/payload` serves a row's stored payload
   and its full `lastError` - the failure's message, which for an HTTP 4xx or 5xx carries the

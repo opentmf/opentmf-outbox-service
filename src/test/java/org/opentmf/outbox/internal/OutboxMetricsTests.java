@@ -201,6 +201,28 @@ class OutboxMetricsTests {
     new OutboxMetrics(new SimpleMeterRegistry(), repository, Duration.ofSeconds(1)).stop();
   }
 
+  /** Both series exist from the start (0, not "no data"); each batch adds its rows to its state. */
+  @Test
+  void recordPruned_addsEachBatchsRows_toTheCounterOfTheirState() {
+    assertThat(prunedCount(OutboxPruned.RELAYED)).isZero();
+    assertThat(prunedCount(OutboxPruned.CANCELLED)).isZero();
+
+    metrics.recordPruned(new OutboxPruned(OutboxPruned.RELAYED, 5_000));
+    metrics.recordPruned(new OutboxPruned(OutboxPruned.RELAYED, 1_200));
+    metrics.recordPruned(new OutboxPruned(OutboxPruned.CANCELLED, 7));
+
+    assertThat(prunedCount(OutboxPruned.RELAYED)).isEqualTo(6_200d);
+    assertThat(prunedCount(OutboxPruned.CANCELLED)).isEqualTo(7d);
+  }
+
+  private double prunedCount(String state) {
+    return registry
+        .get(OutboxMetrics.PRUNED)
+        .tag(OutboxMetrics.TAG_STATE, state)
+        .counter()
+        .count();
+  }
+
   @Test
   void recordDropped_countsPerDestination_neverAsRelayed() {
     metrics.recordDropped("hub");
