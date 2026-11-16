@@ -20,6 +20,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.opentmf.outbox.OutboxEvent;
@@ -259,6 +260,26 @@ class OutboxSendHeartbeatTests {
       heartbeat.stop();
       heartbeat.finished(row);
     }
+  }
+
+  /** The ticker is a daemon thread, as the relay's, the lanes' and the metrics' are. */
+  @Test
+  void theTicker_runsOnADaemonThread() throws Exception {
+    AtomicReference<Thread> ticker = new AtomicReference<>();
+    CountDownLatch ticked = new CountDownLatch(1);
+    heartbeat.onBeat(
+        () -> {
+          ticker.compareAndSet(null, Thread.currentThread());
+          ticked.countDown();
+        });
+    heartbeat.start();
+    try {
+      assertThat(ticked.await(5, TimeUnit.SECONDS)).isTrue();
+    } finally {
+      heartbeat.stop();
+    }
+    assertThat(ticker.get().getName()).isEqualTo("opentmf-outbox-heartbeat");
+    assertThat(ticker.get().isDaemon()).isTrue(); // never holds the JVM open
   }
 
   /**
