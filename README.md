@@ -1586,7 +1586,15 @@ Quality gates on this repo:
   execution merged, checked under `-Pinvariants`; generated Querydsl classes
   excluded from the denominator.
 - SonarQube (`mvn -Psonar clean verify` against a local server on
-  `localhost:9000`, token via `SONAR_TOKEN`): zero open findings is the bar.
+  `localhost:9000`): zero open findings is the bar. The token goes ONLY through the
+  `SONAR_TOKEN` environment variable, never as `-Dsonar.token=` on a command line (it shows
+  in the process list and in any log that echoes the command).
+- **Snapshot normalization is off** (`.mvn/maven.config`:
+  `-Daether.artifactResolver.snapshotNormalization=false`, Maven 3.9.x - the enforcer's
+  range). A resolved timestamped snapshot stays its own file instead of being copied over the
+  shared `<artifactId>-<base>-SNAPSHOT.jar`, which a second build beside this one would
+  rewrite under the first one's running JVM. The enforcer stops every build at `validate`
+  when the line is missing or overridden.
 - **Prerequisite: a JDK 21+ Maven toolchain.** The ITs run twice over the
   lane: on the build JDK (17, platform threads), and `OutboxHttpLaneVirtualIT`
   in failsafe's `virtual-threads-it` execution, forked on a JDK 21+ toolchain

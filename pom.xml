@@ -438,6 +438,19 @@
                   <version>[3.9,3.10)</version>
                   <message>This library builds with Maven 3.9.x.</message>
                 </requireMavenVersion>
+                <!-- ESTATE-SNAPSHOT-NORMALIZATION-OFF-IN-EVERY-MAVEN-REPOSITORY-1: .mvn/maven.config
+                     turns the resolver's snapshot normalization off, so a resolved timestamped
+                     snapshot stays its own file and is never copied over the shared
+                     <artifactId>-<base>-SNAPSHOT.jar that a second build beside this one rewrites
+                     (measured on Maven 3.9.16 / resolver 1.9.27: with the line only the
+                     timestamped jar is written, without it the base file too). Every build of
+                     this repository - the gate, the snapshot deploy, the release - stops here at
+                     validate when the line is missing or overridden. -->
+                <requireProperty>
+                  <property>aether.artifactResolver.snapshotNormalization</property>
+                  <regex>false</regex>
+                  <message>Snapshot normalization must be off: .mvn/maven.config must carry -Daether.artifactResolver.snapshotNormalization=false (and no -D on the command line may set it to true).</message>
+                </requireProperty>
               </rules>
             </configuration>
           </execution>
@@ -563,8 +576,9 @@
     </profile>
     <!-- Local SonarQube analysis as part of the normal build: mvn -Psonar clean verify.
          sonar.host.url MUST be explicit (SonarScanner 5.x targets SonarQube Cloud when
-         absent). Credentials via -Dsonar.token=... or the SONAR_TOKEN environment
-         variable, never the pom. Coverage: the scanner auto-discovers
+         absent). The token ONLY through the SONAR_TOKEN environment variable: never as
+         -Dsonar.token on a command line (it shows in the process list and in any log that
+         echoes the command), never in the pom. Coverage: the scanner auto-discovers
          target/site/jacoco/jacoco.xml; xmlReportPaths is intentionally not set. The
          scan binds to verify, after the jacoco report - see the report execution. -->
     <profile>
