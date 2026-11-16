@@ -169,6 +169,15 @@
     (a 30 s bound with a 29 s read timeout: 7.5 s + 29 s). The rejected value names the figures.
     Every configuration that leaves both timeouts unset boots as before.
 
+### Build (contributors)
+
+- **Snapshot normalization is off for every build of this repository**: `.mvn/maven.config` carries
+  `-Daether.artifactResolver.snapshotNormalization=false`, and the enforcer stops a build at
+  `validate` when the line is missing or overridden. Two builds beside each other no longer
+  rewrite each other's `-SNAPSHOT.jar` base file. The jar is unchanged.
+- The local SonarQube token goes only through the `SONAR_TOKEN` environment variable, never as
+  `-Dsonar.token` on a command line (pom comment and README).
+
 ## 1.11.0 - 2026-11-03
 
 A pod that cannot reach its transport leaves that transport's rows to the pods that can. Two
