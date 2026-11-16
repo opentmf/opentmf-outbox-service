@@ -180,7 +180,10 @@
 - Every dependency and plugin is current (OTMF-OUTBOX-BUMPS-BEFORE-THE-BATCH-1): tmf630-toolkit
   3.5.2 (an optional dependency) and pitest-maven 1.30.2. The pitest 1.19.6 hold is lifted. PIT
   now runs without incremental history - from 1.20 it needs the commercial arcmutate plugin, and
-  the bare `withHistory` flag fails the run - so every run is a full run.
+  the bare `withHistory` flag fails the run - so every run is a full run. On 1.30.2 the daemon flag
+  of the relay's, the metrics' and the ORDERED lane's thread factories is a killed mutant, and a
+  new unit test asserts that the heartbeat's thread is a daemon too: the README's survivor review
+  no longer lists these four.
 
 ## 1.11.0 - 2026-11-03
 
