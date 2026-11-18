@@ -1639,9 +1639,9 @@ Quality gates on this repo:
   `-Dit.test=LeasesIT#b4*`; B5 with `-Dit.clock-corrected=false` shows the
   1.8.0 clock.
 - PIT (`mvn -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage`)
-  on the pinned 1.19.6 hold with incremental history (1.20+ moved free
-  `withHistory` behind the commercial arcmutate plugin). No mutation threshold:
-  survivor review is the unit of work.
+  on pitest-maven 1.30.2 with pitest-junit5-plugin 1.2.3, without incremental history:
+  from 1.20 history needs the commercial arcmutate plugin, so every run is a full run.
+  No mutation threshold: survivor review is the unit of work.
 
 ### Sonar suppressions
 
@@ -1672,9 +1672,6 @@ Accepted survivors, each reviewed:
 | `OutboxConcurrentLane.work` | removed the `startWorkers()` re-check after the release | Race-only: a send queued between a worker's last empty poll and its release. `noQueuedSend_isEverStranded_whileWorkersComeAndGo` exercises the window under load; a unit test cannot force it |
 | `OutboxRelay.stop` | awaitTermination conditional | Shutdown-timing leg; a kill needs a grace-long hanging-task test for no insight |
 | `OutboxRelay.poke` | removed `passQueued.set(false)` after a rejection | Reachable only after shutdown, when no further pass can run anyway |
-| `OutboxRelay` thread factory | removed `setDaemon` | Asserted by `OutboxRelayTests` in every normal run; PIT's per-line selection misses the factory-lambda mapping |
-| `OutboxMetrics` thread factory | removed `setDaemon` | Asserted by `OutboxMetricsTests` (the refresher thread is a daemon); same factory-lambda mapping miss |
-| `OutboxOrderedLane` thread factory | removed `setDaemon` | Asserted by `OutboxOrderedLaneTests` (the ORDERED lane's thread is a daemon); same factory-lambda mapping miss |
 | `OutboxRelay.stop` / `OutboxOrderedLane.close` | removed `interrupt()` after an interrupted wait (no coverage) | Reached only when the stopping thread is itself interrupted mid-wait; restores the flag for the caller |
 | `OutboxClock.measure` / `measureIfDue` / `warnOnSkew` | the fastest-trip, uncertainty, re-measure and skew boundaries; the negated "back within" message | Equivalent at the exact nanosecond; the message is log-only |
 | `OutboxProperties.sendBound` / `httpReadTimeout`, `KafkaOutboxPublisher.longer`, `OutboxSendHeartbeat.bound` | `>=` vs `>` | Equivalent: equal durations give the same answer either way |
@@ -1685,7 +1682,6 @@ Accepted survivors, each reviewed:
 | `OutboxRelay.start` / `stop`, `OutboxRelayWorker.send` | removed the send heartbeat's wiring (`onBeat`, `start`, `stop`, `started`, `finished`) | The heartbeat's own tests use it directly; the wiring is the invariants suite's (B1, B4, K1 assert renewals, the bound and the give-back) - PIT runs unit tests only |
 | `OutboxRelayWorker.renew` | a lapsed ORDERED row's `return true` → `false` | Harmless: the booking then renews the NEXT row one turn early - nothing is sent out of turn, and the lapsed row is still counted, never sent |
 | `OutboxSendHeartbeat.finished` | removed `unlock` | Equivalent: a finished row leaves the sending set and is never locked by the heartbeat again |
-| `OutboxSendHeartbeat` thread factory | removed `setDaemon` | As the other factories: asserted where the thread runs, missed by PIT's per-line mapping |
 | `OutboxHttpClients` | the Jetty and Reactor branches (no coverage); the clients' read timeouts; `present` → false | Neither client is on the unit-test classpath, by design; Apache's (picked here since 1.11.1) and the JDK's connect timeouts are the stalled-connect cells of `OutboxHttpClientsTests`, their read timeouts the suite's F4 on both clients |
 
 `NO_COVERAGE` entries (the Kafka publisher bean method) are exercised by the

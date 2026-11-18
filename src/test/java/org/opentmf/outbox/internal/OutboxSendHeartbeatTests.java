@@ -1,6 +1,7 @@
 package org.opentmf.outbox.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.doReturn;
@@ -20,6 +21,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.opentmf.outbox.OutboxEvent;
@@ -261,6 +263,26 @@ class OutboxSendHeartbeatTests {
     }
   }
 
+  /** The ticker is a daemon thread, as the relay's, the lanes' and the metrics' are. */
+  @Test
+  void theTicker_runsOnADaemonThread() throws Exception {
+    AtomicReference<Thread> ticker = new AtomicReference<>();
+    CountDownLatch ticked = new CountDownLatch(1);
+    heartbeat.onBeat(
+        () -> {
+          ticker.compareAndSet(null, Thread.currentThread());
+          ticked.countDown();
+        });
+    heartbeat.start();
+    try {
+      assertThat(ticked.await(5, TimeUnit.SECONDS)).isTrue();
+    } finally {
+      heartbeat.stop();
+    }
+    assertThat(ticker.get().getName()).isEqualTo("opentmf-outbox-heartbeat");
+    assertThat(ticker.get().isDaemon()).isTrue(); // never holds the JVM open
+  }
+
   /**
    * 1.11.1: a stop waits for the tick in flight - its clock measure, its renewal and their
    * connection - before it returns. Up to 1.11.0 it returned at once and the tick went on while
@@ -290,5 +312,79 @@ class OutboxSendHeartbeatTests {
 
     assertThat(tickEnded).as("the tick in flight ended before the stop returned").isTrue();
     assertThat(alive).isEmpty();
+  }
+
+  /**
+   * A tick still in flight at the stop's deadline is interrupted, and the stop names the
+   * heartbeat's thread as still running - the relay's warning lists it. The tick ignores the
+   * interrupt until the test lets it go, so the outcome does not depend on how fast the machine is.
+   */
+  @Test
+  void aTickPastTheDeadline_isInterruptedAndReportedAlive() throws Exception {
+    CountDownLatch measuring = new CountDownLatch(1);
+    CountDownLatch interruptSeen = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    OutboxSendHeartbeat held =
+        new OutboxSendHeartbeat(
+            repository,
+            TransactionOperations.withoutTransaction(),
+            new OutboxClock(
+                Clock.systemUTC(),
+                () -> {
+                  measuring.countDown();
+                  holdUntil(release, interruptSeen); // a round trip that ignores interrupts
+                  return Instant.now();
+                }),
+            Duration.ofSeconds(10));
+    held.start();
+    try {
+      assertThat(measuring.await(5, TimeUnit.SECONDS)).isTrue();
+
+      List<String> alive = held.stopUntil(System.nanoTime() + Duration.ofMillis(200).toNanos());
+
+      assertThat(alive).containsExactly("opentmf-outbox-heartbeat");
+      assertThat(interruptSeen.await(5, TimeUnit.SECONDS))
+          .as("the tick past the deadline was interrupted")
+          .isTrue();
+    } finally {
+      release.countDown();
+    }
+    await().atMost(Duration.ofSeconds(5)).until(() -> held.alive().isEmpty());
+  }
+
+  /** Waits for {@code release} (at most 10 s), counting every interrupt and going on waiting. */
+  private static void holdUntil(CountDownLatch release, CountDownLatch interruptSeen) {
+    long end = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+    while (release.getCount() > 0 && System.nanoTime() < end) {
+      try {
+        release.await(end - System.nanoTime(), TimeUnit.NANOSECONDS);
+      } catch (InterruptedException ex) {
+        interruptSeen.countDown(); // ignored, as a blocking read ignores it
+      }
+    }
+  }
+
+  /** The heartbeat's thread is named while it runs, and only then. */
+  @Test
+  void alive_namesTheTickerOnlyWhileItRuns() {
+    assertThat(heartbeat.alive()).as("before any start").isEmpty();
+
+    heartbeat.start();
+    assertThat(heartbeat.alive()).containsExactly("opentmf-outbox-heartbeat");
+
+    assertThat(heartbeat.stopUntil(System.nanoTime() + Duration.ofSeconds(10).toNanos())).isEmpty();
+    assertThat(heartbeat.alive()).as("after the stop").isEmpty();
+  }
+
+  /** The test's stop ends the ticker; before any start it has nothing to stop. */
+  @Test
+  void aStop_endsTheTicker() {
+    heartbeat.stop(); // before any start
+
+    heartbeat.start();
+    assertThat(heartbeat.alive()).containsExactly("opentmf-outbox-heartbeat");
+    heartbeat.stop();
+
+    await().atMost(Duration.ofSeconds(5)).until(() -> heartbeat.alive().isEmpty());
   }
 }
