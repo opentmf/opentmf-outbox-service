@@ -141,7 +141,8 @@
   scheme, host and port only. A row without a stored `traceparent` is relayed exactly as before;
   the plain HTTP client, which has no observation, still forwards the stored header as it is.
   Where the application's `ObservationRegistry` has a meter handler, the span is also the timer
-  `opentmf.outbox.relay`, for those rows only.
+  `opentmf.outbox.relay`, for those rows only: it times the row's round (renewal, send, booking),
+  not the send alone.
 - **The HTTP publisher's plain client ends within the send bound, the connect included**
   (OUTBOX-HTTP-CONNECT-TIMEOUT-WITHIN-SEND-BOUND-1). Its read timeout was kept below the bound
   (the larger of `lease` and `send-timeout`), but its connect timeout only had to be positive: a
