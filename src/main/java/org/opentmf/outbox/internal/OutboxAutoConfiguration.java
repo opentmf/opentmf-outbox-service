@@ -7,6 +7,7 @@ import java.util.List;
 import javax.sql.DataSource;
 import org.opentmf.outbox.OutboxClientProfileResolver;
 import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxFailureText;
 import org.opentmf.outbox.OutboxMaintenanceService;
 import org.opentmf.outbox.OutboxProperties;
 import org.opentmf.outbox.OutboxPublisher;
@@ -183,7 +184,8 @@ public class OutboxAutoConfiguration {
       OutboxOrderedLane orderedLane,
       OutboxClock clock,
       OutboxSendHeartbeat heartbeat,
-      ObjectProvider<ObservationRegistry> observationRegistry) {
+      ObjectProvider<ObservationRegistry> observationRegistry,
+      OutboxFailureText failureText) {
     // the post-relay seam: zero or more consumer beans, invoked in bean order inside the
     // booking transaction that stamps relayed_on (see OutboxRelayedListener)
     OutboxRelayWorker worker =
@@ -202,7 +204,19 @@ public class OutboxAutoConfiguration {
             heartbeat);
     // each row's round (renewal, send, booking) in the relay span of a row with a traceparent
     worker.observeRounds(relayObservation(observationRegistry));
+    // a failed attempt's last_error: the consumer's text, else the text up to 1.11.0
+    worker.describeFailures(failureText);
     return worker;
+  }
+
+  /**
+   * The text a failed attempt stores as its row's {@code last_error} (1.11.1): exactly the text up
+   * to 1.11.0, unless the consumer declares its own {@link OutboxFailureText}.
+   */
+  @Bean
+  @ConditionalOnMissingBean
+  OutboxFailureText outboxFailureText() {
+    return OutboxFailureText.DEFAULT;
   }
 
   /**

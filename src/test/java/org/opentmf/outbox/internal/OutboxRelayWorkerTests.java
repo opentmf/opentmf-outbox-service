@@ -28,6 +28,7 @@ import io.micrometer.observation.Observation;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.sdk.trace.data.SpanData;
 import jakarta.persistence.Column;
+import java.lang.reflect.Method;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -57,12 +58,14 @@ import org.mockito.ArgumentCaptor;
 import org.opentmf.outbox.OutboxBooking;
 import org.opentmf.outbox.OutboxBooking.Outcome;
 import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxFailureText;
 import org.opentmf.outbox.OutboxLeaseLapsedException;
 import org.opentmf.outbox.OutboxProperties;
 import org.opentmf.outbox.OutboxPublisher;
 import org.opentmf.outbox.OutboxPublisher.ExhaustionOutcome;
 import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.opentmf.outbox.OutboxRelayedListener;
+import org.opentmf.outbox.OutboxRowView;
 import org.opentmf.outbox.OutboxSendError;
 import org.opentmf.outbox.TerminalOutboxException;
 import org.opentmf.outbox.fixture.TestTracing;
@@ -2484,5 +2487,217 @@ class OutboxRelayWorkerTests {
     assertThat(relay.getStatus().getStatusCode()).isEqualTo(StatusCode.ERROR);
     assertThat(table.get(1L).getAttempts()).isEqualTo(1);
     assertThat(observedAtBooking).containsEntry(1L, OutboxRelayObservation.NAME);
+  }
+
+  // ------------------------------------------------------------ the service's failure text
+
+  /** A peer's answer the service keeps out of its rows and logs. */
+  private static final String PEER_BODY = "peer-body-4711";
+
+  /** The service's text: the failure's kind and a fixed word, never the failure's message. */
+  private static final OutboxFailureText FIXED_WORD =
+      (row, failure) -> OutboxFailureText.typed(failure, "refused by the peer");
+
+  /** The relay's own log lines, captured while {@code run} runs. */
+  private static List<ILoggingEvent> relayLog(Runnable run) {
+    ListAppender<ILoggingEvent> log = new ListAppender<>();
+    log.start();
+    Logger logger = (Logger) LoggerFactory.getLogger(OutboxRelayWorker.class);
+    logger.addAppender(log);
+    try {
+      run.run();
+    } finally {
+      logger.detachAppender(log);
+    }
+    return log.list;
+  }
+
+  /** The kind a view without the sensitive text shows for a stored {@code lastError}. */
+  private static String kindOf(String lastError) {
+    try {
+      Method kindOf = OutboxRowView.class.getDeclaredMethod("kindOf", String.class);
+      kindOf.setAccessible(true);
+      return (String) kindOf.invoke(null, lastError);
+    } catch (ReflectiveOperationException ex) {
+      throw new IllegalStateException(ex);
+    }
+  }
+
+  private static void noPeerBody(List<ILoggingEvent> log) {
+    assertThat(log).isNotEmpty();
+    assertThat(log)
+        .extracting(ILoggingEvent::getFormattedMessage)
+        .noneMatch(line -> line.contains(PEER_BODY));
+  }
+
+  @Test
+  void aRetriedRow_storesTheServicesText_andItsRetryLineCarriesNoPeerBody() {
+    worker.describeFailures(FIXED_WORD);
+    OutboxEvent event = pending(1L, 0);
+    doThrow(new RuntimeException("503 from the peer: " + PEER_BODY)).when(publisher).deliver(event);
+
+    List<ILoggingEvent> log = relayLog(this::relay);
+
+    assertThat(event.getLastError()).isEqualTo("RuntimeException: refused by the peer");
+    assertThat(event.getParkedOn()).isNull();
+    assertThat(log)
+        .extracting(ILoggingEvent::getFormattedMessage)
+        .anyMatch(line -> line.endsWith("RuntimeException: refused by the peer"));
+    noPeerBody(log);
+  }
+
+  @Test
+  void aParkedRow_storesTheServicesText_andItsParkLineCarriesNoPeerBody() {
+    worker.describeFailures(FIXED_WORD);
+    OutboxEvent event = pending(1L, 0);
+    doThrow(new TerminalOutboxException("400 from the peer: " + PEER_BODY))
+        .when(publisher)
+        .deliver(event);
+
+    List<ILoggingEvent> log = relayLog(this::relay);
+
+    assertThat(event.getParkedOn()).isNotNull();
+    assertThat(event.getLastError()).isEqualTo("TerminalOutboxException: refused by the peer");
+    assertThat(log).extracting(ILoggingEvent::getLevel).contains(Level.ERROR);
+    noPeerBody(log);
+  }
+
+  @Test
+  void aDroppedRow_storesTheServicesText_andItsDropLineCarriesNoPeerBody() {
+    worker.describeFailures(FIXED_WORD);
+    when(publisher.maxAttempts(any())).thenReturn(1);
+    when(publisher.onExhausted(any())).thenReturn(ExhaustionOutcome.DROP);
+    OutboxEvent event = pending(1L, 0);
+    doThrow(new RuntimeException("410 from the peer: " + PEER_BODY)).when(publisher).deliver(event);
+
+    List<ILoggingEvent> log = relayLog(this::relay);
+
+    assertThat(event.getRelayedOn()).isNotNull();
+    assertThat(event.getLastError()).isEqualTo("RuntimeException: refused by the peer");
+    noPeerBody(log);
+  }
+
+  @Test
+  void aRowCancelledInFlightThatFails_storesTheServicesText_andItsLineCarriesNoPeerBody() {
+    worker.describeFailures(FIXED_WORD);
+    OutboxEvent event = pending(1L, 0);
+    doAnswer(
+            inv -> {
+              event.setCancelledOn(OffsetDateTime.now());
+              throw new RuntimeException("503 from the peer: " + PEER_BODY);
+            })
+        .when(publisher)
+        .deliver(event);
+
+    List<ILoggingEvent> log = relayLog(this::relay);
+
+    assertThat(bookings).extracting(OutboxBooking::outcome).containsExactly(Outcome.CANCELLED);
+    assertThat(event.getLastError()).isEqualTo("RuntimeException: refused by the peer");
+    noPeerBody(log);
+  }
+
+  @Test
+  void anUnroutableRow_storesTheServicesText() {
+    worker.describeFailures(FIXED_WORD);
+    when(publisher.supports(any())).thenReturn(false);
+    OutboxEvent event = pending(1L, properties.getMaxAttempts() - 1);
+
+    relay();
+
+    assertThat(event.getParkedOn()).isNotNull();
+    assertThat(event.getLastError()).isEqualTo("IllegalStateException: refused by the peer");
+  }
+
+  @Test
+  void theServicesText_isHandedTheRowsFacts_readOnly_withThisAttemptCounted() {
+    List<OutboxFailureText.Row> handed = new CopyOnWriteArrayList<>();
+    worker.describeFailures(
+        (row, failure) -> {
+          handed.add(row);
+          return "RuntimeException: seen";
+        });
+    OutboxEvent event = pending(1L, 2);
+    event.setAggregateType("Dispatch");
+    event.setAggregateId("d-1");
+    event.setEventType("DispatchStaged");
+    doThrow(new RuntimeException(PEER_BODY)).when(publisher).deliver(event);
+
+    relay();
+
+    assertThat(handed)
+        .containsExactly(
+            new OutboxFailureText.Row(
+                1L, "Dispatch", "d-1", "DispatchStaged", "comm.delivery.v1", 3));
+    assertThat(event.getAttempts()).isEqualTo(3);
+  }
+
+  @Test
+  void aNullOrBlankText_storesTheFailuresTypeNameAlone() {
+    OutboxEvent nothing = pending(1L, 0);
+    OutboxEvent blank = pending(2L, 0);
+    worker.describeFailures((row, failure) -> row.id() == 1L ? null : "  ");
+    doThrow(new IllegalStateException(PEER_BODY)).when(publisher).deliver(any());
+
+    relay();
+
+    assertThat(nothing.getLastError()).isEqualTo("IllegalStateException");
+    assertThat(blank.getLastError()).isEqualTo("IllegalStateException");
+  }
+
+  @Test
+  void aTextThatThrows_storesTheFailuresTypeNameAlone_logsNoMessage_andTheRowIsBooked() {
+    worker.describeFailures(
+        (row, failure) -> {
+          throw new IllegalArgumentException("the hook broke on " + PEER_BODY);
+        });
+    OutboxEvent event = pending(1L, 0);
+    doThrow(new RuntimeException("503 from the peer: " + PEER_BODY)).when(publisher).deliver(event);
+
+    List<ILoggingEvent> log = relayLog(this::relay);
+
+    assertThat(event.getAttempts()).isEqualTo(1);
+    assertThat(event.getLastError()).isEqualTo("RuntimeException");
+    assertThat(event.getClaimedUntil()).isNull();
+    assertThat(event.getNextAttemptOn()).isAfter(OffsetDateTime.now());
+    assertThat(rolledBack).isZero();
+    assertThat(log)
+        .extracting(ILoggingEvent::getFormattedMessage)
+        .anyMatch(line -> line.contains(IllegalArgumentException.class.getName()));
+    noPeerBody(log);
+  }
+
+  @Test
+  void anOversizedServiceText_isCutToTheColumnsBound() {
+    worker.describeFailures((row, failure) -> "RuntimeException: " + "x".repeat(10_000));
+    OutboxEvent event = pending(1L, 0);
+    doThrow(new RuntimeException("boom")).when(publisher).deliver(event);
+
+    relay();
+
+    assertThat(event.getLastError()).hasSize(OutboxRelayWorker.LAST_ERROR_MAX_LENGTH);
+  }
+
+  @Test
+  void aServiceTextWithoutAThrowablesName_isBooked_andItsViewShowsUnclassified() {
+    worker.describeFailures((row, failure) -> "the peer refused");
+    OutboxEvent event = pending(1L, 0);
+    doThrow(new RuntimeException(PEER_BODY)).when(publisher).deliver(event);
+
+    relay();
+
+    assertThat(event.getAttempts()).isEqualTo(1);
+    assertThat(event.getLastError()).isEqualTo("the peer refused");
+    assertThat(kindOf(event.getLastError())).isEqualTo("unclassified");
+  }
+
+  @Test
+  void aTypedServiceText_keepsTheFailuresKindInTheView() {
+    worker.describeFailures(FIXED_WORD);
+    OutboxEvent event = pending(1L, 0);
+    doThrow(new TerminalOutboxException(PEER_BODY)).when(publisher).deliver(event);
+
+    relay();
+
+    assertThat(kindOf(event.getLastError())).isEqualTo("TerminalOutboxException");
   }
 }
