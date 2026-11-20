@@ -1,7 +1,9 @@
 package org.opentmf.outbox;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
+import io.micrometer.observation.Observation;
 import io.micrometer.observation.ObservationRegistry;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.sdk.trace.data.SpanData;
@@ -10,6 +12,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.fixture.TestTracing;
@@ -37,7 +40,8 @@ import org.testcontainers.kafka.KafkaContainer;
  * its trace id, not the stored span - and the row without one must start a trace of its own, as in
  * 1.11.0. Up to 1.11.0 the first record carried a new root as well. On both lanes and with a plain
  * and a transactional producer: the relay span must be current on the thread that sends, whichever
- * that is.
+ * that is. The span covers the row's round (OUTBOX-A-RELAY-PASS-THAT-MOVES-ROWS-IS-ONE-TRACE-1):
+ * the booking - seen by a relayed listener, which runs inside it - is inside the span.
  *
  * <p>One context per combination: the subclasses set the lane and the producer kind.
  *
@@ -65,6 +69,9 @@ abstract class KafkaTraceContinuityIT {
   static final String STORED_SPAN = "00f067aa0ba902b7";
   static final String STORED = "00-" + TRACE + "-" + STORED_SPAN + "-01";
 
+  /** What is current on the booking's thread when a row is booked RELAYED, by aggregate. */
+  static final Map<String, String> OBSERVED_AT_BOOKING = new ConcurrentHashMap<>();
+
   @Container static KafkaContainer kafka = new KafkaContainer("apache/kafka-native:3.8.1");
 
   @DynamicPropertySource
@@ -78,6 +85,16 @@ abstract class KafkaTraceContinuityIT {
     @Bean
     TestTracing testTracing() {
       return new TestTracing();
+    }
+
+    /** A relayed listener runs inside the booking transaction: it sees what the booking sees. */
+    @Bean
+    OutboxRelayedListener bookingWitness(ObservationRegistry registry) {
+      return event -> {
+        Observation current = registry.getCurrentObservation();
+        OBSERVED_AT_BOOKING.put(
+            event.getAggregateId(), current == null ? "none" : current.getContext().getName());
+      };
     }
 
     /** The application's registry, its tracing handlers on - Boot's own then backs off. */
@@ -104,6 +121,7 @@ abstract class KafkaTraceContinuityIT {
   @Test
   void aStoredTraceparent_continues_andARowWithoutOne_startsItsOwnTrace() {
     String topic = "trace-" + UUID.randomUUID();
+    OBSERVED_AT_BOOKING.clear();
     TransactionTemplate tx = new TransactionTemplate(txManager);
     tx.executeWithoutResult(
         s -> {
@@ -133,6 +151,10 @@ abstract class KafkaTraceContinuityIT {
         .as("a trace of its own, as before")
         .isNotEqualTo(TRACE);
 
+    // the round's span ends after the booking, which may follow the record's arrival
+    await()
+        .atMost(Duration.ofSeconds(10))
+        .until(() -> tracing.spans().stream().anyMatch(s -> s.getName().equals("outbox relay")));
     SpanData relay = tracing.span("outbox relay");
     assertThat(relay.getParentSpanId()).as("relay span <- stored span").isEqualTo(STORED_SPAN);
     List<SpanData> producers =
@@ -145,6 +167,13 @@ abstract class KafkaTraceContinuityIT {
     assertThat(producers.get(0).getSpanId())
         .as("the header that left")
         .isEqualTo(TestTracing.spanId(traced));
+    await().atMost(Duration.ofSeconds(10)).until(() -> OBSERVED_AT_BOOKING.size() == 2);
+    assertThat(OBSERVED_AT_BOOKING)
+        .as("the traced row is booked inside its relay span, the other in none")
+        .containsEntry("agg-traced", "opentmf.outbox.relay")
+        .containsEntry("agg-untraced", "none");
+    assertThat(relay.getAttributes().asMap().toString())
+        .contains("outbox.claim.ms=", "outbox.queued.ms=", "outbox.destination=" + topic);
   }
 
   private static String traceparentOf(List<ConsumerRecord<String, String>> records, String key) {

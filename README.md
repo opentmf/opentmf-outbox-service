@@ -543,23 +543,34 @@ sequenceDiagram
   producer span's; the relay span (next point) is what keeps it in the stored
   trace.
 - **Trace continuity: the `outbox relay` span (1.11.1).** A row whose stored
-  headers carry a W3C `traceparent` (any letter case) is sent inside a
+  headers carry a W3C `traceparent` (any letter case) is relayed inside a
   CONSUMER-kind span named **`outbox relay`**, the child of the stored span.
   The send's own observation opens inside it - Spring Kafka's template
   observation, or the observation of an HTTP profile client the consumer built
   with an `ObservationRegistry` - so the producer or client span is its child
   and the `traceparent` that leaves is that span's: one trace from the request
   that appended the row to the consumer that reads the event. **What it
-  measures:** one send attempt, from the relay handing the row to its
-  publisher to the publisher's verdict (a failure ends it in error); the gap
-  between the stored span and its start is the time the row waited in the
-  outbox. A retried row has one `outbox relay` span per attempt, all in the
-  same trace. It carries `outbox.id`, `outbox.event-type`,
-  `outbox.destination` and `outbox.transport` (`kafka` or `http`). The
-  registry is the application's unique `ObservationRegistry`, as
-  `KafkaTemplate` finds its own; nothing is opened without one. A row with no
-  stored `traceparent` opens no span and is sent exactly as before; a
-  malformed one makes the relay span a root. The plain HTTP client has no
+  measures:** the row's whole round on its lane's thread - the renewal of a
+  lease that waited in the hand-off queue, the send, and the booking
+  transaction with the publisher's hook and the relayed listeners - so every
+  statement of that round the application traces (database spans kept under a
+  current observation) is a span of the request's trace. A failed send ends it
+  in error; the failure is booked inside it. The gap between the stored span
+  and its start is the time the row waited in the outbox; two attributes say
+  where: `outbox.claim.ms`, how long the claim that took the row ran, and
+  `outbox.queued.ms`, the wait from that claim's commit to the start of the
+  send (milliseconds, three decimals). The claim itself is not traced: an idle
+  pod's sweeps claim nothing and open nothing. A retried row has one `outbox
+  relay` span per round, all in the same trace. It also carries `outbox.id`,
+  `outbox.event-type`, `outbox.destination` - a Kafka topic as it is, a URL as
+  its scheme, host and port only (no user, path or query) - and
+  `outbox.transport` (`kafka`, `http`, or a consumer publisher's own
+  `transport()`, else `other`). No attribute carries the payload or a header's
+  value. The span opens for a consumer's own publisher too. The registry is the
+  application's unique `ObservationRegistry`, as `KafkaTemplate` finds its own;
+  nothing is opened without one. A row with no stored `traceparent` opens no
+  span and is relayed exactly as before; a malformed one makes the relay span a
+  root. The plain HTTP client has no
   observation and forwards the stored header as it is. **Up to 1.11.0** the
   send's observation found nothing current on a relay thread and started a new
   trace: with `observation-enabled` the dispatch's trace ended at the outbox.
@@ -735,7 +746,7 @@ reads the relayed history.
 | `opentmf.outbox.dropped`   | counter | Rows given up by a publisher's DROP policy, tagged by `destination` (never counted as relayed) |
 | `opentmf.outbox.attempts`  | summary | Delivery attempts a relayed row took               |
 | `opentmf.outbox.pruned`    | counter by `state` | Rows the retention prune deleted (1.11.1), every committed batch's rows as it commits - so a call that ends in an error still has its earlier batches counted. `state` is the kind of ROW deleted, `relayed` or `cancelled` (a row withdrawn by `cancel`), not an outcome of the prune: `state="cancelled"` does not count cancelled prunes |
-| `opentmf.outbox.relay`     | timer   | The `outbox relay` span's observation (1.11.1), tagged by `outbox.transport` and `error`: recorded only when the application's `ObservationRegistry` has a meter handler, and only for rows that stored a `traceparent` - a trace aid, not a throughput figure |
+| `opentmf.outbox.relay`     | timer   | The `outbox relay` span's observation (1.11.1) - a row's round: renewal, send, booking - tagged by `outbox.transport` and `error`: recorded only when the application's `ObservationRegistry` has a meter handler, and only for rows that stored a `traceparent` - a trace aid, not a throughput figure |
 
 ## Usage
 

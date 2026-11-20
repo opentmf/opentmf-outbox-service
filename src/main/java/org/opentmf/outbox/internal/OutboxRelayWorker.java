@@ -153,6 +153,14 @@ class OutboxRelayWorker {
   private volatile boolean closed;
 
   /**
+   * The relay span of a row's round (1.11.1): opened, on the lane's thread, around the renewal, the
+   * send and the booking of a row that stored a {@code traceparent}. None until the configuration
+   * gives the application's registry - when the bean is made, before the relay starts, so every
+   * lane thread (each started after it, by an executor hand-off) sees it.
+   */
+  private OutboxRelayObservation relayObservation = OutboxRelayObservation.NONE;
+
+  /**
    * One claimed row: its publisher, the lease value this holder stamped, and when - and, while it
    * is sent, what the {@link OutboxSendHeartbeat} needs (under {@link #lock}, which the booking
    * takes too).
@@ -172,6 +180,13 @@ class OutboxRelayWorker {
 
     /** Whether the send is marked under way in the database ({@code sending_since}). */
     volatile boolean marked;
+
+    /**
+     * How long the claim that took the row ran, and when it committed ({@link System#nanoTime}).
+     */
+    long claimNanos;
+
+    long claimCommittedAt;
 
     boolean sending;
     boolean interrupted;
@@ -198,6 +213,27 @@ class OutboxRelayWorker {
       event.setNextAttemptOn(stamp); // a pre-1.3.0 relay sees the leased row as not due
       event.setSendingSince(null);
     }
+
+    /** The claim that took the row ran {@code took} and committed at {@code committedAt}. */
+    void claimed(long took, long committedAt) {
+      claimNanos = took;
+      claimCommittedAt = committedAt;
+    }
+  }
+
+  /** The relay span of each row's round, from the application's registry (1.11.1). */
+  void observeRounds(OutboxRelayObservation observation) {
+    relayObservation = observation;
+  }
+
+  /** The claim's rows, their stamps mirrored and the claim's time noted on each. */
+  private static Claimed committed(Claimed claimed, long startedAt) {
+    long committedAt = System.nanoTime();
+    for (Leased row : claimed.rows()) {
+      row.mirrorStamp();
+      row.claimed(committedAt - startedAt, committedAt);
+    }
+    return claimed;
   }
 
   /** One lane's claim: the rows leased, and whether the query came back full (more may wait). */
@@ -258,9 +294,9 @@ class OutboxRelayWorker {
 
   /** The ORDERED claim, its own short transaction on the relay thread; its failure fails it. */
   private Claimed claimOrdered() {
+    long startedAt = System.nanoTime();
     Claimed claimed = tx.execute(status -> claimOrdered(clock.now(), properties.getBatchSize()));
-    claimed.rows().forEach(Leased::mirrorStamp);
-    return claimed;
+    return committed(claimed, startedAt);
   }
 
   /**
@@ -274,9 +310,9 @@ class OutboxRelayWorker {
       return Claimed.NONE;
     }
     try {
+      long startedAt = System.nanoTime();
       Claimed claimed = tx.execute(status -> claimConcurrent(clock.now(), room));
-      claimed.rows().forEach(Leased::mirrorStamp);
-      return claimed;
+      return committed(claimed, startedAt);
     } catch (RuntimeException ex) {
       log.error("Outbox CONCURRENT claim failed; the sweep will retry", ex);
       return Claimed.NONE;
@@ -532,14 +568,7 @@ class OutboxRelayWorker {
       return; // the relay is stopping: not sent; its lease lapses
     }
     try {
-      if (row.lapsedSending) {
-        book(laneTx, row, lapsed(row), () -> NOTHING); // counted, not sent: backoff first
-        return;
-      }
-      if (waitedLong(row) && !renewQueued(row)) {
-        return; // taken by another holder meanwhile, or cancelled and released unsent
-      }
-      book(laneTx, row, sent(row), () -> NOTHING);
+      round(row, () -> relayConcurrentRound(row));
     } catch (Throwable ex) { // nothing leaves a lane worker
       log.error(
           "Outbox row {} to {} - renewal or booking failed; the row is redelivered once its"
@@ -624,6 +653,25 @@ class OutboxRelayWorker {
     return !row.lost;
   }
 
+  /**
+   * One CONCURRENT row's round: its lapse booked, or its renewal if it waited, send and booking.
+   */
+  private void relayConcurrentRound(Leased row) {
+    if (row.lapsedSending) {
+      book(laneTx, row, lapsed(row), () -> NOTHING); // counted, not sent: backoff first
+      return;
+    }
+    if (waitedLong(row) && !renewQueued(row)) {
+      return; // taken by another holder meanwhile, or cancelled and released unsent
+    }
+    book(laneTx, row, sent(row), () -> NOTHING);
+  }
+
+  /** Runs a row's round inside its relay span (when the row stored a {@code traceparent}). */
+  private void round(Leased row, Runnable round) {
+    relayObservation.round(row.event, row.publisher.transport(row.event), row.claimNanos, round);
+  }
+
   @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void relayOrdered(List<Leased> ordered) {
     for (int i = 0; i < ordered.size(); i++) {
@@ -636,8 +684,12 @@ class OutboxRelayWorker {
       }
       int index = i;
       try {
-        Attempt attempt = row.lapsedSending ? lapsed(row) : sent(row);
-        book(tx, row, attempt, () -> renewNext(ordered, index));
+        round(
+            row,
+            () -> {
+              Attempt attempt = row.lapsedSending ? lapsed(row) : sent(row);
+              book(tx, row, attempt, () -> renewNext(ordered, index));
+            });
       } catch (Throwable ex) { // nothing leaves the ORDERED lane's thread
         log.error(
             "Outbox row {} to {} - booking failed; it and the rest of the batch are redelivered"
@@ -708,6 +760,9 @@ class OutboxRelayWorker {
    */
   private Attempt sent(Leased row) {
     Attempt attempt = send(row);
+    if (attempt.failure() != null) {
+      relayObservation.sendFailed(row.event, attempt.failure());
+    }
     String transport = row.publisher.transport(row.event);
     if (transport == null) {
       return attempt;
@@ -736,6 +791,7 @@ class OutboxRelayWorker {
   /** One send, its lease kept by the heartbeat while it runs; whatever it throws is a failure. */
   @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private Attempt send(Leased row) {
+    relayObservation.sendStarts(row.event, System.nanoTime() - row.claimCommittedAt);
     heartbeat.started(row);
     try {
       return new Attempt(row.publisher.deliver(row.event), null);
