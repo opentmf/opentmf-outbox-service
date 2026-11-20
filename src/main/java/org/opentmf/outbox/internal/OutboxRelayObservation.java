@@ -48,6 +48,9 @@ final class OutboxRelayObservation {
   /** The W3C trace-context header whose presence on the row opens the relay span. */
   static final String TRACEPARENT = "traceparent";
 
+  /** The low-cardinality transport: {@code kafka}, {@code http}, a publisher's own, or other. */
+  static final String TRANSPORT_KEY = "outbox.transport";
+
   /** How long the claim that took the row ran, in milliseconds. */
   static final String CLAIM_MS = "outbox.claim.ms";
 
@@ -99,7 +102,7 @@ final class OutboxRelayObservation {
     RoundContext context = new RoundContext(event.getId(), carrier);
     Observation.createNotStarted(NAME, () -> context, registry)
         .contextualName(SPAN_NAME)
-        .lowCardinalityKeyValue("outbox.transport", transport != null ? transport : OTHER_TRANSPORT)
+        .lowCardinalityKeyValue(TRANSPORT_KEY, transport != null ? transport : OTHER_TRANSPORT)
         .highCardinalityKeyValue("outbox.id", String.valueOf(event.getId()))
         .highCardinalityKeyValue("outbox.event-type", String.valueOf(event.getEventType()))
         .highCardinalityKeyValue("outbox.destination", destination(event.getDestination()))
@@ -140,7 +143,7 @@ final class OutboxRelayObservation {
       OutboxEvent event, String transport, Map<String, String> storedHeaders, Runnable send) {
     Observation round = roundOf(event);
     if (round != null) {
-      round.lowCardinalityKeyValue("outbox.transport", transport);
+      round.lowCardinalityKeyValue(TRANSPORT_KEY, transport);
       send.run();
       return;
     }
@@ -154,7 +157,7 @@ final class OutboxRelayObservation {
     context.setCarrier(carrier);
     Observation.createNotStarted(NAME, () -> context, registry)
         .contextualName(SPAN_NAME)
-        .lowCardinalityKeyValue("outbox.transport", transport)
+        .lowCardinalityKeyValue(TRANSPORT_KEY, transport)
         .highCardinalityKeyValue("outbox.id", String.valueOf(event.getId()))
         .highCardinalityKeyValue("outbox.event-type", String.valueOf(event.getEventType()))
         .highCardinalityKeyValue("outbox.destination", destination(event.getDestination()))

@@ -155,9 +155,10 @@ class OutboxRelayWorker {
   /**
    * The relay span of a row's round (1.11.1): opened, on the lane's thread, around the renewal, the
    * send and the booking of a row that stored a {@code traceparent}. None until the configuration
-   * gives the application's registry.
+   * gives the application's registry - when the bean is made, before the relay starts, so every
+   * lane thread (each started after it, by an executor hand-off) sees it.
    */
-  private volatile OutboxRelayObservation relayObservation = OutboxRelayObservation.NONE;
+  private OutboxRelayObservation relayObservation = OutboxRelayObservation.NONE;
 
   /**
    * One claimed row: its publisher, the lease value this holder stamped, and when - and, while it
@@ -652,7 +653,6 @@ class OutboxRelayWorker {
     return !row.lost;
   }
 
-  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   /**
    * One CONCURRENT row's round: its lapse booked, or its renewal if it waited, send and booking.
    */
@@ -672,6 +672,7 @@ class OutboxRelayWorker {
     relayObservation.round(row.event, row.publisher.transport(row.event), row.claimNanos, round);
   }
 
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void relayOrdered(List<Leased> ordered) {
     for (int i = 0; i < ordered.size(); i++) {
       Leased row = ordered.get(i);
