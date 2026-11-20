@@ -24,6 +24,9 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.micrometer.observation.Observation;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.sdk.trace.data.SpanData;
 import jakarta.persistence.Column;
 import java.time.Clock;
 import java.time.Duration;
@@ -41,6 +44,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -61,8 +65,9 @@ import org.opentmf.outbox.OutboxPublisher.Lane;
 import org.opentmf.outbox.OutboxRelayedListener;
 import org.opentmf.outbox.OutboxSendError;
 import org.opentmf.outbox.TerminalOutboxException;
-import org.springframework.beans.BeanUtils;
+import org.opentmf.outbox.fixture.TestTracing;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.BeanUtils;
 import org.springframework.transaction.support.TransactionCallback;
 import org.springframework.transaction.support.TransactionOperations;
 
@@ -2364,5 +2369,120 @@ class OutboxRelayWorkerTests {
 
     await().atMost(Duration.ofSeconds(5)).until(() -> row.getAttempts() == 1);
     assertThat(registry.find(OutboxMetrics.CLAIMS_PAUSED).gauge()).isNull();
+  }
+
+  // ------------------------------------------------------------ the relay span covers the round
+
+  /**
+   * OUTBOX-A-RELAY-PASS-THAT-MOVES-ROWS-IS-ONE-TRACE-1: a row that stored a {@code traceparent} is
+   * relayed inside ONE relay span under the stored parent, opened on the lane's thread around the
+   * whole round - the send and the booking with its hook - with the claim's time and the wait
+   * before the send on it; a row without one, and a claim that takes nothing, open nothing.
+   */
+  private static final String TRACE = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+  private static final String STORED_SPAN = "00f067aa0ba902b7";
+  private static final String STORED_HEADERS =
+      "{\"traceparent\":\"00-" + TRACE + "-" + STORED_SPAN + "-01\"}";
+
+  private final TestTracing tracing = new TestTracing();
+
+  /** What was current on the booking hook's thread when each row was booked. */
+  private final Map<Long, String> observedAtBooking = new ConcurrentHashMap<>();
+
+  private OutboxRelayWorker tracedWorker() {
+    OutboxRelayWorker traced = workerOn(lane);
+    traced.observeRounds(new OutboxRelayObservation(tracing.registry()));
+    doAnswer(
+            inv -> {
+              OutboxEvent booked = inv.getArgument(0);
+              Observation current = tracing.registry().getCurrentObservation();
+              observedAtBooking.put(
+                  booked.getId(), current == null ? "none" : current.getContext().getName());
+              bookings.add(inv.getArgument(1));
+              return null;
+            })
+        .when(publisher)
+        .onBooked(any(), any());
+    return traced;
+  }
+
+  private void relayOn(OutboxRelayWorker traced) {
+    traced.relayBatch(true);
+    orderedIdle();
+    idle(lane, 2);
+  }
+
+  private SpanData theRelaySpan() {
+    await()
+        .atMost(Duration.ofSeconds(5))
+        .until(
+            () ->
+                tracing.spans().stream()
+                    .anyMatch(span -> span.getName().equals(OutboxRelayObservation.SPAN_NAME)));
+    return tracing.span(OutboxRelayObservation.SPAN_NAME);
+  }
+
+  @Test
+  void aConcurrentRowWithAStoredTraceparent_isRelayedInOneSpanUnderIt_theBookingInside() {
+    concurrent(1L, "k1").setHeaders(STORED_HEADERS);
+
+    relayOn(tracedWorker());
+
+    SpanData relay = theRelaySpan();
+    assertThat(relay.getTraceId()).as("the stored trace continues").isEqualTo(TRACE);
+    assertThat(relay.getParentSpanId()).as("relay span <- stored span").isEqualTo(STORED_SPAN);
+    assertThat(relay.getAttributes().asMap().toString())
+        .contains(
+            "outbox.id=1",
+            OutboxRelayObservation.CLAIM_MS + "=",
+            OutboxRelayObservation.QUEUED_MS + "=",
+            "outbox.transport=" + OutboxRelayObservation.OTHER_TRANSPORT,
+            "outbox.destination=comm.delivery.v1");
+    assertThat(observedAtBooking)
+        .as("the booking ran inside the relay span")
+        .containsEntry(1L, OutboxRelayObservation.NAME);
+    assertThat(tracing.spans()).as("one span for the round, none for the claim").hasSize(1);
+  }
+
+  @Test
+  void anOrderedRowWithAStoredTraceparent_isRelayedInOneSpanUnderIt_theBookingInside() {
+    pending(1L, 0).setHeaders(STORED_HEADERS);
+
+    relayOn(tracedWorker());
+
+    SpanData relay = theRelaySpan();
+    assertThat(relay.getParentSpanId()).isEqualTo(STORED_SPAN);
+    assertThat(relay.getAttributes().asMap().toString())
+        .contains(OutboxRelayObservation.CLAIM_MS + "=", OutboxRelayObservation.QUEUED_MS + "=");
+    assertThat(observedAtBooking).containsEntry(1L, OutboxRelayObservation.NAME);
+  }
+
+  @Test
+  void aRowWithoutAStoredTraceparent_andAnEmptyClaim_openNoSpan() {
+    OutboxRelayWorker traced = tracedWorker();
+    relayOn(traced); // nothing due: the sweep of an idle pod
+
+    concurrent(1L, "k1").setHeaders("{\"x-custom\":\"kept\"}");
+    pending(2L, 0);
+    relayOn(traced);
+
+    assertThat(table.get(1L).getRelayedOn()).isNotNull();
+    assertThat(table.get(2L).getRelayedOn()).isNotNull();
+    assertThat(tracing.spans()).isEmpty();
+    assertThat(observedAtBooking).containsEntry(1L, "none").containsEntry(2L, "none");
+  }
+
+  @Test
+  void aFailedSend_endsTheRoundsSpanInError_withItsFailureBookedInside() {
+    concurrent(1L, "k1").setHeaders(STORED_HEADERS);
+    doThrow(new RuntimeException("broker down")).when(publisher).deliver(any());
+
+    relayOn(tracedWorker());
+
+    SpanData relay = theRelaySpan();
+    assertThat(relay.getStatus().getStatusCode()).isEqualTo(StatusCode.ERROR);
+    assertThat(table.get(1L).getAttempts()).isEqualTo(1);
+    assertThat(observedAtBooking).containsEntry(1L, OutboxRelayObservation.NAME);
   }
 }

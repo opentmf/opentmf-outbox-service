@@ -15,6 +15,7 @@ import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.observation.DefaultMeterObservationHandler;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.sdk.trace.data.SpanData;
@@ -246,7 +247,11 @@ class OutboxRelaySpanTests {
     SpanData client = spanOfKind(SpanKind.CLIENT);
     assertThat(relay.getParentSpanId()).isEqualTo(STORED_SPAN);
     assertThat(client.getParentSpanId()).isEqualTo(relay.getSpanId());
-    assertThat(relay.getAttributes().asMap().toString()).contains("outbox.transport=http");
+    assertThat(relay.getAttributes().asMap().toString())
+        .contains("outbox.transport=http")
+        .doesNotContain("/cb");
+    assertThat(relay.getAttributes().get(AttributeKey.stringKey("outbox.destination")))
+        .isEqualTo("https://hub");
   }
 
   @Test
@@ -277,5 +282,60 @@ class OutboxRelaySpanTests {
 
     SpanData relay = tracing.span(OutboxRelayObservation.SPAN_NAME);
     assertThat(relay.getStatus().getStatusCode()).isEqualTo(StatusCode.ERROR);
+  }
+
+  /**
+   * A destination on a span: a URL keeps its scheme, host and port only - no user, path, query or
+   * fragment - and a Kafka topic stays as it is.
+   */
+  @Test
+  void aDestinationOnTheSpan_isATopicAsItIs_orAUrlsSchemeHostAndPortOnly() {
+    assertThat(OutboxRelayObservation.destination("dispatch.v1")).isEqualTo("dispatch.v1");
+    assertThat(OutboxRelayObservation.destination("https://hub/cb")).isEqualTo("https://hub");
+    assertThat(
+            OutboxRelayObservation.destination(
+                "https://user:secret@hub.example:8443/party/42/cb?token=x#frag"))
+        .isEqualTo("https://hub.example:8443");
+    assertThat(OutboxRelayObservation.destination("http://[::1]:9/x")).isEqualTo("http://[::1]:9");
+    assertThat(OutboxRelayObservation.destination("https://bad host/x")).isEqualTo("unparsed");
+  }
+
+  /**
+   * Inside the relay's round for the row, a library publisher's send opens no span of its own: the
+   * round's span is the relay span, the send names its transport on it and the producer span is its
+   * child.
+   */
+  @Test
+  void aSendInsideTheRowsRound_opensNoSecondRelaySpan_andNamesItsTransport() {
+    KafkaOutboxPublisher publisher = kafka(false);
+    OutboxEvent event = event("dispatch.v1", stored(STORED));
+    OutboxRelayObservation observation = new OutboxRelayObservation(tracing.registry());
+
+    observation.round(event, null, 1_500_000L, () -> publisher.publish(event));
+
+    SpanData relay = tracing.span(OutboxRelayObservation.SPAN_NAME);
+    assertThat(relay.getParentSpanId()).isEqualTo(STORED_SPAN);
+    assertThat(spanOfKind(SpanKind.PRODUCER).getParentSpanId()).isEqualTo(relay.getSpanId());
+    assertThat(relay.getAttributes().asMap().toString())
+        .contains("outbox.transport=kafka", OutboxRelayObservation.CLAIM_MS + "=1.500");
+    assertThat(TestTracing.traceId(sentTraceparent())).isEqualTo(TRACE);
+  }
+
+  /** Another row's send inside a round is not that round's: it gets its own span, as on its own. */
+  @Test
+  void anotherRowsSendInsideARound_opensItsOwnRelaySpan() {
+    KafkaOutboxPublisher publisher = kafka(false);
+    OutboxEvent other = event("dispatch.v1", stored(STORED));
+    other.setId(12L);
+    OutboxEvent row = event("dispatch.v1", stored(STORED));
+
+    new OutboxRelayObservation(tracing.registry())
+        .round(row, "kafka", 0L, () -> publisher.publish(other));
+
+    assertThat(
+            tracing.spans().stream()
+                .filter(span -> span.getName().equals(OutboxRelayObservation.SPAN_NAME))
+                .count())
+        .isEqualTo(2);
   }
 }

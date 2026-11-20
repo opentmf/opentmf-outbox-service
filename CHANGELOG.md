@@ -131,11 +131,17 @@
   it. The same held for an HTTP profile client built with an `ObservationRegistry`. A row whose
   stored headers carry a `traceparent` is now sent inside an `outbox relay` span, the stored span's
   child, so the producer or client span is its child and the header that leaves continues the
-  stored trace. The span covers one send attempt; its start after the stored span's shows how long
-  the row waited (README, "Trace continuity"). A row without a stored `traceparent` is sent exactly
-  as before; the plain HTTP client, which has no observation, still forwards the stored header as
-  it is. Where the application's `ObservationRegistry` has a meter handler, the span is also the
-  timer `opentmf.outbox.relay`, for those rows only.
+  stored trace. The span covers the row's whole round on its lane's thread - a queued lease's
+  renewal, the send and the booking transaction - so the database statements of that round join
+  the request's trace, with the claim's duration (`outbox.claim.ms`) and the wait from the claim's
+  commit to the send (`outbox.queued.ms`) as attributes (OUTBOX-A-RELAY-PASS-THAT-MOVES-ROWS-IS-ONE-
+  TRACE-1); the claim itself is not traced, so an idle pod's sweeps open nothing. Its start after
+  the stored span's shows how long the row waited (README, "Trace continuity"). It opens for a
+  consumer's own publisher too; `outbox.destination` is a Kafka topic as it is, a URL as its
+  scheme, host and port only. A row without a stored `traceparent` is relayed exactly as before;
+  the plain HTTP client, which has no observation, still forwards the stored header as it is.
+  Where the application's `ObservationRegistry` has a meter handler, the span is also the timer
+  `opentmf.outbox.relay`, for those rows only.
 - **The HTTP publisher's plain client ends within the send bound, the connect included**
   (OUTBOX-HTTP-CONNECT-TIMEOUT-WITHIN-SEND-BOUND-1). Its read timeout was kept below the bound
   (the larger of `lease` and `send-timeout`), but its connect timeout only had to be positive: a

@@ -182,22 +182,27 @@ public class OutboxAutoConfiguration {
       OutboxConcurrentLane lane,
       OutboxOrderedLane orderedLane,
       OutboxClock clock,
-      OutboxSendHeartbeat heartbeat) {
+      OutboxSendHeartbeat heartbeat,
+      ObjectProvider<ObservationRegistry> observationRegistry) {
     // the post-relay seam: zero or more consumer beans, invoked in bean order inside the
     // booking transaction that stamps relayed_on (see OutboxRelayedListener)
-    return new OutboxRelayWorker(
-        repository,
-        router,
-        backoff,
-        metrics,
-        properties,
-        relayedListeners.orderedStream().toList(),
-        relayTransactions(transactionManager),
-        laneTransactions(transactionManager),
-        lane,
-        orderedLane,
-        clock,
-        heartbeat);
+    OutboxRelayWorker worker =
+        new OutboxRelayWorker(
+            repository,
+            router,
+            backoff,
+            metrics,
+            properties,
+            relayedListeners.orderedStream().toList(),
+            relayTransactions(transactionManager),
+            laneTransactions(transactionManager),
+            lane,
+            orderedLane,
+            clock,
+            heartbeat);
+    // each row's round (renewal, send, booking) in the relay span of a row with a traceparent
+    worker.observeRounds(relayObservation(observationRegistry));
+    return worker;
   }
 
   /**
