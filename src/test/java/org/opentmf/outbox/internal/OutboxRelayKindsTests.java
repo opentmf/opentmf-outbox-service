@@ -8,6 +8,7 @@ import java.util.List;
 import org.apache.kafka.common.errors.InterruptException;
 import org.apache.kafka.common.errors.TimeoutException;
 import org.junit.jupiter.api.Test;
+import org.opentmf.outbox.OutboxFailureText;
 import org.opentmf.outbox.OutboxLeaseLapsedException;
 import org.opentmf.outbox.OutboxRowView;
 import org.opentmf.outbox.OutboxSendError;
@@ -22,10 +23,10 @@ import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClientResponseException;
 
 /**
- * The kinds the relay itself writes (1.11.1): every failure it books, through its own {@code
- * describe}, is shown as its type name in a view without the sensitive text - never as {@code
- * unclassified}. A change to how the relay describes a failure that would hide a real kind is red
- * here.
+ * The kinds the relay itself writes (1.11.1): every failure it books, through its default text
+ * ({@link OutboxFailureText#DEFAULT}), is shown as its type name in a view without the sensitive
+ * text - never as {@code unclassified}. A change to how the relay describes a failure that would
+ * hide a real kind is red here.
  */
 class OutboxRelayKindsTests {
 
@@ -62,7 +63,13 @@ class OutboxRelayKindsTests {
           failure.getMessage() == null
               ? failure.getClass().getName()
               : failure.getClass().getSimpleName();
-      assertThat(kindOf.invoke(null, OutboxRelayWorker.describe(failure)))
+      // the default text is the text up to 1.11.0, byte for byte
+      assertThat(OutboxFailureText.DEFAULT.describe(null, failure))
+          .isEqualTo(
+              failure.getMessage() == null
+                  ? failure.toString()
+                  : failure.getClass().getSimpleName() + ": " + failure.getMessage());
+      assertThat(kindOf.invoke(null, OutboxFailureText.DEFAULT.describe(null, failure)))
           .as("the kind of %s", failure.getClass().getName())
           .isEqualTo(expected);
     }

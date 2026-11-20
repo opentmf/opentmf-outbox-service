@@ -1125,6 +1125,27 @@ the response record at all, so a `fields=` selection cannot bring them back. The
 the payload path its stricter role in its own rules, **matching `/ops/outbox/*/payload` before
 `/ops/outbox/*`** (Spring Security takes the first match).
 
+**The failure's text is the service's to give (1.11.1).** What a failed attempt stores as
+`last_error` - and what the relay's retry, park, drop and cancel log lines print - is the
+`OutboxFailureText` bean's text. Without a bean of its own a service stores exactly the text up
+to 1.11.0: the failure's simple type name, `": "` and its own message. A service that keeps a
+receiver's body, an address's path or a peer's echo out of its rows declares one:
+
+```java
+@Bean
+OutboxFailureText failureText() {
+  return (row, failure) -> OutboxFailureText.typed(failure, "refused by " + row.destination());
+}
+```
+
+The bean is called inside the failed attempt's booking with a read-only `OutboxFailureText.Row`
+(id, aggregate type and id, event type, destination, the attempts so far with this one) - never
+the stored row, its payload or its headers. The library cuts the text to the column's 4,000
+characters; a null or blank text, or a bean that throws, stores the failure's type name alone
+(a throw is logged by its type, not its message), and the booking stands. The views without the
+sensitive text read the failure's kind from the text's leading throwable name: `typed(failure,
+text)` keeps it, and a text that does not start so shows as `unclassified` there.
+
 The row routes take an id of **digits only** (`{id:\d+}`, 1.7.0). A literal sibling segment
 is never read as an id: `GET /ops/outbox/unpark` is the 405 of a path that serves POST only
 (up to 1.6.0 it reached the inspect route and answered 400, "not a whole number"), `OPTIONS`
