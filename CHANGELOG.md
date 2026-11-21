@@ -4,6 +4,19 @@
 
 ### Added
 
+- **A lookup of an aggregate's rows has an index** (OUTBOX-THE-LOOKUP-BY-AGGREGATE-HAS-A-PLAN-ON-A-LOADED-TABLE-1):
+  changeset `010-outbox-aggregate-lookup` builds `ix_outbox_aggregate (aggregate_type,
+  aggregate_id, id)` `CONCURRENTLY`, with its rollback. A service that looks up the newest row of
+  an aggregate, or its newest row above an id, read the table by walking the primary key back over
+  every newer row - every row for an aggregate not written yet: 250 ms at 1,000,000 rows and
+  1.4 s at 5,000,000 on a seven-day table; 0.1 ms with the index. It costs about 80 bytes a row,
+  1-6 % on an append's time and up to about twice the write-ahead log per append on a quiet table;
+  the relay's statements keep their plans. The first 1.11.1 start builds it while the service
+  runs (about 10 s at 5,000,000 rows; appends and the relay are not stopped). Nothing to change
+  in a service; a changelog run out of band applies the two statements outside a transaction
+  (README "Upgrading to 1.11.1", item 5). `OutboxAggregateLookupPlanIT` pins the lookup's plan
+  and the relay's on a 1,000,000-row table.
+
 - **The rows the retention prune deletes are counted as each batch commits**
   (OTMF-OUTBOX-PRUNE-STATEMENT-BOUNDED-AND-PLANNED-1): a new counter `opentmf.outbox.pruned`,
   tagged `state` = `relayed` | `cancelled` - the kind of row deleted, not an outcome of the prune.
