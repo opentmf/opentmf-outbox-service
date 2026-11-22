@@ -790,9 +790,11 @@ the onboarding adds below, the index recreated to the 1.2.0 predicate),
 `004-outbox-claim-lease` (1.3.0: `claimed_until`, `lane`, `ordering_key` and the
 lanes' claim indexes), `005-outbox-gauge-and-prune-indexes` (1.3.0) and
 `006-outbox-lane-gauge-indexes` (1.4.0: the per-lane gauge indexes),
-`007-outbox-sending-since` and `008-outbox-claim-plan-fences` (1.9.0) and
-`009-outbox-key-token` (1.11.1: `key_token`, part of the idempotency key).
-004–006 and 008 build their indexes `CONCURRENTLY`.
+`007-outbox-sending-since` and `008-outbox-claim-plan-fences` (1.9.0),
+`009-outbox-key-token` (1.11.1: `key_token`, part of the idempotency key) and
+`010-outbox-aggregate-lookup` (1.11.1: `ix_outbox_aggregate` on
+`(aggregate_type, aggregate_id, id)`, for a service's lookup of an aggregate's
+rows). 004–006, 008 and 010 build their indexes `CONCURRENTLY`.
 
 **Upgrading** needs no consumer change at any step: the included changelog
 applies the missing changesets on the next start (nullable columns only, no
@@ -1485,6 +1487,31 @@ The library is self-contained for consumer testing — no test-jar needed:
    `OutboxHeaders.idempotencyKey(serviceName, event)` (the old method is
    deprecated, unchanged). A consumer that PARSES the key - the last segment
    as the id, say - must stop: the key is opaque.
+5. **The schema: changeset `010-outbox-aggregate-lookup`**, one index,
+   `ix_outbox_aggregate (aggregate_type, aggregate_id, id)`, built
+   `CONCURRENTLY` - nothing to change in your service. It serves a lookup of
+   an aggregate's rows, newest first and optionally above an id
+   (`where aggregate_type = ? and aggregate_id = ? [and id > ?] order by id desc
+   limit 1`): without it PostgreSQL walks the primary key back over every newer
+   row - every row of the table for an aggregate not written yet - measured at
+   250 ms on 1,000,000 rows and 1.4 s on 5,000,000; with it 0.1 ms at every size.
+   - **What it costs:** about 80 bytes a row (394 MB at 5,000,000 rows), 1-6 %
+     on an append's time, and up to about twice the write-ahead log per append
+     on a quiet table (full-page images of the index's leaves after a
+     checkpoint; less under a steady stream of appends). The relay's claim,
+     re-check, stamp, heartbeat, give-back and booking statements keep their
+     plans - none of them filters on the aggregate.
+   - **At the upgrade:** the first 1.11.1 start builds the index while the
+     service runs - `CREATE INDEX CONCURRENTLY` takes no lock that stops appends
+     or the relay - in about 2 s at 1,000,000 rows and 10 s at 5,000,000 (it
+     reads the table twice and waits for transactions already open). Liquibase
+     holds its changelog lock meanwhile, so a second pod starting at the same
+     time waits for the build. A build that fails leaves an INVALID index and
+     the changeset unmarked; the next start drops it and builds it again.
+   - **Changelog run out of band:** apply the two statements (`drop index
+     concurrently if exists ix_outbox_aggregate;` then the `create index
+     concurrently ...`) outside a transaction, before or after 1.11.1 starts -
+     1.11.1 runs without the index too, only the lookup stays slow.
 
 ### Upgrading to 1.9.0
 
