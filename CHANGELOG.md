@@ -29,6 +29,17 @@
   shape. The ops OAS fragment gains the operation (`getOutboxRowPayload`, schema
   `OutboxRowPayload`): re-paste it.
 
+- **A service gives its rows' failure text itself**
+  (OUTBOX-A-ROWS-LAST-ERROR-CAN-BE-GIVEN-BY-ITS-SERVICE-1). A failed attempt's `last_error` - served by the ops surface and printed in the relay's retry,
+  park, drop and cancel log lines - is the failure's own message, and that can quote a
+  receiver's response body or an address with its path. A consumer that declares an
+  `OutboxFailureText` bean now gives that text: the bean is called in the failed attempt's
+  booking with a read-only `OutboxFailureText.Row`, never the stored row; the library cuts the
+  text to 4,000 characters, and a null or blank text or a bean that throws stores the failure's
+  type name alone without rolling the booking back. `OutboxFailureText.typed` keeps the failure's
+  kind for the views without the sensitive text. Without a bean the stored text is exactly the
+  text up to 1.11.0; no schema, statement, view, metric or ops fragment changed.
+
 ### Fixed
 
 - **A restore or a recreated table no longer makes new events look like duplicates**

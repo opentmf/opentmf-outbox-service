@@ -22,6 +22,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.opentmf.outbox.OutboxBooking;
 import org.opentmf.outbox.OutboxBooking.Outcome;
 import org.opentmf.outbox.OutboxEvent;
+import org.opentmf.outbox.OutboxFailureText;
 import org.opentmf.outbox.OutboxLeaseLapsedException;
 import org.opentmf.outbox.OutboxProperties;
 import org.opentmf.outbox.OutboxPublisher;
@@ -161,6 +162,13 @@ class OutboxRelayWorker {
   private OutboxRelayObservation relayObservation = OutboxRelayObservation.NONE;
 
   /**
+   * The text a failed attempt stores as {@code last_error} (1.11.1): the consumer's {@link
+   * OutboxFailureText} bean, else today's text. Set as {@link #relayObservation} is, before the
+   * relay starts.
+   */
+  private OutboxFailureText failureText = OutboxFailureText.DEFAULT;
+
+  /**
    * One claimed row: its publisher, the lease value this holder stamped, and when - and, while it
    * is sent, what the {@link OutboxSendHeartbeat} needs (under {@link #lock}, which the booking
    * takes too).
@@ -224,6 +232,11 @@ class OutboxRelayWorker {
   /** The relay span of each row's round, from the application's registry (1.11.1). */
   void observeRounds(OutboxRelayObservation observation) {
     relayObservation = observation;
+  }
+
+  /** The text of a failed attempt's {@code last_error}, from the consumer's bean (1.11.1). */
+  void describeFailures(OutboxFailureText text) {
+    failureText = text;
   }
 
   /** The claim's rows, their stamps mirrored and the claim's time noted on each. */
@@ -952,11 +965,39 @@ class OutboxRelayWorker {
     return OutboxBooking.failed(Outcome.RETRY, ex, null);
   }
 
-  private static int bookAttempt(OutboxEvent event, RuntimeException ex) {
+  private int bookAttempt(OutboxEvent event, RuntimeException ex) {
     int attempts = event.getAttempts() + 1;
     event.setAttempts(attempts);
-    event.setLastError(truncate(describe(ex)));
+    event.setLastError(truncate(textOf(event, ex)));
     return attempts;
+  }
+
+  /**
+   * The stored text of a failure (1.11.1): the consumer's {@link OutboxFailureText} on a read-only
+   * copy of the row's facts; the failure's type name alone when it gives no text or throws - a
+   * throw is logged by its type only and never rolls the booking back.
+   */
+  private String textOf(OutboxEvent event, RuntimeException ex) {
+    OutboxFailureText.Row row =
+        new OutboxFailureText.Row(
+            event.getId(),
+            event.getAggregateType(),
+            event.getAggregateId(),
+            event.getEventType(),
+            event.getDestination(),
+            event.getAttempts());
+    String text;
+    try {
+      text = failureText.describe(row, ex);
+    } catch (RuntimeException hookFailure) {
+      log.warn(
+          "Outbox row {} - the OutboxFailureText bean threw {}; the row's last error is the"
+              + " failure's type name alone",
+          event.getId(),
+          hookFailure.getClass().getName());
+      text = null;
+    }
+    return text == null || text.isBlank() ? ex.getClass().getSimpleName() : text;
   }
 
   private ExhaustionOutcome exhaust(OutboxEvent event, OutboxPublisher publisher) {
@@ -993,13 +1034,6 @@ class OutboxRelayWorker {
   private Duration backoffFor(OutboxEvent event, OutboxPublisher publisher, int attempts) {
     Duration declared = publisher == null ? null : publisher.backoff(event, attempts);
     return declared != null ? declared : backoff.delayFor(attempts);
-  }
-
-  /** The stored text of a failure; its leading type name is the kind a view may show alone. */
-  static String describe(RuntimeException ex) {
-    return ex.getMessage() == null
-        ? ex.toString()
-        : ex.getClass().getSimpleName() + ": " + ex.getMessage();
   }
 
   private static String truncate(String text) {
