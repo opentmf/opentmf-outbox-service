@@ -91,13 +91,20 @@ class OutboxHttpClientsTests {
   private final List<Socket> backlog = new ArrayList<>();
   private ServerSocket listener;
 
+  /** One cleanup for every cell: the stalling listener and its backlog, then the receiver. */
   @AfterEach
-  void closeTheListener() throws IOException {
-    for (Socket socket : backlog) {
-      socket.close();
-    }
-    if (listener != null) {
-      listener.close();
+  void closeWhatTheCellOpened() throws IOException {
+    try {
+      for (Socket socket : backlog) {
+        socket.close();
+      }
+      if (listener != null) {
+        listener.close();
+      }
+    } finally {
+      if (receiver != null) {
+        receiver.stop(0);
+      }
     }
   }
 
@@ -177,13 +184,6 @@ class OutboxHttpClientsTests {
 
   private HttpServer receiver;
   private final Map<String, AtomicInteger> hits = new ConcurrentHashMap<>();
-
-  @AfterEach
-  void stopTheReceiver() {
-    if (receiver != null) {
-      receiver.stop(0);
-    }
-  }
 
   /** A local receiver; {@code handler} answers each request, every hit counted by path. */
   private String receiver(HttpHandler handler) throws IOException {
