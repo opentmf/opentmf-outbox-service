@@ -32,11 +32,19 @@ public final class TestTracing {
 
   private final InMemorySpanExporter exporter = InMemorySpanExporter.create();
   private final ObservationRegistry registry = ObservationRegistry.create();
+  private final Tracer tracer;
+  private final Propagator propagator;
 
+  /** Every span sampled. */
   public TestTracing() {
+    this(Sampler.alwaysOn());
+  }
+
+  /** Spans sampled by {@code sampler}: {@code Sampler.alwaysOff()} records none. */
+  public TestTracing(Sampler sampler) {
     SdkTracerProvider provider =
         SdkTracerProvider.builder()
-            .setSampler(Sampler.alwaysOn())
+            .setSampler(sampler)
             .addSpanProcessor(SimpleSpanProcessor.create(exporter))
             .build();
     OpenTelemetrySdk sdk =
@@ -44,9 +52,8 @@ public final class TestTracing {
             .setTracerProvider(provider)
             .setPropagators(ContextPropagators.create(W3CTraceContextPropagator.getInstance()))
             .build();
-    Tracer tracer =
-        new OtelTracer(sdk.getTracer(SCOPE), new OtelCurrentTraceContext(), event -> {});
-    Propagator propagator = new OtelPropagator(sdk.getPropagators(), sdk.getTracer(SCOPE));
+    tracer = new OtelTracer(sdk.getTracer(SCOPE), new OtelCurrentTraceContext(), event -> {});
+    propagator = new OtelPropagator(sdk.getPropagators(), sdk.getTracer(SCOPE));
     registry
         .observationConfig()
         .observationHandler(
@@ -59,6 +66,16 @@ public final class TestTracing {
   /** The registry the handlers are on. */
   public ObservationRegistry registry() {
     return registry;
+  }
+
+  /** The tracer - a consumer's {@code Tracer} bean once Boot's tracing is on. */
+  public Tracer tracer() {
+    return tracer;
+  }
+
+  /** The W3C propagator - a consumer's {@code Propagator} bean once Boot's tracing is on. */
+  public Propagator propagator() {
+    return propagator;
   }
 
   /** Every span finished so far, in the order they ended. */
@@ -78,6 +95,14 @@ public final class TestTracing {
   /** The trace id of a W3C {@code traceparent} ({@code 00-<trace>-<span>-<flags>}). */
   public static String traceId(String traceparent) {
     return traceparent.split("-")[1];
+  }
+
+  /**
+   * Whether a W3C {@code traceparent}'s flags have the sampled bit - the lowest; others (the random
+   * trace-id flag) may be set beside it.
+   */
+  public static boolean sampled(String traceparent) {
+    return (Integer.parseInt(traceparent.split("-")[3], 16) & 1) == 1;
   }
 
   /** The span id of a W3C {@code traceparent}. */

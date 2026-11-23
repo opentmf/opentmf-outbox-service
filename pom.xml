@@ -188,6 +188,13 @@
       <groupId>io.micrometer</groupId>
       <artifactId>micrometer-observation</artifactId>
     </dependency>
+    <!-- The writer stamps the current trace context on a row (1.11.1) through the application's
+         Tracer and Propagator - optional: a consumer without tracing links none of it. -->
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-tracing</artifactId>
+      <optional>true</optional>
+    </dependency>
 
     <!-- The library-provided seal rule (OutboxArchRules) — optional: only test
          classpaths ever see it. anything older

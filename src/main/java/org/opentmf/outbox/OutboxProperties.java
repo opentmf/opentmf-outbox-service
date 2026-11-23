@@ -94,6 +94,17 @@ public class OutboxProperties {
    */
   @NotNull private Duration metricsRefresh = Duration.ofSeconds(15);
 
+  /**
+   * Whether a row appended without a {@code traceparent} header stores the trace context current
+   * at the append (1.11.1), so the relay sends the event in the trace of the work that appended it.
+   * Needs Micrometer Tracing with a {@code Tracer} and a W3C {@code Propagator}; without them, or
+   * without a current span, nothing is stored. With it the stored headers - and so the ops views
+   * and the headers a built-in publisher forwards - gain {@code traceparent} (and {@code
+   * tracestate}, when the context has one), and each such row's round opens the {@code outbox
+   * relay} span. Default true.
+   */
+  private boolean stampTraceContext = true;
+
   /** The bounded bulk operations: prune, unpark by filter ({@code opentmf.outbox.maintenance}). */
   @Valid private final Maintenance maintenance = new Maintenance();
 

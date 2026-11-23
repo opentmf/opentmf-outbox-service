@@ -549,7 +549,9 @@ sequenceDiagram
   observation, or the observation of an HTTP profile client the consumer built
   with an `ObservationRegistry` - so the producer or client span is its child
   and the `traceparent` that leaves is that span's: one trace from the request
-  that appended the row to the consumer that reads the event. **What it
+  that appended the row to the consumer that reads the event. The writer
+  stores the current span's `traceparent` on a row appended without one (see
+  "The trace of an append" under "Append events"). **What it
   measures:** the row's whole round on its lane's thread - the renewal of a
   lease that waited in the hand-off queue, the send, and the booking
   transaction with the publisher's hook and the relayed listeners - so every
@@ -648,6 +650,7 @@ opentmf:
     shutdown-grace: 10s      # how long a stopping relay lets sends in flight finish
     shutdown-join: 5s        # then how long it waits for its threads to end (1.11.1)
     metrics-refresh: 15s     # how often the gauges are re-read (a scrape never queries)
+    stamp-trace-context: true  # a row appended without a traceparent stores the current one (1.11.1)
     claim-pause:             # a pod whose transport is down leaves its rows to others (1.11.0)
       after-failures: 5      # failed sends over a transport in a row that pause it; 0 = never
       max: 1m                # longest wait between two probe rows; a row due longer is taken
@@ -693,6 +696,7 @@ opentmf:
 | `shutdown-grace` | `Duration` | `10s`   | On stop: the time the relay thread, the ORDERED batch and the in-flight CONCURRENT sends get, together, to finish and book (one deadline since 1.11.1; each in turn before); the rest lapse by lease. |
 | `shutdown-join`  | `Duration` | `5s`    | On stop, after the grace (1.11.1): how long the relay waits for its interrupted threads - the lanes, the heartbeat, the gauges' refresher - to end, so none uses the pool while it closes. The whole stop takes at most `shutdown-grace + shutdown-join`. |
 | `metrics-refresh` | `Duration` | `15s`  | How often the gauges are re-read from the database; a scrape reads the last values. |
+| `stamp-trace-context` | `boolean` | `true` | A row appended without a `traceparent` header stores the trace context current at the append (1.11.1; see "Append events"). `false` stores only the headers the caller gives, as up to 1.11.0. |
 | `claim-pause.after-failures` | `int` | `5` | Failed sends over one transport in a row (the publisher says the transport was out of reach), with no success between them, after which this pod leaves that transport's rows to the other pods (1.11.0; see "A pod whose transport is down"). `0` switches the pause off. |
 | `claim-pause.max` | `Duration` | `1m` | While paused, the pod takes one probe row: the first `backoff-base` after the pause, each next one twice as long after the one before, never longer apart than this. A paused transport's row due for longer than this is taken anyway - no pod is sending it. Positive (validated at boot). |
 | `maintenance.batch-size` | `int`    | `5000`  | Rows per batch of a bulk operation (prune, unpark by filter); each batch is its own transaction, no entity loaded. |
@@ -872,6 +876,37 @@ Pass the payload as a fact object — it is serialized at write time. Extra
 `withHeaders`; the relay stamps `x-idempotency-key`, `x-event-type` and
 `x-producer` on top, replacing same-named stored ones on both legs. Anything
 that must NOT reach the wire goes in `withReference`.
+
+**The trace of an append (1.11.1).** A row appended without a `traceparent`
+header (in any letter case) stores the trace context current at the append:
+the W3C `traceparent` - and `tracestate`, when the context has one - exactly as
+the application's Micrometer `Propagator` writes them for the current span of
+its `Tracer` (the beans Spring Boot registers once a tracing bridge is on the
+classpath). The relay then sends the event inside the `outbox relay` span,
+the child of that span (see "Trace continuity" under "How It Works"), so an
+event appended while a request or a message is processed leaves in that
+trace. An unsampled span is stored too: its flags say it is not sampled, and
+the trace id carries on with sampling off.
+
+- **A `traceparent` you give is stored as it is** - give a stored context of
+  your own (a late event of an earlier request) this way; a `tracestate` you
+  give is never replaced either.
+- **Nothing is stored** without Micrometer Tracing on the classpath (it is an
+  optional dependency of the library), without a `Tracer` or a `Propagator`
+  bean, without a current span, or with a propagator that writes no
+  `traceparent` (B3 propagation only: the relay continues a W3C context only).
+  A propagator that fails is logged and stores nothing; tracing never fails an
+  append.
+- **Baggage is never stored.** It is the application's own data: the row would
+  keep it until the prune and every built-in publisher would forward it as a
+  header of the event. Give it as a header where the event should carry it.
+- **What changes for a service:** the stored headers - and so the ops views
+  and the headers the built-in publishers forward - gain `traceparent` (and
+  `tracestate`); each such row's round opens the `outbox relay` span and, with
+  a meter handler, records the `opentmf.outbox.relay` timer. A service whose
+  tests compare a row's stored headers exactly, or that wants none of this,
+  sets `opentmf.outbox.stamp-trace-context=false`. A bean of your own of type
+  `OutboxTraceContext` replaces the library's.
 
 ### Publisher failure policy (`OutboxPublisher`)
 
@@ -1512,6 +1547,13 @@ The library is self-contained for consumer testing — no test-jar needed:
      concurrently if exists ix_outbox_aggregate;` then the `create index
      concurrently ...`) outside a transaction, before or after 1.11.1 starts -
      1.11.1 runs without the index too, only the lookup stays slow.
+6. **A row appended inside a span stores its trace context.** With Micrometer
+   Tracing in the service (a `Tracer` and a W3C `Propagator` bean), a row
+   appended without a `traceparent` header stores the current span's, and its
+   event leaves in that trace (see "The trace of an append" under "Append
+   events"). Nothing to change; a service whose tests compare stored headers
+   exactly, or that wants rows as before, sets
+   `opentmf.outbox.stamp-trace-context=false`.
 
 ### Upgrading to 1.9.0
 
