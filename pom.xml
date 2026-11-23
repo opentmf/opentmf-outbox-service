@@ -7,7 +7,7 @@
   <parent>
     <groupId>org.springframework.boot</groupId>
     <artifactId>spring-boot-starter-parent</artifactId>
-    <version>4.1.2</version>
+    <version>4.2.0</version>
     <relativePath />
   </parent>
 
@@ -97,7 +97,7 @@
          source/javadoc/deploy; it pins maven-release-plugin at 3.0.1, overridden here to
          3.3.1. gpg + central-publishing are not Boot-managed. -->
     <maven-release-plugin.version>3.3.1</maven-release-plugin.version>
-    <sonar-maven-plugin.version>5.8.0.7211</sonar-maven-plugin.version>
+    <sonar-maven-plugin.version>5.9.0.7382</sonar-maven-plugin.version>
     <maven-gpg-plugin.version>3.2.8</maven-gpg-plugin.version>
     <central-publishing-maven-plugin.version>0.12.0</central-publishing-maven-plugin.version>
   </properties>
