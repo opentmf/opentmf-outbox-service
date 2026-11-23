@@ -13,9 +13,11 @@
   processed left on a new trace. A `traceparent` the caller gives is stored as it is; an
   unsampled span is stored too; baggage is never stored. Nothing is stored without Micrometer
   Tracing (a new optional dependency), without a `Tracer` or `Propagator` bean or without a
-  current span. `opentmf.outbox.stamp-trace-context=false` turns it off (default `true`) - for a
-  service whose tests compare stored headers exactly. No signature changed; a new
-  `OutboxWriter` constructor takes the trace context, the old ones store none.
+  current span. **A service's test that compares a row's stored headers exactly will now see
+  `traceparent` (and `tracestate`) on a row appended inside a span:** adjust the test, or set
+  `opentmf.outbox.stamp-trace-context=false` (default `true`) to store only the headers the caller
+  gives, as before. No signature changed; a new `OutboxWriter` constructor takes the trace
+  context, the old ones store none.
 
 - **A lookup of an aggregate's rows has an index** (OUTBOX-THE-LOOKUP-BY-AGGREGATE-HAS-A-PLAN-ON-A-LOADED-TABLE-1):
   changeset `010-outbox-aggregate-lookup` builds `ix_outbox_aggregate (aggregate_type,
