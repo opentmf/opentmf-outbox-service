@@ -4,6 +4,19 @@
 
 ### Added
 
+- **A key's consecutive rows relayed as one unit** (OUTBOX-A-KEYS-CONSECUTIVE-ROWS-ARE-RELAYED-AS-ONE-UNIT-1),
+  opt-in: `opentmf.outbox.concurrent.key-run` (default `1`, one row of a key per claim, as
+  before). Above 1, one CONCURRENT claim takes a key's head and up to `key-run - 1` due rows of
+  its key right behind it, and one slot sends them in `id` order. Each row is still booked on its
+  own, and its booking renews the next row's lease in the same transaction, so a crash mid-run
+  redelivers only the row whose booking it interrupted. The run ends at the first row that is
+  not due, at a failed send (the rows after it are released, due at once - a failed row may then
+  be passed, as before) and at a row lost to another holder. Rows of one key are never in flight
+  together, within a pod and across pods; a paused transport's probe stays one row; the rows of
+  all runs of a claim stay within the lane's room. Two new claim statements, both plan-pinned
+  under custom and generic plans; no schema change. The invariants suite's `KeyRunsIT` runs every
+  cell at a run length of 1 and 8, and `-Dit.key-run=<n>` runs the whole suite at one.
+
 - **A row appended inside a span stores its trace context** (OUTBOX-AN-APPEND-CARRIES-THE-CURRENT-TRACE-1):
   an append that gives no `traceparent` header stores the current trace context - the W3C
   `traceparent`, and `tracestate` when there is one - as the application's Micrometer

@@ -846,6 +846,30 @@ class OutboxClaimPlanIT {
           .as("%s cross-pod re-check, %s: buffers", state, mode)
           .isLessThanOrEqualTo(FULL_BATCH_BUFFER_BOUND);
     }
+    // a key's run (1.11.1): the rows behind each head over the keyed index from the head on -
+    // never a key's whole backlog - and their lock, by primary key
+    Map<String, String> tails = Map.of("heads", "'" + heads + "'", "limit", "7");
+    assertIndexedOnly(
+        state + " key runs behind the heads",
+        OutboxClaimSql.TAIL,
+        tails,
+        List.of("outbox_pkey", "ix_outbox_concurrent_keyed"));
+    for (String mode : PLAN_MODES) {
+      JsonNode plan = explain(OutboxClaimSql.TAIL, mode, tails).get("Plan");
+      assertThat(plan.get("Actual Rows").asLong())
+          .as("%s key runs, %s: at most seven rows behind each of the %d heads", state, mode,
+              FULL_BATCH)
+          .isPositive()
+          .isLessThanOrEqualTo(7L * FULL_BATCH);
+      assertThat(plan.get("Shared Hit Blocks").asLong() + plan.get("Shared Read Blocks").asLong())
+          .as("%s key runs, %s: buffers", state, mode)
+          .isLessThanOrEqualTo(FULL_BATCH_BUFFER_BOUND);
+    }
+    assertIndexedOnly(
+        state + " key runs' lock",
+        OutboxClaimSql.TAIL_LOCK,
+        Map.of("now", "now()", "ids", "'" + heads + "'"),
+        List.of("outbox_pkey"));
     assertIndexedOnly(
         state + " stamp",
         OutboxClaimSql.STAMP,

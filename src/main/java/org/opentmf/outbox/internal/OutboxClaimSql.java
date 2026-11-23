@@ -248,6 +248,42 @@ final class OutboxClaimSql {
           order by o.ordering_key, o.id limit 1) is null""";
 
   /**
+   * A KEY'S RUN (1.11.1, {@code concurrent.key-run} above 1): for each re-checked head (the ids as
+   * an array literal), the open rows of its key right behind it, in {@code id} order, at most
+   * {@code :limit} per key - the eligibility columns read, not filtered: the run is the prefix of
+   * due rows, and the first row that is not due ends it, so the caller needs to see that row too.
+   * Run inside the claim, after the key locks and the re-check: no other pod claims these keys
+   * meanwhile, and no row of them is in flight. Each head is read by primary key, each key's rows
+   * over {@code ix_outbox_concurrent_keyed} from the head's id on - never a key's whole backlog.
+   */
+  static final String TAIL =
+      """
+      select t.* from unnest(cast(:heads as bigint[])) as h (id)
+      join outbox hr on hr.id = h.id
+      cross join lateral (
+        select o.* from outbox o
+        where o.lane = 'CONCURRENT' and o.ordering_key = hr.ordering_key and o.id > hr.id
+          and coalesce(o.relayed_on, o.cancelled_on, o.parked_on) is null
+        order by o.ordering_key, o.id
+        limit :limit) t""";
+
+  /**
+   * Locks the rows of the runs (the ids as an array literal) that are still due and leased by
+   * nobody, {@code FOR UPDATE SKIP LOCKED}: a row an operator is cancelling right now is skipped,
+   * and its run ends before it. By primary key.
+   */
+  static final String TAIL_LOCK =
+      """
+      select e.id from outbox e
+      where e.id = any (cast(:ids as bigint[]))
+        and coalesce(e.relayed_on, e.cancelled_on, e.parked_on) is null
+        and (e.release_at is null or e.release_at <= :now)
+        and e.next_attempt_on <= :now
+        and (e.claimed_until is null or e.claimed_until <= :now)
+      order by e.id
+      for update of e skip locked""";
+
+  /**
    * Writes the lease of every claimed row that shares one lease end, in ONE statement (1.6.0; one
    * flushed update per row before): {@code claimed_until} and {@code next_attempt_on} - the latter
    * so a pre-1.3.0 relay sees a leased row as not due - and clears {@code sending_since} (1.9.0):

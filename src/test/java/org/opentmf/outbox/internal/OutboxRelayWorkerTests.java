@@ -2700,4 +2700,321 @@ class OutboxRelayWorkerTests {
 
     assertThat(kindOf(event.getLastError())).isEqualTo("TerminalOutboxException");
   }
+
+  // ------------------------------------------------------------ a key's run as one unit, 1.11.1
+
+  /** A lane of two slots that claims up to eight rows ahead: room for a key's run. */
+  private final OutboxConcurrentLane wide =
+      fast(new OutboxConcurrentLane(2, 8, false, Duration.ofSeconds(5)));
+
+  /** The run statements and the guarded release, on the fake table, and a key run of four. */
+  private OutboxRelayWorker runs() {
+    properties.getConcurrent().setKeyRun(4);
+    when(repository.keyRunTails(any(), anyInt()))
+        .thenAnswer(
+            inv -> {
+              int limit = inv.getArgument(1);
+              List<OutboxEvent> tails = new ArrayList<>();
+              for (long head : idsOf(inv.getArgument(0))) {
+                String key = table.get(head).getOrderingKey();
+                pendingConcurrent().stream()
+                    .filter(e -> key.equals(e.getOrderingKey()) && e.getId() > head)
+                    .sorted(Comparator.comparing(OutboxEvent::getId))
+                    .limit(limit)
+                    .forEach(tails::add);
+              }
+              return tails;
+            });
+    when(repository.lockKeyRunTails(any(), any()))
+        .thenAnswer(
+            inv -> {
+              OffsetDateTime now = inv.getArgument(0);
+              return idsOf(inv.getArgument(1)).stream()
+                  .filter(id -> claimable(table.get(id), now) && !lockedElsewhere.contains(id))
+                  .toList();
+            });
+    when(repository.releaseLeases(any(), any(), any()))
+        .thenAnswer(
+            inv -> {
+              List<Long> ids = idsOf(inv.getArgument(0));
+              String inner = ((String) inv.getArgument(1)).replaceAll("[{}\"]", "");
+              List<OffsetDateTime> stamps =
+                  Stream.of(inner.split(",")).map(OffsetDateTime::parse).toList();
+              int released = 0;
+              for (int i = 0; i < ids.size(); i++) {
+                OutboxEvent row = table.get(ids.get(i));
+                if (row.getClaimedUntil() != null && row.getClaimedUntil().isEqual(stamps.get(i))) {
+                  row.setClaimedUntil(null);
+                  row.setNextAttemptOn(inv.getArgument(2));
+                  released++;
+                }
+              }
+              return released;
+            });
+    return workerOn(wide);
+  }
+
+  private void relayRuns(OutboxRelayWorker worker) {
+    worker.relayBatch(false);
+    idle(wide, 2);
+  }
+
+  @AfterEach
+  void closeWideLane() {
+    wide.close();
+    properties.getConcurrent().setKeyRun(1);
+  }
+
+  /** The sends in the order the publisher saw them. */
+  private List<Long> recordSends() {
+    List<Long> sent = new CopyOnWriteArrayList<>();
+    doAnswer(
+            inv -> {
+              sent.add(inv.<OutboxEvent>getArgument(0).getId());
+              return null;
+            })
+        .when(publisher)
+        .deliver(any());
+    return sent;
+  }
+
+  @Test
+  void aKeysRun_isLeasedByOneClaim_sentInIdOrder_andEachRowBookedOnItsOwn() {
+    OutboxRelayWorker worker = runs();
+    concurrent(1L, "k");
+    concurrent(2L, "k");
+    concurrent(3L, "k");
+    List<Long> sent = recordSends();
+
+    relayRuns(worker);
+
+    verify(repository, times(1)).stampLeases(any(), eq("{1,2,3}"));
+    assertThat(sent).containsExactly(1L, 2L, 3L);
+    assertThat(table.values()).allMatch(e -> e.getRelayedOn() != null && e.getClaimedUntil() == null);
+    assertThat(bookings).hasSize(3); // one booking per row, each renewing the next
+  }
+
+  @Test
+  void aKeyRunOfOne_takesOneRowOfAKeyPerClaim_asBefore() {
+    OutboxRelayWorker worker = runs();
+    properties.getConcurrent().setKeyRun(1);
+    concurrent(1L, "k");
+    concurrent(2L, "k");
+
+    relayRuns(worker);
+
+    verify(repository, never()).keyRunTails(any(), anyInt());
+    assertThat(table.get(1L).getRelayedOn()).isNotNull();
+    assertThat(table.get(2L).getRelayedOn()).isNull(); // the next claim's head
+  }
+
+  @Test
+  void aFailedRow_endsTheRun_andTheRowsBehindItAreReleased_dueAtOnce_unsent() {
+    OutboxRelayWorker worker = runs();
+    concurrent(1L, "k");
+    OutboxEvent failing = concurrent(2L, "k");
+    concurrent(3L, "k");
+    List<Long> sent = recordSends();
+    doAnswer(
+            inv -> {
+              sent.add(2L);
+              throw new IllegalStateException("receiver down");
+            })
+        .when(publisher)
+        .deliver(failing);
+
+    relayRuns(worker);
+
+    assertThat(sent).containsExactly(1L, 2L);
+    assertThat(table.get(1L).getRelayedOn()).isNotNull();
+    assertThat(failing.getAttempts()).isEqualTo(1);
+    assertThat(failing.getNextAttemptOn()).isAfter(OffsetDateTime.now()); // backing off
+    OutboxEvent behind = table.get(3L);
+    assertThat(behind.getClaimedUntil()).isNull(); // released in the failure's booking
+    assertThat(behind.getNextAttemptOn()).isBeforeOrEqualTo(OffsetDateTime.now());
+    assertThat(behind.getAttempts()).isZero();
+
+    relayRuns(worker); // the next claim: row 3 is its key's due head now (row 2 backs off)
+
+    assertThat(sent).containsExactly(1L, 2L, 3L);
+  }
+
+  @Test
+  void aRowNotDueBehindTheHead_endsTheRun_beforeIt() {
+    OutboxRelayWorker worker = runs();
+    concurrent(1L, "k");
+    concurrent(2L, "k").setReleaseAt(OffsetDateTime.now().plusMinutes(5));
+    concurrent(3L, "k");
+
+    worker.relayBatch(false);
+
+    verify(repository).stampLeases(any(), eq("{1}"));
+    verify(repository, never()).lockKeyRunTails(any(), any());
+    idle(wide, 2);
+  }
+
+  @Test
+  void aRowAnotherTransactionHoldsLocked_endsTheRun_beforeIt() {
+    OutboxRelayWorker worker = runs();
+    concurrent(1L, "k");
+    concurrent(2L, "k");
+    concurrent(3L, "k");
+    lockedElsewhere.add(2L); // an operator's cancel, say
+
+    worker.relayBatch(false);
+
+    verify(repository).stampLeases(any(), eq("{1}"));
+    idle(wide, 2);
+  }
+
+  @Test
+  void theRoomTheHeadsLeft_boundsTheRuns_overTheClaim() {
+    OutboxRelayWorker worker = runs();
+    for (long id = 1; id <= 6; id++) {
+      concurrent(id, "a");
+    }
+    for (long id = 7; id <= 12; id++) {
+      concurrent(id, "b");
+    }
+    for (long id = 13; id <= 18; id++) {
+      concurrent(id, "c");
+    }
+    List<Long> sent = recordSends();
+
+    int claimed = worker.relayBatch(false).concurrent();
+
+    assertThat(claimed).isLessThanOrEqualTo(8); // the lane's room, whatever the runs want
+    idle(wide, 2);
+    assertThat(sent).containsSubsequence(1L, 2L, 3L).containsSubsequence(7L, 8L);
+  }
+
+  @Test
+  void aRowCancelledBeforeItsTurn_isReleasedUnsent_andTheRunGoesOnBehindIt() {
+    OutboxRelayWorker worker = runs();
+    OutboxEvent head = concurrent(1L, "k");
+    OutboxEvent cancelled = concurrent(2L, "k");
+    concurrent(3L, "k");
+    List<Long> sent = recordSends();
+    doAnswer(
+            inv -> {
+              sent.add(1L);
+              cancelled.setCancelledOn(OffsetDateTime.now()); // the operator was quicker
+              return null;
+            })
+        .when(publisher)
+        .deliver(head);
+
+    relayRuns(worker);
+
+    assertThat(sent).containsExactly(1L, 3L);
+    assertThat(cancelled.getClaimedUntil()).isNull();
+    assertThat(cancelled.getRelayedOn()).isNull();
+    assertThat(table.get(3L).getRelayedOn()).isNotNull();
+  }
+
+  @Test
+  void aRowLostToAnotherHolder_endsTheRun_andTheRestIsReleased() {
+    OutboxRelayWorker worker = runs();
+    OutboxEvent head = concurrent(1L, "k");
+    OutboxEvent taken = concurrent(2L, "k");
+    concurrent(3L, "k");
+    List<Long> sent = recordSends();
+    doAnswer(
+            inv -> {
+              sent.add(1L);
+              taken.setClaimedUntil(OffsetDateTime.now().plusMinutes(9)); // another holder's
+              return null;
+            })
+        .when(publisher)
+        .deliver(head);
+
+    relayRuns(worker);
+
+    assertThat(sent).containsExactly(1L);
+    assertThat(head.getRelayedOn()).isNotNull();
+    assertThat(table.get(3L).getClaimedUntil()).isNull(); // released, due for the next claim
+    assertThat(table.get(3L).getRelayedOn()).isNull();
+  }
+
+  @Test
+  void aHeadWhoseLeaseLapsedBeforeItsBooking_endsTheRun_andTheRestIsReleased() {
+    OutboxRelayWorker worker = runs();
+    OutboxEvent head = concurrent(1L, "k");
+    concurrent(2L, "k");
+    List<Long> sent = recordSends();
+    doAnswer(
+            inv -> {
+              sent.add(1L);
+              head.setClaimedUntil(OffsetDateTime.now().plusMinutes(9)); // lapsed, re-stamped
+              return null;
+            })
+        .when(publisher)
+        .deliver(head);
+
+    relayRuns(worker);
+
+    assertThat(sent).containsExactly(1L);
+    assertThat(head.getRelayedOn()).isNull(); // the other holder books it
+    assertThat(table.get(2L).getClaimedUntil()).isNull();
+  }
+
+  @Test
+  void aRelayedBookingRefusedByAListener_endsTheRun_andTheRestIsReleased() {
+    OutboxRelayWorker worker = runs();
+    concurrent(1L, "k");
+    concurrent(2L, "k");
+    List<Long> sent = recordSends();
+    listeners.add(
+        row -> {
+          throw new IllegalStateException("listener refuses");
+        });
+
+    relayRuns(worker);
+
+    assertThat(sent).containsExactly(1L);
+    assertThat(table.get(1L).getAttempts()).isEqualTo(1); // booked as a failure instead
+    assertThat(table.get(2L).getClaimedUntil()).isNull();
+  }
+
+  @Test
+  void aHeadWhoseLastSendLapsedUnderWay_runsAlone_andItsLapseIsBooked() {
+    OutboxRelayWorker worker = runs();
+    OutboxEvent head = concurrent(1L, "k");
+    head.setClaimedUntil(OffsetDateTime.now().minusSeconds(1));
+    head.setSendingSince(OffsetDateTime.now().minusSeconds(5));
+    concurrent(2L, "k");
+    List<Long> sent = recordSends();
+
+    relayRuns(worker);
+
+    verify(repository, never()).keyRunTails(any(), anyInt());
+    assertThat(sent).isEmpty();
+    assertThat(head.getAttempts()).isEqualTo(1); // the lapse, counted
+  }
+
+  @Test
+  void aQueuedRunWhoseHeadWaitedAndWasTaken_sendsNothing_andReleasesTheRest() throws Exception {
+    runs();
+    when(publisher.lease(any())).thenReturn(Duration.ofSeconds(1));
+    CountDownLatch gate = new CountDownLatch(1);
+    List<Long> delivered = new CopyOnWriteArrayList<>();
+    OutboxConcurrentLane oneSlot = oneSlotHeldBy(gate, delivered);
+    OutboxRelayWorker queued = workerOn(oneSlot);
+    concurrent(1L, null); // holds the one slot
+    OutboxEvent head = concurrent(2L, "k");
+    concurrent(3L, "k");
+    try {
+      queued.relayBatch(false); // row 1 sending; the run of rows 2 and 3 waits in the queue
+      waitPastATenth();
+      head.setClaimedUntil(OffsetDateTime.now().plusMinutes(9)); // taken by another holder
+      gate.countDown();
+      idle(oneSlot, 1);
+    } finally {
+      oneSlot.close();
+    }
+
+    assertThat(delivered).containsExactly(1L);
+    assertThat(table.get(3L).getClaimedUntil()).isNull(); // released, due for the next claim
+    assertThat(table.get(3L).getRelayedOn()).isNull();
+  }
 }
