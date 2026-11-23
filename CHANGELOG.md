@@ -4,6 +4,21 @@
 
 ### Added
 
+- **A row appended inside a span stores its trace context** (OUTBOX-AN-APPEND-CARRIES-THE-CURRENT-TRACE-1):
+  an append that gives no `traceparent` header stores the current trace context - the W3C
+  `traceparent`, and `tracestate` when there is one - as the application's Micrometer
+  `Propagator` writes it for the current span of its `Tracer`. The relay then sends the event in
+  that trace, through the `outbox relay` span. Up to 1.11.0 only a caller that put a
+  `traceparent` on the row by hand kept its trace; an event appended while a message was
+  processed left on a new trace. A `traceparent` the caller gives is stored as it is; an
+  unsampled span is stored too; baggage is never stored. Nothing is stored without Micrometer
+  Tracing (a new optional dependency), without a `Tracer` or `Propagator` bean or without a
+  current span. **A service's test that compares a row's stored headers exactly will now see
+  `traceparent` (and `tracestate`) on a row appended inside a span:** adjust the test, or set
+  `opentmf.outbox.stamp-trace-context=false` (default `true`) to store only the headers the caller
+  gives, as before. No signature changed; a new `OutboxWriter` constructor takes the trace
+  context, the old ones store none.
+
 - **A lookup of an aggregate's rows has an index** (OUTBOX-THE-LOOKUP-BY-AGGREGATE-HAS-A-PLAN-ON-A-LOADED-TABLE-1):
   changeset `010-outbox-aggregate-lookup` builds `ix_outbox_aggregate (aggregate_type,
   aggregate_id, id)` `CONCURRENTLY`, with its rollback. A service that looks up the newest row of

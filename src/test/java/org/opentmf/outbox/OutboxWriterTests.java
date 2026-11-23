@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -12,9 +13,12 @@ import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.opentmf.outbox.internal.OutboxAppended;
+import org.opentmf.outbox.internal.OutboxClock;
 import org.opentmf.outbox.internal.OutboxEventRepository;
 import org.opentmf.outbox.internal.OutboxLaneStamper;
+import org.opentmf.outbox.internal.OutboxTraceContext;
 import org.springframework.context.ApplicationEventPublisher;
+import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
 /** The append seam: payload frozen at write, headers only when present, the after-insert nudge. */
@@ -129,5 +133,86 @@ class OutboxWriterTests {
     OutboxEvent saved = writer.append("agg", "a-1", "e.v1", "https://hub/x", Map.of());
 
     assertThat(saved.getLane()).isNull(); // rides ORDERED
+  }
+
+  // --- the trace context of the append ---
+
+  private static final String CURRENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+  private OutboxWriter tracing(OutboxTraceContext traceContext) {
+    return new OutboxWriter(
+        repository, events, new ObjectMapper(), () -> null, OutboxClock.system(),
+        () -> traceContext);
+  }
+
+  private static Map<String, String> stored(OutboxEvent saved) {
+    return new ObjectMapper()
+        .readValue(saved.getHeaders(), new TypeReference<Map<String, String>>() {});
+  }
+
+  @Test
+  void aNonEmptyMapWithoutATraceparentKey_isStamped_andKeepsItsOtherEntries() {
+    stubSave();
+    OutboxWriter traced =
+        tracing(() -> Map.of("traceparent", CURRENT, "tracestate", "vendor=a"));
+
+    OutboxEvent saved =
+        traced.append("agg", "a-1", "e.v1", "topic", Map.of(), Map.of("x-schema-version", "1"));
+
+    assertThat(stored(saved))
+        .containsOnly(
+            Map.entry("x-schema-version", "1"),
+            Map.entry("traceparent", CURRENT),
+            Map.entry("tracestate", "vendor=a"));
+  }
+
+  @Test
+  void aTraceparentKeyInAnotherLetterCase_isKept_andNotStampedTwice() {
+    stubSave();
+    OutboxTraceContext current = mock(OutboxTraceContext.class);
+    OutboxWriter traced = tracing(current);
+
+    OutboxEvent saved =
+        traced.append(
+            OutboxAppend.of("agg", "a-1", "e.v1", "topic", Map.of())
+                .withHeaders(Map.of("TraceParent", "00-given-01", "tracestate", "given=1")));
+
+    assertThat(stored(saved))
+        .containsOnly(Map.entry("TraceParent", "00-given-01"), Map.entry("tracestate", "given=1"));
+    verify(current, never()).current();
+  }
+
+  @Test
+  void anEmptyMap_isStamped() {
+    stubSave();
+    OutboxWriter traced = tracing(() -> Map.of("traceparent", CURRENT));
+
+    OutboxEvent saved = traced.append("agg", "a-1", "e.v1", "topic", Map.of(), Map.of());
+
+    assertThat(stored(saved)).containsExactly(Map.entry("traceparent", CURRENT));
+  }
+
+  @Test
+  void aTracestateTheCallerGives_isNotReplaced() {
+    stubSave();
+    OutboxWriter traced =
+        tracing(() -> Map.of("traceparent", CURRENT, "tracestate", "vendor=a"));
+
+    OutboxEvent saved =
+        traced.append("agg", "a-1", "e.v1", "topic", Map.of(), Map.of("TraceState", "given=1"));
+
+    assertThat(stored(saved))
+        .containsOnly(Map.entry("TraceState", "given=1"), Map.entry("traceparent", CURRENT));
+  }
+
+  @Test
+  void noCurrentTraceContext_storesNothing() {
+    stubSave();
+
+    OutboxEvent none = tracing(Map::of).append("agg", "a-1", "e.v1", "topic", Map.of());
+    OutboxEvent off = tracing(null).append("agg", "a-2", "e.v1", "topic", Map.of());
+
+    assertThat(none.getHeaders()).isNull();
+    assertThat(off.getHeaders()).isNull();
   }
 }

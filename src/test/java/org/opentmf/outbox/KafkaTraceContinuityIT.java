@@ -5,6 +5,9 @@ import static org.awaitility.Awaitility.await;
 
 import io.micrometer.observation.Observation;
 import io.micrometer.observation.ObservationRegistry;
+import io.micrometer.tracing.Span;
+import io.micrometer.tracing.Tracer;
+import io.micrometer.tracing.propagation.Propagator;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.sdk.trace.data.SpanData;
 import jakarta.persistence.EntityManagerFactory;
@@ -16,6 +19,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.Test;
 import org.opentmf.outbox.fixture.TestTracing;
+import org.opentmf.outbox.internal.OutboxEventRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -42,6 +46,10 @@ import org.testcontainers.kafka.KafkaContainer;
  * and a transactional producer: the relay span must be current on the thread that sends, whichever
  * that is. The span covers the row's round (OUTBOX-A-RELAY-PASS-THAT-MOVES-ROWS-IS-ONE-TRACE-1):
  * the booking - seen by a relayed listener, which runs inside it - is inside the span.
+ *
+ * <p>A third row is appended inside a span of the application's own and given no header
+ * (OUTBOX-AN-APPEND-CARRIES-THE-CURRENT-TRACE-1): the writer stores that span's {@code
+ * traceparent}, and its record continues that span's trace through its own relay span.
  *
  * <p>One context per combination: the subclasses set the lane and the producer kind.
  *
@@ -97,6 +105,18 @@ abstract class KafkaTraceContinuityIT {
       };
     }
 
+    /** The application's tracer, as Boot's tracing registers it: the writer reads the span. */
+    @Bean
+    Tracer tracer(TestTracing tracing) {
+      return tracing.tracer();
+    }
+
+    /** The application's W3C propagator, as Boot's tracing registers it. */
+    @Bean
+    Propagator propagator(TestTracing tracing) {
+      return tracing.propagator();
+    }
+
     /** The application's registry, its tracing handlers on - Boot's own then backs off. */
     @Bean
     ObservationRegistry observationRegistry(TestTracing tracing) {
@@ -117,12 +137,26 @@ abstract class KafkaTraceContinuityIT {
   @Autowired private OutboxWriter writer;
   @Autowired private PlatformTransactionManager txManager;
   @Autowired private TestTracing tracing;
+  @Autowired private OutboxEventRepository repository;
 
   @Test
   void aStoredTraceparent_continues_andARowWithoutOne_startsItsOwnTrace() {
     String topic = "trace-" + UUID.randomUUID();
     OBSERVED_AT_BOOKING.clear();
     TransactionTemplate tx = new TransactionTemplate(txManager);
+    Tracer tracer = tracing.tracer();
+    Span request = tracer.nextSpan().name("request").start();
+    Long inRequest;
+    try (Tracer.SpanInScope scope = tracer.withSpan(request)) {
+      inRequest =
+          tx.execute(
+                  s ->
+                      writer
+                          .append("thing", "agg-in-request", "thing.created.v1", topic, Map.of())
+                          .getId());
+    } finally {
+      request.end();
+    }
     tx.executeWithoutResult(
         s -> {
           writer.append(
@@ -137,9 +171,9 @@ abstract class KafkaTraceContinuityIT {
 
     List<ConsumerRecord<String, String>> records;
     try (KafkaProbe probe = new KafkaProbe(kafka.getBootstrapServers(), topic)) {
-      records = probe.drain(2, Duration.ofSeconds(30));
+      records = probe.drain(3, Duration.ofSeconds(30));
     }
-    assertThat(records).as("both rows on the topic").hasSize(2);
+    assertThat(records).as("the three rows on the topic").hasSize(3);
     String traced = traceparentOf(records, "agg-traced");
     String untraced = traceparentOf(records, "agg-untraced");
 
@@ -152,10 +186,8 @@ abstract class KafkaTraceContinuityIT {
         .isNotEqualTo(TRACE);
 
     // the round's span ends after the booking, which may follow the record's arrival
-    await()
-        .atMost(Duration.ofSeconds(10))
-        .until(() -> tracing.spans().stream().anyMatch(s -> s.getName().equals("outbox relay")));
-    SpanData relay = tracing.span("outbox relay");
+    await().atMost(Duration.ofSeconds(10)).until(() -> relaySpans().size() == 2);
+    SpanData relay = relaySpanIn(TRACE);
     assertThat(relay.getParentSpanId()).as("relay span <- stored span").isEqualTo(STORED_SPAN);
     List<SpanData> producers =
         tracing.spans().stream()
@@ -167,13 +199,44 @@ abstract class KafkaTraceContinuityIT {
     assertThat(producers.get(0).getSpanId())
         .as("the header that left")
         .isEqualTo(TestTracing.spanId(traced));
-    await().atMost(Duration.ofSeconds(10)).until(() -> OBSERVED_AT_BOOKING.size() == 2);
+    await().atMost(Duration.ofSeconds(10)).until(() -> OBSERVED_AT_BOOKING.size() == 3);
     assertThat(OBSERVED_AT_BOOKING)
-        .as("the traced row is booked inside its relay span, the other in none")
+        .as("the traced rows are booked inside their relay spans, the other in none")
         .containsEntry("agg-traced", "opentmf.outbox.relay")
+        .containsEntry("agg-in-request", "opentmf.outbox.relay")
         .containsEntry("agg-untraced", "none");
     assertThat(relay.getAttributes().asMap().toString())
         .contains("outbox.claim.ms=", "outbox.queued.ms=", "outbox.destination=" + topic);
+
+    // the row appended inside the request span stored that span, and its event continues it
+    String requestTrace = request.context().traceId();
+    String storedInRequest = repository.findById(inRequest).orElseThrow().getHeaders();
+    assertThat(storedInRequest)
+        .as("the writer stored the request span's traceparent")
+        .contains("00-" + requestTrace + "-" + request.context().spanId() + "-");
+    String fromRequest = traceparentOf(records, "agg-in-request");
+    assertThat(TestTracing.traceId(fromRequest))
+        .as("the event continues the request's trace")
+        .isEqualTo(requestTrace);
+    SpanData requestRelay = relaySpanIn(requestTrace);
+    assertThat(requestRelay.getParentSpanId())
+        .as("relay span <- the request span")
+        .isEqualTo(request.context().spanId());
+    assertThat(TestTracing.traceId(untraced))
+        .as("the untraced row, appended outside any span, stored none")
+        .isNotEqualTo(requestTrace);
+  }
+
+  private List<SpanData> relaySpans() {
+    return tracing.spans().stream().filter(s -> s.getName().equals("outbox relay")).toList();
+  }
+
+  /** The one relay span of that trace. */
+  private SpanData relaySpanIn(String traceId) {
+    List<SpanData> inTrace =
+        relaySpans().stream().filter(s -> s.getTraceId().equals(traceId)).toList();
+    assertThat(inTrace).as("one relay span in trace %s", traceId).hasSize(1);
+    return inTrace.get(0);
   }
 
   private static String traceparentOf(List<ConsumerRecord<String, String>> records, String key) {

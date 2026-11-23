@@ -46,6 +46,7 @@ class KafkaLessStartupTests {
   private static final String LIBRARY_PACKAGE = "org.opentmf.outbox.";
   private static final String KAFKA_PACKAGE = "org.springframework.kafka";
   private static final String WEB_PACKAGE = "org.springframework.web";
+  private static final String TRACING_PACKAGE = "io.micrometer.tracing";
 
   @Configuration(proxyBeanMethods = false)
   static class ConsumerWithoutJpa {
@@ -149,6 +150,18 @@ class KafkaLessStartupTests {
             });
   }
 
+  /** Micrometer Tracing is optional: without it the writer stores no trace context. */
+  @Test
+  void aTracingLessConsumerStarts_withAWriterThatStoresNoTraceContext() {
+    consumerWithout(TRACING_PACKAGE)
+        .run(
+            context -> {
+              assertThat(context).hasNotFailed();
+              assertBeanIs(context, "outboxWriter", OutboxWriter.class);
+              assertThat(context).doesNotHaveBean("outboxTraceContext");
+            });
+  }
+
   /**
    * A {@code @Configuration} nested class is a component-scan candidate: a consumer scanning
    * {@code org.opentmf.outbox} (the ITs' test application does) would register it ahead of the
@@ -168,14 +181,21 @@ class KafkaLessStartupTests {
   }
 
   @Test
-  void theOuterAutoConfigurationNamesNoKafkaOrWebTypeInAnySignature() {
+  void theOuterAutoConfigurationNamesNoKafkaWebOrTracingTypeInAnySignature() {
     for (Method m : OutboxAutoConfiguration.class.getDeclaredMethods()) {
       for (Class<?> t : m.getParameterTypes()) {
-        assertThat(t.getName()).as(m.getName()).doesNotStartWith(KAFKA_PACKAGE);
-        assertThat(t.getName()).as(m.getName()).doesNotStartWith(WEB_PACKAGE);
+        assertThat(t.getName())
+            .as(m.getName())
+            .doesNotStartWith(KAFKA_PACKAGE)
+            .doesNotStartWith(WEB_PACKAGE)
+            .doesNotStartWith(TRACING_PACKAGE);
       }
-      assertThat(m.getReturnType().getName()).as(m.getName()).doesNotStartWith(KAFKA_PACKAGE);
-      assertThat(m.getReturnType().getName()).as(m.getName()).doesNotStartWith(WEB_PACKAGE);
+      assertThat(m.toGenericString()).as(m.getName()).doesNotContain(TRACING_PACKAGE);
+      assertThat(m.getReturnType().getName())
+          .as(m.getName())
+          .doesNotStartWith(KAFKA_PACKAGE)
+          .doesNotStartWith(WEB_PACKAGE)
+          .doesNotStartWith(TRACING_PACKAGE);
     }
   }
 }

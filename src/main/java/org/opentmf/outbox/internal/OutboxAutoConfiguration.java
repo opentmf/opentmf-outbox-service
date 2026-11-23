@@ -2,6 +2,8 @@ package org.opentmf.outbox.internal;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.observation.ObservationRegistry;
+import io.micrometer.tracing.Tracer;
+import io.micrometer.tracing.propagation.Propagator;
 import java.time.Clock;
 import java.util.List;
 import javax.sql.DataSource;
@@ -87,10 +89,17 @@ public class OutboxAutoConfiguration {
       ApplicationEventPublisher eventPublisher,
       ObjectMapper objectMapper,
       ObjectProvider<OutboxLaneStamper> laneStamper,
-      OutboxClock clock) {
+      OutboxClock clock,
+      OutboxProperties properties,
+      ObjectProvider<OutboxTraceContext> traceContext) {
     // lazy: a consumer publisher that appends through the writer must not form a cycle
     return new OutboxWriter(
-        repository, eventPublisher, objectMapper, laneStamper::getObject, clock);
+        repository,
+        eventPublisher,
+        objectMapper,
+        laneStamper::getObject,
+        clock,
+        properties.isStampTraceContext() ? traceContext::getIfUnique : () -> null);
   }
 
   /**
@@ -346,6 +355,22 @@ public class OutboxAutoConfiguration {
           objectMapper,
           environment.getProperty("spring.application.name", "unknown"),
           relayObservation(observationRegistry));
+    }
+  }
+
+  /**
+   * The trace context of an append (1.11.1), read from the application's Micrometer {@code Tracer}
+   * and {@code Propagator} - name-guarded like the publisher defaults, so a consumer without
+   * Micrometer Tracing links none of its types and its writer stores no trace context.
+   */
+  @ConditionalOnClass(name = "io.micrometer.tracing.Tracer")
+  static class TraceContextConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean(OutboxTraceContext.class)
+    OutboxTraceContext outboxTraceContext(
+        ObjectProvider<Tracer> tracer, ObjectProvider<Propagator> propagator) {
+      return new OutboxTracerContext(tracer, propagator);
     }
   }
 

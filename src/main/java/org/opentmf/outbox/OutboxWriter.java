@@ -1,6 +1,7 @@
 package org.opentmf.outbox;
 
 import java.time.OffsetDateTime;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.Supplier;
@@ -8,6 +9,7 @@ import org.opentmf.outbox.internal.OutboxAppended;
 import org.opentmf.outbox.internal.OutboxClock;
 import org.opentmf.outbox.internal.OutboxEventRepository;
 import org.opentmf.outbox.internal.OutboxLaneStamper;
+import org.opentmf.outbox.internal.OutboxTraceContext;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -22,6 +24,12 @@ import tools.jackson.databind.ObjectMapper;
  * through the relay's own router - frozen at write time like the headers. The router is
  * resolved lazily, so a publisher that itself appends through this writer creates no cycle.
  *
+ * <p>Since 1.11.1 a row the caller gives no {@code traceparent} header (in any letter case) stores
+ * the trace context current at the append, as the application's tracing writes it: the relay then
+ * sends the event in the trace of the work that appended it. A header the caller gives is stored as
+ * it is. Without a current trace context - no tracing on the classpath, no current span - nothing
+ * is added. {@code opentmf.outbox.stamp-trace-context=false} turns it off.
+ *
  * <p>After the insert an {@code OutboxAppended} application event is published; it fires the
  * relay nudge only AFTER the caller's transaction commits.
  */
@@ -32,6 +40,7 @@ public class OutboxWriter {
   private final ObjectMapper objectMapper;
   private final Supplier<OutboxLaneStamper> laneStamper;
   private final OutboxClock clock;
+  private final Supplier<OutboxTraceContext> traceContext;
 
   /** A writer that stamps no lane - every row it appends rides ORDERED. */
   public OutboxWriter(
@@ -60,11 +69,27 @@ public class OutboxWriter {
       ObjectMapper objectMapper,
       Supplier<OutboxLaneStamper> laneStamper,
       OutboxClock clock) {
+    this(repository, eventPublisher, objectMapper, laneStamper, clock, () -> null);
+  }
+
+  /**
+   * The library's writer with the trace context of each append (1.11.1): a row the caller gives no
+   * {@code traceparent} stores the one {@code traceContext} names as current - resolved at each
+   * append; a null supplier result stores none.
+   */
+  public OutboxWriter(
+      OutboxEventRepository repository,
+      ApplicationEventPublisher eventPublisher,
+      ObjectMapper objectMapper,
+      Supplier<OutboxLaneStamper> laneStamper,
+      OutboxClock clock,
+      Supplier<OutboxTraceContext> traceContext) {
     this.repository = repository;
     this.eventPublisher = eventPublisher;
     this.objectMapper = objectMapper;
     this.laneStamper = laneStamper;
     this.clock = clock;
+    this.traceContext = traceContext;
   }
 
   /**
@@ -139,7 +164,7 @@ public class OutboxWriter {
     event.setDestination(request.destination());
     event.setClientProfile(request.clientProfile());
     event.setPayload(objectMapper.writeValueAsString(request.payload()));
-    Map<String, String> headers = request.headers();
+    Map<String, String> headers = withTraceContext(request.headers());
     event.setHeaders(headers.isEmpty() ? null : objectMapper.writeValueAsString(headers));
     OffsetDateTime now = clock.now();
     event.setCreatedOn(now);
@@ -154,5 +179,33 @@ public class OutboxWriter {
     OutboxEvent saved = repository.save(event);
     eventPublisher.publishEvent(new OutboxAppended(saved.getId(), saved.getLane()));
     return saved;
+  }
+
+  /**
+   * The caller's headers, plus the current trace context when the caller gave no {@code
+   * traceparent}; a header the caller gave is never replaced.
+   */
+  private Map<String, String> withTraceContext(Map<String, String> given) {
+    OutboxTraceContext source = traceContext.get();
+    if (source == null || named(given, OutboxTraceContext.TRACEPARENT)) {
+      return given;
+    }
+    Map<String, String> current = source.current();
+    if (current.isEmpty()) {
+      return given;
+    }
+    Map<String, String> stamped = new LinkedHashMap<>(given);
+    current.forEach(
+        (name, value) -> {
+          if (!named(stamped, name)) {
+            stamped.put(name, value);
+          }
+        });
+    return stamped;
+  }
+
+  /** Whether {@code headers} has a header of that name, in any letter case. */
+  private static boolean named(Map<String, String> headers, String name) {
+    return headers.keySet().stream().anyMatch(name::equalsIgnoreCase);
   }
 }
