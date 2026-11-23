@@ -148,6 +148,7 @@ class DatabaseIT {
       probe.eligible(eligible);
       s.startPod("pod-a", "opentmf.outbox.concurrent.max-in-flight=1");
       s.startPod("pod-b");
+      HarnessState.print("D3 start", s); // information: what earlier scenarios left in this JVM
       AtomicBoolean pruning = new AtomicBoolean(true);
       AtomicLong pruned = new AtomicLong();
       CompletableFuture<Void> pruner =
@@ -182,6 +183,8 @@ class DatabaseIT {
       // in claim order (88-135 s measured on 1.8.0 and 1.9.0 alike). The starvation check this
       // scenario keeps is the drain's own: no row may wait longer than its share of the drain in
       // claim order allows - see starvedInClaimOrder.
+      HarnessState.print("D3 end", s);
+      HarnessState.printDrain("D3", Receiver.deliveries());
       Findings f = s.finish(Duration.ofMinutes(1), Expect.strict().pruned().skipStarvation());
       starvedInClaimOrder(f, eligible);
       noPrematureWrap(f, probeDir);
