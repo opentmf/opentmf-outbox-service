@@ -254,7 +254,6 @@ class OutboxClaimPlanIT {
     R call(A argument) throws Exception;
   }
 
-  /** Every plan node, depth first. */
   /** Every node of one statement's plan under both modes, for the record (the PR's evidence). */
   private static void printNodes(String what, String statement, Map<String, String> args)
       throws Exception {
@@ -282,6 +281,7 @@ class OutboxClaimPlanIT {
     }
   }
 
+  /** Every plan node, depth first. */
   private static List<JsonNode> nodes(JsonNode node, List<JsonNode> into) {
     into.add(node);
     JsonNode children = node.get("Plans");

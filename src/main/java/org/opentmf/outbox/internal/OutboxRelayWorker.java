@@ -444,6 +444,17 @@ class OutboxRelayWorker {
     if (keyRun <= 1 || budget <= 0 || runnable.isEmpty()) {
       return heads.stream().map(List::of).toList();
     }
+    Map<Long, List<OutboxEvent>> chosen = runTails(runnable, keyRun, budget, now);
+    Set<Long> locked = lockRunTails(chosen, now);
+    return leaseRuns(heads, chosen, locked, now);
+  }
+
+  /**
+   * Per runnable head (by id), the due prefix of its key's rows right behind it: at most {@code
+   * keyRun - 1} per head, at most {@code budget} over the claim, in the heads' order.
+   */
+  private Map<Long, List<OutboxEvent>> runTails(
+      List<Leased> runnable, int keyRun, int budget, OffsetDateTime now) {
     Map<String, List<OutboxEvent>> behind = new LinkedHashMap<>();
     for (OutboxEvent row :
         repository.keyRunTails(
@@ -465,12 +476,27 @@ class OutboxRelayWorker {
         chosen.put(head.event.getId(), tail);
       }
     }
-    Set<Long> locked =
-        chosen.isEmpty()
-            ? Set.of()
-            : new HashSet<>(
-                repository.lockKeyRunTails(
-                    now, idsLiteral(chosen.values().stream().flatMap(List::stream).toList())));
+    return chosen;
+  }
+
+  /** The chosen rows still due and leased by nobody, locked {@code FOR UPDATE SKIP LOCKED}. */
+  private Set<Long> lockRunTails(Map<Long, List<OutboxEvent>> chosen, OffsetDateTime now) {
+    return chosen.isEmpty()
+        ? Set.of()
+        : new HashSet<>(
+            repository.lockKeyRunTails(
+                now, idsLiteral(chosen.values().stream().flatMap(List::stream).toList())));
+  }
+
+  /**
+   * Every head with its run: the chosen rows behind it in order, up to the first that is not
+   * locked here, has no publisher or whose transport is paused here; each leased like its head.
+   */
+  private List<List<Leased>> leaseRuns(
+      List<Leased> heads,
+      Map<Long, List<OutboxEvent>> chosen,
+      Set<Long> locked,
+      OffsetDateTime now) {
     List<List<Leased>> runs = new ArrayList<>();
     for (Leased head : heads) {
       List<Leased> run = new ArrayList<>();

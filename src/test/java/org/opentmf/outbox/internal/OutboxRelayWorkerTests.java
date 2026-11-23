@@ -2754,8 +2754,8 @@ class OutboxRelayWorkerTests {
     return workerOn(wide);
   }
 
-  private void relayRuns(OutboxRelayWorker worker) {
-    worker.relayBatch(false);
+  private void relayRuns(OutboxRelayWorker runWorker) {
+    runWorker.relayBatch(false);
     idle(wide, 2);
   }
 
@@ -2780,13 +2780,13 @@ class OutboxRelayWorkerTests {
 
   @Test
   void aKeysRun_isLeasedByOneClaim_sentInIdOrder_andEachRowBookedOnItsOwn() {
-    OutboxRelayWorker worker = runs();
+    OutboxRelayWorker runWorker = runs();
     concurrent(1L, "k");
     concurrent(2L, "k");
     concurrent(3L, "k");
     List<Long> sent = recordSends();
 
-    relayRuns(worker);
+    relayRuns(runWorker);
 
     verify(repository, times(1)).stampLeases(any(), eq("{1,2,3}"));
     assertThat(sent).containsExactly(1L, 2L, 3L);
@@ -2796,12 +2796,12 @@ class OutboxRelayWorkerTests {
 
   @Test
   void aKeyRunOfOne_takesOneRowOfAKeyPerClaim_asBefore() {
-    OutboxRelayWorker worker = runs();
+    OutboxRelayWorker runWorker = runs();
     properties.getConcurrent().setKeyRun(1);
     concurrent(1L, "k");
     concurrent(2L, "k");
 
-    relayRuns(worker);
+    relayRuns(runWorker);
 
     verify(repository, never()).keyRunTails(any(), anyInt());
     assertThat(table.get(1L).getRelayedOn()).isNotNull();
@@ -2810,7 +2810,7 @@ class OutboxRelayWorkerTests {
 
   @Test
   void aFailedRow_endsTheRun_andTheRowsBehindItAreReleased_dueAtOnce_unsent() {
-    OutboxRelayWorker worker = runs();
+    OutboxRelayWorker runWorker = runs();
     concurrent(1L, "k");
     OutboxEvent failing = concurrent(2L, "k");
     concurrent(3L, "k");
@@ -2823,7 +2823,7 @@ class OutboxRelayWorkerTests {
         .when(publisher)
         .deliver(failing);
 
-    relayRuns(worker);
+    relayRuns(runWorker);
 
     assertThat(sent).containsExactly(1L, 2L);
     assertThat(table.get(1L).getRelayedOn()).isNotNull();
@@ -2834,19 +2834,19 @@ class OutboxRelayWorkerTests {
     assertThat(behind.getNextAttemptOn()).isBeforeOrEqualTo(OffsetDateTime.now());
     assertThat(behind.getAttempts()).isZero();
 
-    relayRuns(worker); // the next claim: row 3 is its key's due head now (row 2 backs off)
+    relayRuns(runWorker); // the next claim: row 3 is its key's due head now (row 2 backs off)
 
     assertThat(sent).containsExactly(1L, 2L, 3L);
   }
 
   @Test
   void aRowNotDueBehindTheHead_endsTheRun_beforeIt() {
-    OutboxRelayWorker worker = runs();
+    OutboxRelayWorker runWorker = runs();
     concurrent(1L, "k");
     concurrent(2L, "k").setReleaseAt(OffsetDateTime.now().plusMinutes(5));
     concurrent(3L, "k");
 
-    worker.relayBatch(false);
+    runWorker.relayBatch(false);
 
     verify(repository).stampLeases(any(), eq("{1}"));
     verify(repository, never()).lockKeyRunTails(any(), any());
@@ -2855,13 +2855,13 @@ class OutboxRelayWorkerTests {
 
   @Test
   void aRowAnotherTransactionHoldsLocked_endsTheRun_beforeIt() {
-    OutboxRelayWorker worker = runs();
+    OutboxRelayWorker runWorker = runs();
     concurrent(1L, "k");
     concurrent(2L, "k");
     concurrent(3L, "k");
     lockedElsewhere.add(2L); // an operator's cancel, say
 
-    worker.relayBatch(false);
+    runWorker.relayBatch(false);
 
     verify(repository).stampLeases(any(), eq("{1}"));
     idle(wide, 2);
@@ -2869,7 +2869,7 @@ class OutboxRelayWorkerTests {
 
   @Test
   void theRoomTheHeadsLeft_boundsTheRuns_overTheClaim() {
-    OutboxRelayWorker worker = runs();
+    OutboxRelayWorker runWorker = runs();
     for (long id = 1; id <= 6; id++) {
       concurrent(id, "a");
     }
@@ -2881,7 +2881,7 @@ class OutboxRelayWorkerTests {
     }
     List<Long> sent = recordSends();
 
-    int claimed = worker.relayBatch(false).concurrent();
+    int claimed = runWorker.relayBatch(false).concurrent();
 
     assertThat(claimed).isLessThanOrEqualTo(8); // the lane's room, whatever the runs want
     idle(wide, 2);
@@ -2890,7 +2890,7 @@ class OutboxRelayWorkerTests {
 
   @Test
   void aRowCancelledBeforeItsTurn_isReleasedUnsent_andTheRunGoesOnBehindIt() {
-    OutboxRelayWorker worker = runs();
+    OutboxRelayWorker runWorker = runs();
     OutboxEvent head = concurrent(1L, "k");
     OutboxEvent cancelled = concurrent(2L, "k");
     concurrent(3L, "k");
@@ -2904,7 +2904,7 @@ class OutboxRelayWorkerTests {
         .when(publisher)
         .deliver(head);
 
-    relayRuns(worker);
+    relayRuns(runWorker);
 
     assertThat(sent).containsExactly(1L, 3L);
     assertThat(cancelled.getClaimedUntil()).isNull();
@@ -2914,7 +2914,7 @@ class OutboxRelayWorkerTests {
 
   @Test
   void aRowLostToAnotherHolder_endsTheRun_andTheRestIsReleased() {
-    OutboxRelayWorker worker = runs();
+    OutboxRelayWorker runWorker = runs();
     OutboxEvent head = concurrent(1L, "k");
     OutboxEvent taken = concurrent(2L, "k");
     concurrent(3L, "k");
@@ -2928,7 +2928,7 @@ class OutboxRelayWorkerTests {
         .when(publisher)
         .deliver(head);
 
-    relayRuns(worker);
+    relayRuns(runWorker);
 
     assertThat(sent).containsExactly(1L);
     assertThat(head.getRelayedOn()).isNotNull();
@@ -2938,7 +2938,7 @@ class OutboxRelayWorkerTests {
 
   @Test
   void aHeadWhoseLeaseLapsedBeforeItsBooking_endsTheRun_andTheRestIsReleased() {
-    OutboxRelayWorker worker = runs();
+    OutboxRelayWorker runWorker = runs();
     OutboxEvent head = concurrent(1L, "k");
     concurrent(2L, "k");
     List<Long> sent = recordSends();
@@ -2951,7 +2951,7 @@ class OutboxRelayWorkerTests {
         .when(publisher)
         .deliver(head);
 
-    relayRuns(worker);
+    relayRuns(runWorker);
 
     assertThat(sent).containsExactly(1L);
     assertThat(head.getRelayedOn()).isNull(); // the other holder books it
@@ -2960,7 +2960,7 @@ class OutboxRelayWorkerTests {
 
   @Test
   void aRelayedBookingRefusedByAListener_endsTheRun_andTheRestIsReleased() {
-    OutboxRelayWorker worker = runs();
+    OutboxRelayWorker runWorker = runs();
     concurrent(1L, "k");
     concurrent(2L, "k");
     List<Long> sent = recordSends();
@@ -2969,7 +2969,7 @@ class OutboxRelayWorkerTests {
           throw new IllegalStateException("listener refuses");
         });
 
-    relayRuns(worker);
+    relayRuns(runWorker);
 
     assertThat(sent).containsExactly(1L);
     assertThat(table.get(1L).getAttempts()).isEqualTo(1); // booked as a failure instead
@@ -2978,14 +2978,14 @@ class OutboxRelayWorkerTests {
 
   @Test
   void aHeadWhoseLastSendLapsedUnderWay_runsAlone_andItsLapseIsBooked() {
-    OutboxRelayWorker worker = runs();
+    OutboxRelayWorker runWorker = runs();
     OutboxEvent head = concurrent(1L, "k");
     head.setClaimedUntil(OffsetDateTime.now().minusSeconds(1));
     head.setSendingSince(OffsetDateTime.now().minusSeconds(5));
     concurrent(2L, "k");
     List<Long> sent = recordSends();
 
-    relayRuns(worker);
+    relayRuns(runWorker);
 
     verify(repository, never()).keyRunTails(any(), anyInt());
     assertThat(sent).isEmpty();
