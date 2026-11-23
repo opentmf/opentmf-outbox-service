@@ -215,6 +215,13 @@
     (a 30 s bound with a 29 s read timeout: 7.5 s + 29 s). The rejected value names the figures.
     Every configuration that leaves both timeouts unset boots as before.
 
+### Dependencies
+
+- spring-boot-starter-parent 4.1.2 → 4.2.0: the library is compiled and tested against Boot
+  4.2.0; a consumer's own parent wins at runtime. The library's code is unchanged and uses
+  nothing that 4.1 lacks, so the requirement stays Spring Boot 4.1+.
+- sonar-maven-plugin 5.8.0.7211 → 5.9.0.7382 (build only).
+
 ### Build (contributors)
 
 - **Snapshot normalization is off for every build of this repository**: `.mvn/maven.config` carries

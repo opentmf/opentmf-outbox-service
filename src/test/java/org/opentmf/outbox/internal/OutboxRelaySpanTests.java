@@ -172,7 +172,10 @@ class OutboxRelaySpanTests {
     tracing
         .registry()
         .observationConfig()
-        .observationHandler(new DefaultMeterObservationHandler(meters));
+        .observationHandler(
+            DefaultMeterObservationHandler.builder(meters)
+                .includeActiveObservationLongTaskTimer(true)
+                .build());
 
     kafka(false).publish(event("dispatch.v1", stored(STORED)));
 
