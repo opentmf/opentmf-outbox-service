@@ -78,6 +78,7 @@ class OutboxClaimPlanIT {
           Map.entry("namespace", "int"),
           Map.entry("keys", "varchar"),
           Map.entry("ids", "varchar"),
+          Map.entry("heads", "varchar"),
           Map.entry("id", "bigint"),
           Map.entry("stamp", "timestamptz"),
           Map.entry("relayedOn", "timestamptz"),
@@ -254,6 +255,33 @@ class OutboxClaimPlanIT {
   }
 
   /** Every plan node, depth first. */
+  /** Every node of one statement's plan under both modes, for the record (the PR's evidence). */
+  private static void printNodes(String what, String statement, Map<String, String> args)
+      throws Exception {
+    for (String mode : PLAN_MODES) {
+      JsonNode plan = explain(statement, mode, args).get("Plan");
+      for (JsonNode n : nodes(plan, new ArrayList<>())) {
+        System.out.printf(
+            "PLAN-NODES: %s, %s: %s%s rows %d x %d loops, %d buffers%n",
+            what,
+            mode.substring(6, 13),
+            n.get("Node Type").asString(),
+            n.has("Index Name")
+                ? " on " + n.get("Index Name").asString()
+                : n.has("Relation Name") ? " on " + n.get("Relation Name").asString() : "",
+            n.get("Actual Rows").asLong(),
+            n.get("Actual Loops").asLong(),
+            n.path("Shared Hit Blocks").asLong() + n.path("Shared Read Blocks").asLong());
+      }
+      System.out.printf(
+          "PLAN-NODES: %s, %s: total %d buffers (bound %d)%n",
+          what,
+          mode.substring(6, 13),
+          plan.get("Shared Hit Blocks").asLong() + plan.get("Shared Read Blocks").asLong(),
+          FULL_BATCH_BUFFER_BOUND);
+    }
+  }
+
   private static List<JsonNode> nodes(JsonNode node, List<JsonNode> into) {
     into.add(node);
     JsonNode children = node.get("Plans");
@@ -865,11 +893,17 @@ class OutboxClaimPlanIT {
           .as("%s key runs, %s: buffers", state, mode)
           .isLessThanOrEqualTo(FULL_BATCH_BUFFER_BOUND);
     }
+    Map<String, String> tailIds = Map.of("now", "now()", "ids", "'" + heads + "'");
     assertIndexedOnly(
-        state + " key runs' lock",
-        OutboxClaimSql.TAIL_LOCK,
-        Map.of("now", "now()", "ids", "'" + heads + "'"),
-        List.of("outbox_pkey"));
+        state + " key runs' lock", OutboxClaimSql.TAIL_LOCK, tailIds, List.of("outbox_pkey"));
+    for (String mode : PLAN_MODES) {
+      JsonNode plan = explain(OutboxClaimSql.TAIL_LOCK, mode, tailIds).get("Plan");
+      assertThat(plan.get("Shared Hit Blocks").asLong() + plan.get("Shared Read Blocks").asLong())
+          .as("%s key runs' lock, %s: buffers", state, mode)
+          .isLessThanOrEqualTo(FULL_BATCH_BUFFER_BOUND);
+    }
+    printNodes(state + " key runs behind the heads", OutboxClaimSql.TAIL, tails);
+    printNodes(state + " key runs' lock", OutboxClaimSql.TAIL_LOCK, tailIds);
     assertIndexedOnly(
         state + " stamp",
         OutboxClaimSql.STAMP,

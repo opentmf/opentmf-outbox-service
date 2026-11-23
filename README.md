@@ -1546,6 +1546,12 @@ The library is self-contained for consumer testing — no test-jar needed:
 
 ### Upgrading to 1.11.1
 
+**First: one behaviour changes by default, and one property switches it
+back.** A key's consecutive due rows now leave as one unit (item 7); a
+service that wants the relay of 1.11.0 sets
+`opentmf.outbox.concurrent.key-run: 1` (no schema change, nothing else to
+undo).
+
 1. **The idempotency key names the row.**
    Up to 1.11.0 the key was `<service>:outbox:<id>`, and an `id` repeats once
    the table is recreated or the database is restored to a point in time: a
