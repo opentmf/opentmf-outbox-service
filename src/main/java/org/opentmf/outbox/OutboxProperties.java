@@ -403,5 +403,17 @@ public class OutboxProperties {
      * its lease or longer is leased again before its send. Default 8.
      */
     @Positive private int maxInFlight = 8;
+
+    /**
+     * How many consecutive due rows of one ordering key one claim takes and one slot sends, in
+     * {@code id} order (1.11.1): the key's head and up to {@code key-run - 1} rows behind it,
+     * each sent once the one before is booked, every lease renewed in the booking before. The run
+     * ends at the first row behind the head that is not due (backing off, held, its send lapsed);
+     * a failed send ends it too, and the rows after it are released, due at once. Default 8: a key
+     * holds one slot for at most eight sends in a row, while the other keys keep their turn. {@code
+     * 1} takes one row of a key per claim, as up to 1.11.0. The rows of all runs of one claim never
+     * exceed the claim's room, so with a full lane a run shrinks back to its head.
+     */
+    @Positive private int keyRun = 8;
   }
 }

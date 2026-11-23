@@ -103,6 +103,24 @@ public interface OutboxEventRepository
   List<Long> recheckKeyedHeads(@Param("now") OffsetDateTime now, @Param("ids") String ids);
 
   /**
+   * The open rows right behind each head, per key in {@code id} order, at most {@code limit} per
+   * key ({@link OutboxClaimSql#TAIL}, 1.11.1) - read inside the claim, after the re-check.
+   *
+   * @param heads the re-checked heads as a PostgreSQL array literal, e.g. {@code {7,12}}
+   */
+  @Query(value = OutboxClaimSql.TAIL, nativeQuery = true)
+  List<OutboxEvent> keyRunTails(@Param("heads") String heads, @Param("limit") int limit);
+
+  /**
+   * Of a claim's run rows, those still due and leased by nobody, locked ({@link
+   * OutboxClaimSql#TAIL_LOCK}, 1.11.1); a row another transaction holds locked is skipped.
+   *
+   * @param ids the rows as a PostgreSQL array literal, e.g. {@code {7,12}}
+   */
+  @Query(value = OutboxClaimSql.TAIL_LOCK, nativeQuery = true)
+  List<Long> lockKeyRunTails(@Param("now") OffsetDateTime now, @Param("ids") String ids);
+
+  /**
    * Writes one lease end on every claimed row it names, in ONE statement
    * ({@link OutboxClaimSql#STAMP}) - inside the claim transaction that locked them.
    *

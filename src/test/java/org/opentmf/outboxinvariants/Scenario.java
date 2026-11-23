@@ -50,6 +50,12 @@ public final class Scenario implements AutoCloseable {
           Map.entry("logging.level.liquibase", "WARN"),
           Map.entry("logging.level.com.zaxxer", "WARN"));
 
+  /**
+   * How many consecutive due rows of one ordering key one claim takes and one slot sends in order;
+   * {@code -Dit.key-run=<n>} runs every scenario with it (a scenario's own override wins).
+   */
+  static final String KEY_RUN = "opentmf.outbox.concurrent.key-run";
+
   final String name;
   final long seed;
   final Map<String, String> properties = new LinkedHashMap<>(DEFAULTS);
@@ -86,6 +92,10 @@ public final class Scenario implements AutoCloseable {
     Thread.setDefaultUncaughtExceptionHandler(
         (thread, error) ->
             scenario.uncaught.add("%s escaped thread %s".formatted(error, thread.getName())));
+    String keyRun = System.getProperty("it.key-run");
+    if (keyRun != null) { // the whole suite with a key's run relayed as one unit (or not)
+      scenario.properties.put(KEY_RUN, keyRun);
+    }
     for (String override : overrides) {
       int eq = override.indexOf('=');
       scenario.properties.put(override.substring(0, eq), override.substring(eq + 1));

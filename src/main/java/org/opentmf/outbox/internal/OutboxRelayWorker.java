@@ -143,6 +143,9 @@ class OutboxRelayWorker {
    */
   private final Map<Long, Leased> queuedHere = new ConcurrentHashMap<>();
 
+  /** The units this pod holds in the lane's queue, by their head's id: a run, or one row. */
+  private final Map<Long, List<Leased>> queuedRuns = new ConcurrentHashMap<>();
+
   /** Each named transport's claim pause on this pod (1.11.0), built on its first send verdict. */
   private final Map<String, OutboxClaimPause> pauses = new ConcurrentHashMap<>();
 
@@ -185,6 +188,12 @@ class OutboxRelayWorker {
     OffsetDateTime leasedAt;
     volatile OffsetDateTime stamp;
     volatile boolean lost;
+
+    /** Its RELAYED booking found the lease gone: another holder owns the row (1.11.1). */
+    boolean unbooked;
+
+    /** Found cancelled at its renewal and released unsent (1.11.1). */
+    boolean cancelledUnsent;
 
     /** Whether the send is marked under way in the database ({@code sending_since}). */
     volatile boolean marked;
@@ -249,9 +258,17 @@ class OutboxRelayWorker {
     return claimed;
   }
 
-  /** One lane's claim: the rows leased, and whether the query came back full (more may wait). */
-  private record Claimed(List<Leased> rows, boolean full) {
+  /**
+   * One lane's claim: the rows leased, and whether the query came back full (more may wait). The
+   * CONCURRENT claim's rows also come as RUNS (1.11.1): a key's head with the rows of its key it
+   * leased behind it, sent in order on one slot; a row without a run is a run of one.
+   */
+  private record Claimed(List<Leased> rows, boolean full, List<List<Leased>> runs) {
     static final Claimed NONE = new Claimed(List.of(), false);
+
+    Claimed(List<Leased> rows, boolean full) {
+      this(rows, full, rows.stream().map(List::of).toList());
+    }
   }
 
   /**
@@ -284,13 +301,20 @@ class OutboxRelayWorker {
   public Batch relayBatch(boolean withOrdered) {
     Claimed ordered = withOrdered && !orderedLane.busy() ? claimOrdered() : Claimed.NONE;
     Claimed concurrent = claimConcurrent();
-    for (Leased row : concurrent.rows()) {
-      queuedHere.put(row.event.getId(), row);
-      if (!lane.submit(row.event.getId(), () -> relayConcurrent(row))) {
-        queuedHere.remove(row.event.getId());
+    for (List<Leased> run : concurrent.runs()) {
+      Leased head = run.get(0);
+      long headId = head.event.getId();
+      run.forEach(row -> queuedHere.put(row.event.getId(), row));
+      queuedRuns.put(headId, run);
+      Runnable send = run.size() == 1 ? () -> relayConcurrent(head) : () -> relayRun(run);
+      if (!lane.submit(headId, run.size(), send)) {
+        queuedRuns.remove(headId);
+        run.forEach(row -> queuedHere.remove(row.event.getId()));
         log.info(
-            "Outbox row {} not sent - the relay is stopping; its lease lapses",
-            row.event.getId());
+            "Outbox row {} not sent - the relay is stopping; its lease lapses (and the lease of"
+                + " the {} rows of its key's run behind it)",
+            headId,
+            run.size() - 1);
       }
     }
     List<Leased> orderedRows = ordered.rows();
@@ -391,12 +415,118 @@ class OutboxRelayWorker {
             .toList();
     List<Leased> leased = new ArrayList<>();
     int taken = leaseTaken(candidates, room, Lane.CONCURRENT, now, leased);
-    stampAll(leased);
+    List<List<Leased>> runs = keyRuns(leased, room - leased.size(), now);
+    List<Leased> all = runs.stream().flatMap(List::stream).toList();
+    stampAll(all);
     // not when the room filled inside the skip window: the candidates left keep their turn
     if (lastKey != null && taken == candidates.size()) {
       keyCursor = lastKey;
     }
-    return new Claimed(leased, skipping ? leased.size() >= room : rows.size() >= limit);
+    return new Claimed(all, skipping ? leased.size() >= room : rows.size() >= limit, runs);
+  }
+
+  /**
+   * The runs of a claim (1.11.1, {@code concurrent.key-run} above 1): each keyed head with the due
+   * rows of its key right behind it, at most {@code key-run - 1} per head and {@code budget} over
+   * the claim - the room the heads left. A run takes rows in {@code id} order and ENDS at the first
+   * row that is not due (backing off, held, leased), whose last send lapsed under way, that this
+   * pod holds queued, whose publisher cannot be resolved or whose transport is paused here, or that
+   * another transaction holds locked. A head whose own lapse is to be booked, or whose transport is
+   * paused here (its probe), runs alone. The rows are leased like their heads.
+   */
+  private List<List<Leased>> keyRuns(List<Leased> heads, int budget, OffsetDateTime now) {
+    int keyRun = properties.getConcurrent().getKeyRun();
+    List<Leased> runnable =
+        heads.stream()
+            .filter(head -> head.event.getOrderingKey() != null && !head.lapsedSending)
+            .filter(head -> !pausedHere(head.publisher, head.event))
+            .toList();
+    if (keyRun <= 1 || budget <= 0 || runnable.isEmpty()) {
+      return heads.stream().map(List::of).toList();
+    }
+    Map<Long, List<OutboxEvent>> chosen = runTails(runnable, keyRun, budget, now);
+    Set<Long> locked = lockRunTails(chosen, now);
+    return leaseRuns(heads, chosen, locked, now);
+  }
+
+  /**
+   * Per runnable head (by id), the due prefix of its key's rows right behind it: at most {@code
+   * keyRun - 1} per head, at most {@code budget} over the claim, in the heads' order.
+   */
+  private Map<Long, List<OutboxEvent>> runTails(
+      List<Leased> runnable, int keyRun, int budget, OffsetDateTime now) {
+    Map<String, List<OutboxEvent>> behind = new LinkedHashMap<>();
+    for (OutboxEvent row :
+        repository.keyRunTails(
+            idsLiteral(runnable.stream().map(head -> head.event).toList()), keyRun - 1)) {
+      behind.computeIfAbsent(row.getOrderingKey(), key -> new ArrayList<>()).add(row);
+    }
+    Map<Long, List<OutboxEvent>> chosen = new LinkedHashMap<>();
+    int left = budget;
+    for (Leased head : runnable) {
+      List<OutboxEvent> tail = new ArrayList<>();
+      for (OutboxEvent row : behind.getOrDefault(head.event.getOrderingKey(), List.of())) {
+        if (left == 0 || !dueBehind(row, now)) {
+          break;
+        }
+        tail.add(row);
+        left--;
+      }
+      if (!tail.isEmpty()) {
+        chosen.put(head.event.getId(), tail);
+      }
+    }
+    return chosen;
+  }
+
+  /** The chosen rows still due and leased by nobody, locked {@code FOR UPDATE SKIP LOCKED}. */
+  private Set<Long> lockRunTails(Map<Long, List<OutboxEvent>> chosen, OffsetDateTime now) {
+    return chosen.isEmpty()
+        ? Set.of()
+        : new HashSet<>(
+            repository.lockKeyRunTails(
+                now, idsLiteral(chosen.values().stream().flatMap(List::stream).toList())));
+  }
+
+  /**
+   * Every head with its run: the chosen rows behind it in order, up to the first that is not
+   * locked here, has no publisher or whose transport is paused here; each leased like its head.
+   */
+  private List<List<Leased>> leaseRuns(
+      List<Leased> heads,
+      Map<Long, List<OutboxEvent>> chosen,
+      Set<Long> locked,
+      OffsetDateTime now) {
+    List<List<Leased>> runs = new ArrayList<>();
+    for (Leased head : heads) {
+      List<Leased> run = new ArrayList<>();
+      run.add(head);
+      for (OutboxEvent row : chosen.getOrDefault(head.event.getId(), List.of())) {
+        OutboxPublisher publisher = locked.contains(row.getId()) ? route(row) : null;
+        if (publisher == null || pausedHere(publisher, row)) {
+          break;
+        }
+        run.add(lease(row, publisher, Lane.CONCURRENT, now));
+      }
+      runs.add(List.copyOf(run));
+    }
+    return runs;
+  }
+
+  /** A row behind its key's head that a run may take: due, unleased, never sent under way. */
+  private boolean dueBehind(OutboxEvent row, OffsetDateTime now) {
+    return (row.getReleaseAt() == null || !row.getReleaseAt().isAfter(now))
+        && !row.getNextAttemptOn().isAfter(now)
+        && (row.getClaimedUntil() == null || !row.getClaimedUntil().isAfter(now))
+        && !(row.getClaimedUntil() != null && row.getSendingSince() != null)
+        && !queuedHere.containsKey(row.getId());
+  }
+
+  /** Whether the row's transport is paused on this pod (1.11.0): no run rides a paused one. */
+  private boolean pausedHere(OutboxPublisher publisher, OutboxEvent row) {
+    String transport = publisher.transport(row);
+    OutboxClaimPause pause = transport == null ? null : pauses.get(transport);
+    return pause != null && pause.paused();
   }
 
   /**
@@ -576,6 +706,7 @@ class OutboxRelayWorker {
    */
   @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void relayConcurrent(Leased row) {
+    queuedRuns.remove(row.event.getId());
     queuedHere.remove(row.event.getId()); // it leaves the queue: from here on a claim may see it
     if (closed) {
       return; // the relay is stopping: not sent; its lease lapses
@@ -602,7 +733,12 @@ class OutboxRelayWorker {
    */
   void giveBackStranded() {
     List<Leased> rows =
-        lane.evictStranded().stream().map(queuedHere::remove).filter(Objects::nonNull).toList();
+        lane.evictStranded().stream()
+            .map(queuedRuns::remove)
+            .filter(Objects::nonNull)
+            .flatMap(List::stream)
+            .filter(row -> queuedHere.remove(row.event.getId()) != null)
+            .toList();
     if (rows.isEmpty()) {
       return;
     }
@@ -680,6 +816,124 @@ class OutboxRelayWorker {
     book(laneTx, row, sent(row), () -> NOTHING);
   }
 
+  /**
+   * A KEY'S RUN on one lane worker (1.11.1): its rows in {@code id} order, each sent once the one
+   * before is booked RELAYED - in the booking's own transaction the next row's lease is renewed,
+   * as the ORDERED lane renews its next row, so the key never stands without a live lease between
+   * two sends and every send starts with its full lease. The run ENDS at a row that is not sent
+   * (its lapse booked, lost to another holder, cancelled meanwhile) or whose send failed: the rows
+   * after it are released in the same transaction, due at once - the next claim takes them as
+   * today's rule says (a failed row backs off, and the rows behind it may pass it). Each row is
+   * booked on its own: a crash mid-run redelivers only the row whose booking it interrupted.
+   */
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
+  private void relayRun(List<Leased> run) {
+    queuedRuns.remove(run.get(0).event.getId());
+    run.forEach(row -> queuedHere.remove(row.event.getId())); // from here on a claim may see them
+    for (int i = 0; i < run.size() && !closed; i++) {
+      Leased row = run.get(i);
+      if (row.cancelledUnsent) {
+        continue; // released unsent at the renewal before; the row after it was renewed instead
+      }
+      if (i > 0) {
+        lane.nextRow(); // the slot starts a send of its own: live again for the horizon
+      }
+      try {
+        int index = i;
+        boolean[] goOn = {false};
+        round(row, () -> goOn[0] = relayRunRow(run, index));
+        if (!goOn[0]) {
+          return;
+        }
+      } catch (Throwable ex) { // nothing leaves a lane worker
+        log.error(
+            "Outbox row {} to {} - renewal or booking failed; it and the {} rows of its key's run"
+                + " behind it are redelivered once their leases lapse",
+            row.event.getId(),
+            row.event.getDestination(),
+            run.size() - i - 1,
+            ex);
+        return;
+      }
+    }
+  }
+
+  /**
+   * Row {@code index} of a run: its lapse booked, or (the head) its renewal if it waited, its send
+   * and its booking - with the next row's renewal when it was relayed, with the release of the rest
+   * when it was not.
+   *
+   * @return whether the run goes on with a renewed next row
+   */
+  private boolean relayRunRow(List<Leased> run, int index) {
+    Leased row = run.get(index);
+    if (row.lapsedSending) {
+      book(laneTx, row, lapsed(row), () -> releaseRest(run, index));
+      return false;
+    }
+    if (index == 0 && waitedLong(row) && !renewQueued(row)) {
+      commit(laneTx, () -> NOTHING, () -> releaseRest(run, index));
+      return false;
+    }
+    if (row.lost) {
+      return false; // lost when the row before was booked: the rest was released with it
+    }
+    boolean[] renewed = {false};
+    book(
+        laneTx,
+        row,
+        sent(row),
+        () -> row.unbooked ? releaseRest(run, index) : renewNextInRun(run, index, renewed),
+        () -> releaseRest(run, index));
+    return renewed[0];
+  }
+
+  /**
+   * Inside the RELAYED booking of run row {@code index}: renews the next row still held (a row
+   * cancelled meanwhile is released unsent and skipped, as on the ORDERED lane); a row lost to
+   * another holder ends the run, and the rows after it are released.
+   */
+  private Runnable renewNextInRun(List<Leased> run, int index, boolean[] renewed) {
+    List<Runnable> afterCommit = new ArrayList<>();
+    for (int j = index + 1; j < run.size(); j++) {
+      Leased next = run.get(j);
+      if (renew(next, Lane.CONCURRENT, afterCommit)) {
+        afterCommit.add(() -> renewed[0] = true);
+        return () -> afterCommit.forEach(Runnable::run);
+      }
+      if (!next.cancelledUnsent) {
+        afterCommit.add(releaseRest(run, j));
+        break;
+      }
+    }
+    return () -> afterCommit.forEach(Runnable::run);
+  }
+
+  /**
+   * Releases the run's rows after {@code index} that are still this holder's - each guarded on its
+   * stamp, due at once - in the transaction it is called in; they are not sent by this run.
+   */
+  private Runnable releaseRest(List<Leased> run, int index) {
+    List<Leased> rest = run.subList(index + 1, run.size()).stream().filter(r -> !r.lost).toList();
+    if (rest.isEmpty()) {
+      return NOTHING;
+    }
+    int released =
+        repository.releaseLeases(
+            OutboxSqlArrays.ids(rest.stream().map(r -> r.event.getId()).toList()),
+            OutboxSqlArrays.instants(rest.stream().map(r -> r.stamp).toList()),
+            clock.now());
+    return () -> {
+      rest.forEach(r -> r.lost = true);
+      log.debug(
+          "Outbox run of key {} ends at row {} - {} rows behind it released ({} still held)",
+          run.get(index).event.getOrderingKey(),
+          run.get(index).event.getId(),
+          rest.size(),
+          released);
+    };
+  }
+
   /** Runs a row's round inside its relay span (when the row stored a {@code traceparent}). */
   private void round(Leased row, Runnable round) {
     relayObservation.round(row.event, row.publisher.transport(row.event), row.claimNanos, round);
@@ -741,6 +995,7 @@ class OutboxRelayWorker {
     if (row.getCancelledOn() != null) {
       row.setClaimedUntil(null);
       row.setSendingSince(null);
+      next.cancelledUnsent = true;
       afterCommit.add(() -> next.lost = true);
       log.info("Outbox row {} cancelled before its send - released unsent", row.getId());
       return false;
@@ -828,6 +1083,7 @@ class OutboxRelayWorker {
    * and a claim takes them again, in this pod or another.
    */
   void open() {
+    queuedRuns.clear();
     queuedHere.clear();
     closed = false;
   }
@@ -839,9 +1095,23 @@ class OutboxRelayWorker {
    * failure booking refused too (the hook threw again) is booked once more WITHOUT the hook, so
    * the attempt counts and the row's budget ends it - never redelivered unbooked forever (1.9.0).
    */
-  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void book(
       TransactionOperations via, Leased row, Attempt attempt, Supplier<Runnable> alsoInTx) {
+    book(via, row, attempt, alsoInTx, alsoInTx);
+  }
+
+  /**
+   * Books one attempt as {@link #book(TransactionOperations, Leased, Attempt, Supplier)} does, with
+   * {@code ifRelayed} riding a RELAYED booking's transaction and {@code ifFailed} a failure's - a
+   * key's run renews its next row after the one, releases the rest after the other (1.11.1).
+   */
+  @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
+  private void book(
+      TransactionOperations via,
+      Leased row,
+      Attempt attempt,
+      Supplier<Runnable> ifRelayed,
+      Supplier<Runnable> ifFailed) {
     if (closed) {
       log.info(
           "Outbox row {} to {} - not booked: the relay is stopping; it is redelivered once its"
@@ -853,7 +1123,7 @@ class OutboxRelayWorker {
     RuntimeException failure = attempt.failure();
     if (failure == null) {
       try {
-        commit(via, () -> bookRelayed(row, attempt.result()), alsoInTx);
+        commit(via, () -> bookRelayed(row, attempt.result()), ifRelayed);
         return;
       } catch (Throwable refused) {
         failure = asFailure(refused);
@@ -861,7 +1131,7 @@ class OutboxRelayWorker {
     }
     RuntimeException failed = failure;
     try {
-      commit(via, () -> bookFailure(row, failed, true), alsoInTx);
+      commit(via, () -> bookFailure(row, failed, true), ifFailed);
     } catch (Throwable refusedAgain) {
       log.error(
           "Outbox row {} to {} - the failure booking was refused as well (its booking hook"
@@ -870,7 +1140,7 @@ class OutboxRelayWorker {
           row.event.getDestination(),
           refusedAgain);
       failed.addSuppressed(refusedAgain);
-      commit(via, () -> bookFailure(row, failed, false), alsoInTx);
+      commit(via, () -> bookFailure(row, failed, false), ifFailed);
     }
   }
 
@@ -888,6 +1158,7 @@ class OutboxRelayWorker {
     Optional<OutboxEvent> held =
         repository.bookRelayed(leased.event.getId(), leased.stamp, clock.now());
     if (held.isEmpty()) {
+      leased.unbooked = true;
       logLapsed(leased);
       return NOTHING;
     }

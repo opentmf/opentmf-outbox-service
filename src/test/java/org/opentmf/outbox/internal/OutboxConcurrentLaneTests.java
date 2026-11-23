@@ -353,4 +353,54 @@ class OutboxConcurrentLaneTests {
     assertThat(ended).as("the interrupted send ended before the stop returned").isTrue();
     assertThat(lane.alive()).isEmpty();
   }
+
+  /**
+   * A key's run (1.11.1) is ONE unit on one slot that counts as its rows: in the queue's depth, in
+   * the room, and when it is given back; each of its sends is measured as a send of its own, and
+   * the slot is live again at each.
+   */
+  @Test
+  void aRun_countsAsItsRows_isGivenBackWhole_andEachOfItsSendsIsMeasured() {
+    OutboxConcurrentLane lane = new OutboxConcurrentLane(1, 100, false, Duration.ofSeconds(5));
+    lane.sendTook(Duration.ofMillis(1).toNanos());
+    CountDownLatch release = new CountDownLatch(1);
+    lane.submit(
+        1L,
+        () -> {
+          try {
+            release.await(10, TimeUnit.SECONDS); // the one slot, a slow send
+          } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+          }
+        });
+    await().atMost(Duration.ofSeconds(5)).until(() -> lane.available() == 0);
+    lane.submit(2L, 3, () -> {});
+    assertThat(lane.queued()).isEqualTo(3); // the run's three rows
+
+    await()
+        .pollDelay(OutboxConcurrentLane.HORIZON.plusMillis(100))
+        .atMost(Duration.ofSeconds(5))
+        .until(() -> lane.liveSlots() == 0);
+    assertThat(lane.evictStranded()).containsExactly(2L); // by its head, whole
+    assertThat(lane.queued()).isZero();
+    release.countDown();
+    await().atMost(Duration.ofSeconds(5)).until(() -> lane.available() == 1);
+
+    AtomicInteger rows = new AtomicInteger();
+    lane.submit(
+        3L,
+        3,
+        () -> {
+          for (int i = 0; i < 3; i++) {
+            if (i > 0) {
+              lane.nextRow(); // a send of its own: the slot is live again
+              assertThat(lane.liveSlots()).isEqualTo(1);
+            }
+            rows.incrementAndGet();
+          }
+        });
+    await().atMost(Duration.ofSeconds(5)).until(() -> rows.get() == 3 && lane.available() == 1);
+    assertThat(lane.depth()).isPositive(); // its sends measured one by one
+    lane.close();
+  }
 }

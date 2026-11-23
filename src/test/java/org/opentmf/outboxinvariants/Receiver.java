@@ -99,6 +99,9 @@ public final class Receiver {
     boolean hookHolds;
     boolean listenerThrows;
 
+    /** The transport the publisher names for these rows (null: none - no claim pause). */
+    String transport;
+
     public static Script concurrent() {
       return new Script();
     }
@@ -177,6 +180,12 @@ public final class Receiver {
     /** The booking hook waits for {@link Receiver#release()} - delivered, not yet booked. */
     public Script hookHolds() {
       this.hookHolds = true;
+      return this;
+    }
+
+    /** The publisher names {@code name} as these rows' transport: their failures may pause it. */
+    public Script transport(String name) {
+      this.transport = name;
       return this;
     }
 

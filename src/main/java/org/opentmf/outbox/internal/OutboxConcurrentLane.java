@@ -66,7 +66,7 @@ class OutboxConcurrentLane {
   private final Queue<Queued> queue = new ConcurrentLinkedQueue<>();
 
   /** A queued send and the row it sends ({@code -1}: no row, never given back). */
-  private record Queued(long rowId, Runnable send) {}
+  private record Queued(long rowId, int rows, Runnable send) {}
   private final AtomicInteger queued = new AtomicInteger();
   private final AtomicReference<Runnable> onRoom = new AtomicReference<>(() -> {});
   /** Moving average of one send (renewal, send, booking), in nanoseconds; 0 = none measured yet. */
@@ -173,18 +173,39 @@ class OutboxConcurrentLane {
    * @return whether the send was queued
    */
   boolean submit(Runnable send) {
-    return submit(-1, send);
+    return submit(-1, 1, send);
   }
 
   /** {@link #submit(Runnable)} for row {@code rowId} - which {@link #evictStranded} may give back. */
   boolean submit(long rowId, Runnable send) {
+    return submit(rowId, 1, send);
+  }
+
+  /**
+   * {@link #submit(long, Runnable)} for a unit of {@code rows} sends on one slot (1.11.1: a key's
+   * run, {@code rowId} its head): it counts as that many rows in the queue's depth.
+   */
+  boolean submit(long rowId, int rows, Runnable send) {
     if (closed) {
       return false;
     }
-    queued.incrementAndGet(); // first: a worker's poll never drives the count below zero
-    queue.add(new Queued(rowId, send));
+    queued.addAndGet(rows); // first: a worker's poll never drives the count below zero
+    queue.add(new Queued(rowId, rows, send));
     startWorkers();
     return true;
+  }
+
+  /**
+   * The calling worker starts the next send of its unit (1.11.1, a key's run): the send before is
+   * measured as a send of its own, and the slot counts as live again for the horizon.
+   */
+  void nextRow() {
+    Thread worker = Thread.currentThread();
+    long now = System.nanoTime();
+    Long started = sendStarted.put(worker, now);
+    if (started != null) {
+      sendTook(now - started);
+    }
   }
 
   /**
@@ -202,7 +223,7 @@ class OutboxConcurrentLane {
     List<Long> evicted = new ArrayList<>();
     for (Queued entry : queue) {
       if (entry.rowId() >= 0 && queue.remove(entry)) {
-        queued.decrementAndGet();
+        queued.addAndGet(-entry.rows());
         evicted.add(entry.rowId());
       }
     }
@@ -235,16 +256,17 @@ class OutboxConcurrentLane {
     try {
       for (Queued next = poll(); next != null; next = poll()) {
         Runnable send = next.send();
-        long started = System.nanoTime();
-        sendStarted.put(Thread.currentThread(), started);
+        long begun = System.nanoTime();
+        sendStarted.put(Thread.currentThread(), begun);
+        Long last = null;
         try {
           send.run(); // the relay worker catches and logs; this guard is the last line
         } catch (Throwable ex) {
           log.error("Outbox send worker caught what a send threw - the worker goes on", ex);
         } finally {
-          sendStarted.remove(Thread.currentThread());
+          last = sendStarted.remove(Thread.currentThread()); // a run's last send started then
         }
-        sendTook(System.nanoTime() - started);
+        sendTook(System.nanoTime() - (last != null ? last : begun));
       }
     } finally {
       permits.release();
@@ -262,7 +284,12 @@ class OutboxConcurrentLane {
       return null;
     }
     Queued next = queue.poll();
-    if (next != null && queued.decrementAndGet() == depth() / 2) {
+    if (next == null) {
+      return null;
+    }
+    int half = depth() / 2;
+    int after = queued.addAndGet(-next.rows());
+    if (after <= half && after + next.rows() > half) {
       onRoom.get().run(); // half drained: time for the next claim
     }
     return next;

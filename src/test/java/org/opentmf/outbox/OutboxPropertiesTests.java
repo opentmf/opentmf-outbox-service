@@ -23,6 +23,7 @@ class OutboxPropertiesTests {
     assertThat(properties.getOrdered().getLease()).isEqualTo(Duration.ofSeconds(15));
     assertThat(properties.getLease()).isEqualTo(Duration.ofMinutes(2));
     assertThat(properties.getConcurrent().getMaxInFlight()).isEqualTo(8);
+    assertThat(properties.getConcurrent().getKeyRun()).isEqualTo(8);
     // 1.5.0: the Kafka publisher stays ORDERED unless told otherwise
     assertThat(properties.isKafkaLeaseLongerThanSendTimeout()).isTrue();
     assertThat(properties.getKafka().getLane()).isEqualTo(OutboxPublisher.Lane.ORDERED);

@@ -45,6 +45,11 @@ public class ScriptedPublisher implements OutboxPublisher {
   }
 
   @Override
+  public String transport(OutboxEvent event) {
+    return script(event).transport;
+  }
+
+  @Override
   public Duration lease(OutboxEvent event) {
     return script(event).lease;
   }

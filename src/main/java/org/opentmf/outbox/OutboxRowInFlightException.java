@@ -4,8 +4,9 @@ import java.time.OffsetDateTime;
 
 /**
  * The row is IN FLIGHT: a relay CLAIMED it under a live lease - it waits in that relay's hand-off
- * queue for a slot (about a second at most) or its publisher is delivering it right now; the
- * database cannot tell which, so it cannot be cancelled (1.4.0). An {@link IllegalStateException}
+ * queue for a slot (about a second at most), behind the earlier rows of its key's run on the slot
+ * sending them (1.11.1), or its publisher is delivering it right now; the database cannot tell
+ * which, so it cannot be cancelled (1.4.0). An {@link IllegalStateException}
  * - the ops
  * surface answers 409, like every other "not in the state the action needs" - with its own name,
  * so a caller can tell "try again once the send is booked" from "already relayed". Once the send
