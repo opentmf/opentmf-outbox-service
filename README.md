@@ -980,6 +980,17 @@ marks the pause and the resume; `opentmf.outbox.claims.paused{transport}` reads 
   is UNATTENDED - no pod is sending the transport's rows, it is down for all of them - and is
   taken as before 1.11.0: its attempt fails and its backoff moves it aside. So a backlog of a
   transport down everywhere holds the rows behind it back by at most `claim-pause.max`.
+- **A consumer's test against a broker that is down.** The pause lives in the pod, so it
+  outlives one test: in a suite whose Spring context is cached, the failing rows that earlier
+  tests left behind can pause the transport before a later test appends its row. Do NOT
+  assume that every row gets its attempt promptly when sends fail. While the transport is
+  paused, a fresh row waits for a probe, and a row nobody is sending waits for up to
+  `claim-pause.max`. So a test that waits for ITS row's first failed attempt passes or fails
+  depending on how many failing rows came before it, and that is easy to misread as a second
+  relay. Set the state the test needs instead: switch the pause off for that suite
+  (`opentmf.outbox.claim-pause.after-failures: 0`), or write the row's state directly
+  instead of waiting for the relay. Or wait for the pause's own signal:
+  `opentmf.outbox.claims.paused{transport=kafka}` reads 1, and a WARN line marks the pause.
 - **Measured** (`OutboxFailingRelayIT`): beside a healthy pod, a pod whose transport is down
   took 102 of 300 rows on 1.10.0 (98 on 1.9.1's claim rule), 8 since; one dead HTTP
   receiver beside a healthy one holds nothing back (1,000 of 1,000); 30 rows behind a
