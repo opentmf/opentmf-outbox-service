@@ -4,19 +4,6 @@
 
 ### Added
 
-- **A key's consecutive rows relayed as one unit** (OUTBOX-A-KEYS-CONSECUTIVE-ROWS-ARE-RELAYED-AS-ONE-UNIT-1),
-  opt-in: `opentmf.outbox.concurrent.key-run` (default `1`, one row of a key per claim, as
-  before). Above 1, one CONCURRENT claim takes a key's head and up to `key-run - 1` due rows of
-  its key right behind it, and one slot sends them in `id` order. Each row is still booked on its
-  own, and its booking renews the next row's lease in the same transaction, so a crash mid-run
-  redelivers only the row whose booking it interrupted. The run ends at the first row that is
-  not due, at a failed send (the rows after it are released, due at once - a failed row may then
-  be passed, as before) and at a row lost to another holder. Rows of one key are never in flight
-  together, within a pod and across pods; a paused transport's probe stays one row; the rows of
-  all runs of a claim stay within the lane's room. Two new claim statements, both plan-pinned
-  under custom and generic plans; no schema change. The invariants suite's `KeyRunsIT` runs every
-  cell at a run length of 1 and 8, and `-Dit.key-run=<n>` runs the whole suite at one.
-
 - **A row appended inside a span stores its trace context** (OUTBOX-AN-APPEND-CARRIES-THE-CURRENT-TRACE-1):
   an append that gives no `traceparent` header stores the current trace context - the W3C
   `traceparent`, and `tracestate` when there is one - as the application's Micrometer
@@ -80,6 +67,29 @@
   type name alone without rolling the booking back. `OutboxFailureText.typed` keeps the failure's
   kind for the views without the sensitive text. Without a bean the stored text is exactly the
   text up to 1.11.0; no schema, statement, view, metric or ops fragment changed.
+
+### Changed
+
+- **A key's consecutive rows leave as one unit, by default** (OUTBOX-A-KEYS-CONSECUTIVE-ROWS-ARE-RELAYED-AS-ONE-UNIT-1):
+  one CONCURRENT claim now takes a key's head and up to seven due rows of its key right behind
+  it, and one slot sends them in `id` order - a key's rows no longer wait a claim and a relay
+  pass each. New property `opentmf.outbox.concurrent.key-run`, default `8`; **set it to `1` to
+  relay one row of a key per claim, as up to 1.11.0.** What an adopter sees differ by default:
+  - **a cancel of a row inside a claimed run is refused (409, `OutboxRowInFlightException`) and
+    the row is relayed in order** - the run has leased it, as for any leased row. Up to 1.11.0
+    only the key's head was leased, and the rows behind it could be cancelled until their own
+    claim. The ops contract already declares this 409; the cancel operation's description now
+    names a row waiting in its key's run.
+  - the in-flight gauge counts the leased rows of a run while they wait for their send.
+  Each row is still booked on its own, and its booking renews the next row's lease in the same
+  transaction, so a crash mid-run redelivers only the row whose booking it interrupted. A run ends
+  at the first row behind its head that is not due, at a failed send (the rows after it are
+  released, due at once - a failed row may then be passed, as before) and at a row lost to
+  another holder. Rows of one key are never in flight together, within a pod and across pods; a
+  paused transport's probe stays one row; the rows of all runs of one claim stay within the
+  lane's room. Two new claim statements, both plan-pinned under custom and generic plans; no
+  schema change. The invariants suite's `KeyRunsIT` runs every cell at a run length of 1 and 8,
+  and `-Dit.key-run=<n>` runs the whole suite at one.
 
 ### Fixed
 

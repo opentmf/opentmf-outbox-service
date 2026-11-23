@@ -157,9 +157,9 @@ sequenceDiagram
   Kafka row again. CONCURRENT rows keep **no order** against ORDERED rows, nor
   against CONCURRENT rows with another **ordering key**. Rows sharing a key
   are never in flight together and go in `id` order on the happy path (a
-  failed row backs off, and later rows of its key may pass it). With
-  `concurrent.key-run` above 1 (1.11.1) one claim takes a key's consecutive
-  due rows together and one slot sends them in order (see "A key's run"). The HTTP
+  failed row backs off, and later rows of its key may pass it). Since 1.11.1
+  one claim takes up to `concurrent.key-run` (default 8) consecutive due rows
+  of a key together and one slot sends them in order (see "A key's run"). The HTTP
   publisher's key is the destination, so rows to one receiver keep their order.
   A key over 255 characters is stored as `sha256:<hex>`. **Each lane claims
   over its own query and index**, so no backlog of one lane can hide a row of
@@ -383,12 +383,19 @@ sequenceDiagram
   meanwhile, because the send is still running. A row in backoff lets later
   rows of its key pass. A held row waits for its hold; a cancelled or parked
   row never comes back on its own.
-- **A key's run (1.11.1, `concurrent.key-run`).** With the default `1` a claim
-  takes ONE row of a key, its head: a key's three rows leave as three rounds
-  of claim, send and booking, and the next claim of the key waits for the
-  booking before it, plus the relay's next pass. With `key-run: n` (n > 1) the
-  claim also takes up to n - 1 due rows of the key right behind its head and
-  leases them with it; one slot sends them in `id` order.
+- **A key's run (1.11.1, `concurrent.key-run`, default 8).** Up to 1.11.0 a
+  claim took ONE row of a key, its head: a key's three rows left as three
+  rounds of claim, send and booking, each next claim of the key waiting for
+  the booking before it, plus the relay's next pass. Since 1.11.1 the claim
+  also takes up to `key-run - 1` due rows of the key right behind its head and
+  leases them with it; one slot sends them in `id` order. `key-run: 1` takes
+  one row of a key per claim again.
+  - **Why 8.** A run holds one slot for its sends, one after another; eight
+    bounds that to eight sends, about the lane's default slot count, so a key
+    with a backlog never holds a slot much longer than a full claim's worth
+    of other keys would, and the round-robin across keys goes on: one slot,
+    a key of 40 rows and four keys of one row each - every one of the four is
+    sent before the big key's 20th row (`KeyRunsIT` K9, at 1 and at 8).
   - **One booking per row, chained.** Each row is booked on its own, right
     after its send, and the booking's transaction renews the next row's
     lease, as the ORDERED lane renews its next row. So the key never stands
@@ -696,8 +703,8 @@ opentmf:
     concurrent:
       max-in-flight: 8       # CONCURRENT sends at once per pod (also the thread bound) - the
                              # send-side lever; size the connection pool above it
-      key-run: 1             # rows of one ordering key one claim takes and one slot sends in
-                             # order (1.11.1); 1 = one row of a key per claim
+      key-run: 8             # rows of one ordering key one claim takes and one slot sends in
+                             # order (1.11.1); 1 = one row of a key per claim, as up to 1.11.0
     kafka:                   # the default Kafka publisher (1.5.0)
       lane: ORDERED          # ORDERED | CONCURRENT - CONCURRENT for per-key order across pods
       ordering-key: AGGREGATE_ID  # on CONCURRENT: AGGREGATE_ID | NONE
@@ -726,7 +733,7 @@ opentmf:
 | `http.read-timeout` | `Duration` | unset | The plain client's read timeout (1.9.0; none before). Unset = the send bound less the connect timeout and a tenth of the bound (at least 1 s) - 98 s on the defaults (1.11.1; 108 s up to 1.11.0). When set it must be below the bound, and **the connect and read timeouts together must end before it** (1.11.1; validated at boot - see "Timeouts"). A profile's client keeps its own. |
 | `ordered.lease`  | `Duration` | `15s`   | Lease of an ORDERED row when its publisher declares none. Short on purpose: after a pod stop the row waits this long. Must exceed `send-timeout` (validated at boot). |
 | `concurrent.max-in-flight` | `int` | `8` | CONCURRENT sends in flight per pod (also the thread bound). Since 1.6.0 the claim runs ahead of the slots, so this is the lever for the lane's throughput; each send holds a connection while it books, so the pool must exceed it. |
-| `concurrent.key-run` | `int` | `1` | Consecutive due rows of one ordering key that one claim takes and one slot sends in `id` order (1.11.1; see "A key's run"). `1` = one row of a key per claim, as before. Positive (validated at boot). |
+| `concurrent.key-run` | `int` | `8` | Consecutive due rows of one ordering key that one claim takes and one slot sends in `id` order (1.11.1; see "A key's run"). `1` = one row of a key per claim, as up to 1.11.0. Positive (validated at boot). |
 | `kafka.lane`     | `ORDERED`/`CONCURRENT` | `ORDERED` | The default Kafka publisher's lane (1.5.0). `CONCURRENT` = per-aggregate order across pods (see "Running several relays with Kafka"). Stamped at append. |
 | `kafka.ordering-key` | `AGGREGATE_ID`/`NONE` | `AGGREGATE_ID` | On `CONCURRENT`: what orders a Kafka row. Ignored on `ORDERED`. The record key is the `aggregateId` either way. |
 | `kafka.lease`    | `Duration` | `15s`   | On `CONCURRENT`: a Kafka row's lease. Must exceed `send-timeout` (validated at boot). Ignored on `ORDERED`. |
@@ -777,7 +784,7 @@ reads the relayed history.
 | Metric                     | Type    | Meaning                                            |
 |----------------------------|---------|----------------------------------------------------|
 | `opentmf.outbox.pending`   | gauge by `lane` | Rows not yet relayed nor cancelled (held, parked and in-flight included) |
-| `opentmf.outbox.in-flight` | gauge by `lane` | Pending rows under a live lease, across pods — claimed, send not booked yet (1.3.0); since 1.6.0 that includes CONCURRENT rows waiting in a hand-off queue - since 1.9.0 only as many as the slots start within about a second, so behind slow sends it counts the sending rows alone |
+| `opentmf.outbox.in-flight` | gauge by `lane` | Pending rows under a live lease, across pods — claimed, send not booked yet (1.3.0); since 1.6.0 that includes CONCURRENT rows waiting in a hand-off queue - since 1.9.0 only as many as the slots start within about a second, so behind slow sends it counts the sending rows alone; since 1.11.1 also the rows of a key's run waiting behind its earlier rows |
 | `opentmf.outbox.parked`    | gauge by `lane` | Rows with `parked_on` stamped — **alert when > 0** |
 | `opentmf.outbox.metrics-age` | gauge | Seconds since the gauges were last refreshed successfully — **alert when above a few refresh periods** (e.g. > 60 s with the default 15 s): the values above are stale or NaN |
 | `opentmf.outbox.relay-lag` | gauge by `lane` | Seconds the lane's oldest *released* pending row has been deliverable (a held row is not lagging) |
@@ -1603,10 +1610,17 @@ The library is self-contained for consumer testing — no test-jar needed:
    exactly, or that wants rows as before, sets
    `opentmf.outbox.stamp-trace-context=false`.
 
-7. **A key's run as one unit, opt-in.** `opentmf.outbox.concurrent.key-run`
-   (default `1`: as before) lets one claim take a key's consecutive due rows
-   and one slot send them in order (see "A key's run"). No schema change: the
-   claim reads the rows behind a head over the keyed index it already has.
+7. **A key's consecutive rows leave as one unit, by default.** One claim now
+   takes a key's head and up to seven due rows of its key behind it, and one
+   slot sends them in `id` order, each booked on its own (see "A key's run").
+   What an adopter can see differ: a **cancel** of a row that its key's run has
+   already leased - the run is queued or sending - is **refused with 409**
+   (`OutboxRowInFlightException`) and the row is relayed in order, as for any
+   leased row; up to 1.11.0 only the key's head was leased, so the rows behind
+   it could be cancelled until their own claim. The in-flight gauge counts a
+   run's leased rows. To switch back, set
+   `opentmf.outbox.concurrent.key-run: 1`. No schema change: the claim reads the
+   rows behind a head over the keyed index it already has.
 
 ### Upgrading to 1.9.0
 

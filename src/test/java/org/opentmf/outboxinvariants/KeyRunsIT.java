@@ -29,9 +29,10 @@ import org.opentmf.outboxinvariants.Receiver.Step;
 /**
  * K - a key's run of consecutive due rows relayed as ONE unit
  * (OUTBOX-A-KEYS-CONSECUTIVE-ROWS-ARE-RELAYED-AS-ONE-UNIT-1). Every cell runs twice: with {@code
- * opentmf.outbox.concurrent.key-run=1} (one row of a key per claim - the relay up to 1.11.0) and
- * with {@code 8} (a key's head and up to seven due rows behind it in one claim, sent in order on
- * one slot). K1 is what the run adds; every other cell is a contract of today that the run must
+ * opentmf.outbox.concurrent.key-run=1} (one row of a key per claim - the relay up to 1.11.0, and
+ * an adopter's switch back) and with {@code 8} (the default since 1.11.1: a key's head and up to
+ * seven due rows behind it in one claim, sent in order on one slot). K1 is what the run adds;
+ * every other cell is a contract of 1.11.0 that the run must
  * keep: id order, a failed or held row ends the run (and may then be passed, as documented), a
  * lapsed lease or a killed pod mid-run, a row appended during a run, a cancel, the claim pause,
  * fairness across keys. The six invariants are checked at the end of every cell, as everywhere.
