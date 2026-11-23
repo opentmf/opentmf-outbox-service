@@ -1362,7 +1362,7 @@ endpoints.
 
 The ops surface is documented ONCE, in the jar:
 `META-INF/openapi/opentmf-outbox-ops.oas.yaml` (`OutboxOpsOpenApi.fragment()` returns its
-text). It carries the eight routes above — the unpark by filter included, with the bounded
+text). It carries the nine routes above — the unpark by filter included, with the bounded
 prune's and unpark's `moreTo…` flags and the row view's `inFlight` / `claimedUntil` — with
 the TMF630 paging the toolkit really answers —
 200 / 206 / 416, `X-Total-Count`, `X-Result-Count`, a 1-based `Content-Range`, `Link`, the
@@ -1551,6 +1551,23 @@ back.** A key's consecutive due rows now leave as one unit (item 7); a
 service that wants the relay of 1.11.0 sets
 `opentmf.outbox.concurrent.key-run: 1` (no schema change, nothing else to
 undo).
+
+**Second: re-paste the ops OAS fragment.** A service that publishes the ops
+routes pastes `META-INF/openapi/opentmf-outbox-ops.oas.yaml` into its own OAS
+(see "OAS fragment"); take this version's text verbatim. It changes in
+1.11.1:
+- `info.version`;
+- one new operation, `GET /ops/outbox/{id}/payload` (`getOutboxRowPayload`),
+  and its schema `OutboxRowPayload`;
+- descriptions only, no contract change:
+  - the inspect operation (`GET /ops/outbox/{id}`) and its 200;
+  - the cancel operation (`POST /ops/outbox/{id}/cancel`): among the rows it
+    refuses with 409 it now also names a row waiting behind the earlier rows of
+    its key's run;
+  - the row's `lastError` and `payload`.
+
+A service whose tests compare its served OAS with the fragment goes red until
+it re-pastes. A service without such a test serves the old text unnoticed.
 
 1. **The idempotency key names the row.**
    Up to 1.11.0 the key was `<service>:outbox:<id>`, and an `id` repeats once
