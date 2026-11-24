@@ -802,7 +802,7 @@ final class Invariants {
       executorField.setAccessible(true);
       Object executor = executorField.get(target);
       if (executor instanceof AtomicReference<?> current) {
-        executor = current.get(); // a restartable relay's executor of the current run (1.11.1)
+        executor = current.get(); // a restartable relay's executor of the current run (1.12.0)
       }
       if (executor == null) {
         return true; // never started (the ORDERED lane before its first batch): nothing died

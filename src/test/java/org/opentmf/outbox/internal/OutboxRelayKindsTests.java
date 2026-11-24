@@ -23,7 +23,7 @@ import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClientResponseException;
 
 /**
- * The kinds the relay itself writes (1.11.1): every failure it books, through its default text
+ * The kinds the relay itself writes (1.12.0): every failure it books, through its default text
  * ({@link OutboxFailureText#DEFAULT}), is shown as its type name in a view without the sensitive
  * text - never as {@code unclassified}. A change to how the relay describes a failure that would
  * hide a real kind is red here.

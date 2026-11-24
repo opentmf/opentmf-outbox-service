@@ -94,7 +94,7 @@ public class PodApp {
   }
 
   /**
-   * The library's HTTP publisher on the JDK's plain client (HttpIT's second run, 1.11.1): ahead of
+   * The library's HTTP publisher on the JDK's plain client (HttpIT's second run, 1.12.0): ahead of
    * the library's own HTTP publisher, which picks Apache HttpClient on this classpath - as a
    * consumer without Apache has it.
    */

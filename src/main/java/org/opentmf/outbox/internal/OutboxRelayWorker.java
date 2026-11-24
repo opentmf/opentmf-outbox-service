@@ -150,14 +150,14 @@ class OutboxRelayWorker {
   private final Map<String, OutboxClaimPause> pauses = new ConcurrentHashMap<>();
 
   /**
-   * Set when a stopping relay's grace has run out (1.11.1): from then on nothing is sent or booked
+   * Set when a stopping relay's grace has run out (1.12.0): from then on nothing is sent or booked
    * - a send that returns afterwards books nothing, and its row is redelivered once its lease
    * lapses, so no thread of the relay borrows a connection while the application's pool closes.
    */
   private volatile boolean closed;
 
   /**
-   * The relay span of a row's round (1.11.1): opened, on the lane's thread, around the renewal, the
+   * The relay span of a row's round (1.12.0): opened, on the lane's thread, around the renewal, the
    * send and the booking of a row that stored a {@code traceparent}. None until the configuration
    * gives the application's registry - when the bean is made, before the relay starts, so every
    * lane thread (each started after it, by an executor hand-off) sees it.
@@ -165,7 +165,7 @@ class OutboxRelayWorker {
   private OutboxRelayObservation relayObservation = OutboxRelayObservation.NONE;
 
   /**
-   * The text a failed attempt stores as {@code last_error} (1.11.1): the consumer's {@link
+   * The text a failed attempt stores as {@code last_error} (1.12.0): the consumer's {@link
    * OutboxFailureText} bean, else today's text. Set as {@link #relayObservation} is, before the
    * relay starts.
    */
@@ -189,10 +189,10 @@ class OutboxRelayWorker {
     volatile OffsetDateTime stamp;
     volatile boolean lost;
 
-    /** Its RELAYED booking found the lease gone: another holder owns the row (1.11.1). */
+    /** Its RELAYED booking found the lease gone: another holder owns the row (1.12.0). */
     boolean unbooked;
 
-    /** Found cancelled at its renewal and released unsent (1.11.1). */
+    /** Found cancelled at its renewal and released unsent (1.12.0). */
     boolean cancelledUnsent;
 
     /** Whether the send is marked under way in the database ({@code sending_since}). */
@@ -238,12 +238,12 @@ class OutboxRelayWorker {
     }
   }
 
-  /** The relay span of each row's round, from the application's registry (1.11.1). */
+  /** The relay span of each row's round, from the application's registry (1.12.0). */
   void observeRounds(OutboxRelayObservation observation) {
     relayObservation = observation;
   }
 
-  /** The text of a failed attempt's {@code last_error}, from the consumer's bean (1.11.1). */
+  /** The text of a failed attempt's {@code last_error}, from the consumer's bean (1.12.0). */
   void describeFailures(OutboxFailureText text) {
     failureText = text;
   }
@@ -260,7 +260,7 @@ class OutboxRelayWorker {
 
   /**
    * One lane's claim: the rows leased, and whether the query came back full (more may wait). The
-   * CONCURRENT claim's rows also come as RUNS (1.11.1): a key's head with the rows of its key it
+   * CONCURRENT claim's rows also come as RUNS (1.12.0): a key's head with the rows of its key it
    * leased behind it, sent in order on one slot; a row without a run is a run of one.
    */
   private record Claimed(List<Leased> rows, boolean full, List<List<Leased>> runs) {
@@ -426,7 +426,7 @@ class OutboxRelayWorker {
   }
 
   /**
-   * The runs of a claim (1.11.1, {@code concurrent.key-run} above 1): each keyed head with the due
+   * The runs of a claim (1.12.0, {@code concurrent.key-run} above 1): each keyed head with the due
    * rows of its key right behind it, at most {@code key-run - 1} per head and {@code budget} over
    * the claim - the room the heads left. A run takes rows in {@code id} order and ENDS at the first
    * row that is not due (backing off, held, leased), whose last send lapsed under way, that this
@@ -817,7 +817,7 @@ class OutboxRelayWorker {
   }
 
   /**
-   * A KEY'S RUN on one lane worker (1.11.1): its rows in {@code id} order, each sent once the one
+   * A KEY'S RUN on one lane worker (1.12.0): its rows in {@code id} order, each sent once the one
    * before is booked RELAYED - in the booking's own transaction the next row's lease is renewed,
    * as the ORDERED lane renews its next row, so the key never stands without a live lease between
    * two sends and every send starts with its full lease. The run ENDS at a row that is not sent
@@ -1021,7 +1021,7 @@ class OutboxRelayWorker {
    * One send, its verdict told to its transport's claim pause (1.11.0) when the publisher names
    * one: a success resumes it; a failure with the transport out of reach ({@link
    * OutboxPublisher#transportDown}) counts towards a pause, and so does a send the heartbeat
-   * interrupted at its bound (1.11.1) - whatever the publisher makes of the interrupt, the
+   * interrupted at its bound (1.12.0) - whatever the publisher makes of the interrupt, the
    * transport did not answer in time; a {@link TerminalOutboxException} (the receiver answered)
    * and a refused row neither. An interrupt the heartbeat did not make (a shutdown) counts
    * nothing.
@@ -1072,7 +1072,7 @@ class OutboxRelayWorker {
 
   // ---------------------------------------------------------------- booking
 
-  /** The stopping relay's grace has run out: nothing more is sent or booked (1.11.1). */
+  /** The stopping relay's grace has run out: nothing more is sent or booked (1.12.0). */
   void close() {
     closed = true;
   }
@@ -1103,7 +1103,7 @@ class OutboxRelayWorker {
   /**
    * Books one attempt as {@link #book(TransactionOperations, Leased, Attempt, Supplier)} does, with
    * {@code ifRelayed} riding a RELAYED booking's transaction and {@code ifFailed} a failure's - a
-   * key's run renews its next row after the one, releases the rest after the other (1.11.1).
+   * key's run renews its next row after the one, releases the rest after the other (1.12.0).
    */
   @SuppressWarnings("java:S1181") // an Error is a failed attempt; nothing leaves the thread (F-4)
   private void book(
@@ -1244,7 +1244,7 @@ class OutboxRelayWorker {
   }
 
   /**
-   * The stored text of a failure (1.11.1): the consumer's {@link OutboxFailureText} on a read-only
+   * The stored text of a failure (1.12.0): the consumer's {@link OutboxFailureText} on a read-only
    * copy of the row's facts; the failure's type name alone when it gives no text or throws - a
    * throw is logged by its type only and never rolls the booking back.
    */

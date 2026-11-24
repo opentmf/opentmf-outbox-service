@@ -325,7 +325,7 @@ class OutboxConcurrentLaneTests {
   }
 
   /**
-   * 1.11.1: a stopping lane interrupts the sends still running after the grace and JOINS them - a
+   * 1.12.0: a stopping lane interrupts the sends still running after the grace and JOINS them - a
    * send that goes on after the interrupt (a booking on its way) ends before the stop returns. Up
    * to 1.11.0 the stop returned after the interrupt and the send ran on beside a closing pool.
    */
@@ -355,7 +355,7 @@ class OutboxConcurrentLaneTests {
   }
 
   /**
-   * A key's run (1.11.1) is ONE unit on one slot that counts as its rows: in the queue's depth, in
+   * A key's run (1.12.0) is ONE unit on one slot that counts as its rows: in the queue's depth, in
    * the room, and when it is given back; each of its sends is measured as a send of its own, and
    * the slot is live again at each.
    */

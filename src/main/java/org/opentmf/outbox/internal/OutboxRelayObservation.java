@@ -13,7 +13,7 @@ import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * The relay span (1.11.1, OUTBOX-SEND-OBSERVATION-PARENT-1): a row that stored a W3C {@code
+ * The relay span (1.12.0, OUTBOX-SEND-OBSERVATION-PARENT-1): a row that stored a W3C {@code
  * traceparent} is relayed inside a receiver-kind observation that takes the stored trace context as
  * its parent. The send's own observation - Spring Kafka's template observation, or the consumer's
  * {@code RestClient} observation on an HTTP profile client - opens while this one is current, so
@@ -60,7 +60,7 @@ final class OutboxRelayObservation {
   /** The transport of a publisher that names none (a consumer's own publisher). */
   static final String OTHER_TRANSPORT = "other";
 
-  /** No registry: every send runs as it did before 1.11.1. */
+  /** No registry: every send runs as it did before 1.12.0. */
   static final OutboxRelayObservation NONE = new OutboxRelayObservation(ObservationRegistry.NOOP);
 
   private static final ObjectMapper HEADERS = new ObjectMapper();

@@ -284,7 +284,7 @@ class OutboxSendHeartbeatTests {
   }
 
   /**
-   * 1.11.1: a stop waits for the tick in flight - its clock measure, its renewal and their
+   * 1.12.0: a stop waits for the tick in flight - its clock measure, its renewal and their
    * connection - before it returns. Up to 1.11.0 it returned at once and the tick went on while
    * the application's pool closed.
    */

@@ -874,7 +874,7 @@ class OutboxClaimPlanIT {
           .as("%s cross-pod re-check, %s: buffers", state, mode)
           .isLessThanOrEqualTo(FULL_BATCH_BUFFER_BOUND);
     }
-    // a key's run (1.11.1): the rows behind each head over the keyed index from the head on -
+    // a key's run (1.12.0): the rows behind each head over the keyed index from the head on -
     // never a key's whole backlog - and their lock, by primary key
     Map<String, String> tails = Map.of("heads", "'" + heads + "'", "limit", "7");
     assertIndexedOnly(

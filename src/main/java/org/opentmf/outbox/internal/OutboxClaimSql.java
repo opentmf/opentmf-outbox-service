@@ -248,7 +248,7 @@ final class OutboxClaimSql {
           order by o.ordering_key, o.id limit 1) is null""";
 
   /**
-   * A KEY'S RUN (1.11.1, {@code concurrent.key-run} above 1): for each re-checked head (the ids as
+   * A KEY'S RUN (1.12.0, {@code concurrent.key-run} above 1): for each re-checked head (the ids as
    * an array literal), the open rows of its key right behind it, in {@code id} order, at most
    * {@code :limit} per key - the eligibility columns read, not filtered: the run is the prefix of
    * due rows, and the first row that is not due ends it, so the caller needs to see that row too.

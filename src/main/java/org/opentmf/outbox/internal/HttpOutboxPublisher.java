@@ -24,7 +24,7 @@ import tools.jackson.databind.ObjectMapper;
  * <p>Stored headers are forwarded first; the relay headers are then SET (replacing a stored
  * header of the same name - the Kafka leg does the same). The row's {@code reference} is
  * never sent. A row that stored a {@code traceparent} is POSTed inside the relay span ({@link
- * OutboxRelayObservation}, 1.11.1): a profile client whose {@code RestClient} observation is on
+ * OutboxRelayObservation}, 1.12.0): a profile client whose {@code RestClient} observation is on
  * stamps its own client span's header, a child in the stored trace - up to 1.11.0 a new trace's
  * root. The plain client has no observation and forwards the stored header as it is.
  *

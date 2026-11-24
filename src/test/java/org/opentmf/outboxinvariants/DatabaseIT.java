@@ -103,7 +103,7 @@ class DatabaseIT {
 
   /**
    * D3's claim bound on the vacuumed 200k-row table, no pod relaying: 1,318 buffers measured three
-   * times (2026-11-14, quiet), and a quarter on top (1.11.1, 2,500 before).
+   * times (2026-11-14, quiet), and a quarter on top (1.12.0, 2,500 before).
    */
   static final int CLAIM_BUFFERS_BOUND = 1650;
 
@@ -112,7 +112,7 @@ class DatabaseIT {
    * ANALYZE BUFFERS of the library's own statement), and the prune running WHILE two pods relay
    * never deletes a row that is not relayed or cancelled.
    *
-   * <p>The bound is measured on a DETERMINISTIC table (1.11.1, OUTBOX-GATE-INDEPENDENT-OF-MACHINE-
+   * <p>The bound is measured on a DETERMINISTIC table (1.12.0, OUTBOX-GATE-INDEPENDENT-OF-MACHINE-
    * LOAD-1): no pod relays while it is taken, and {@code VACUUM (ANALYZE)} has set the visibility
    * map. Up to 1.11.0 it was taken right after the insert, a pod relaying beside it: its heap
    * visits then followed whether autovacuum had come first and how far that pod had booked, both a

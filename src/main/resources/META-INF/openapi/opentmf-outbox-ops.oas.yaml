@@ -73,7 +73,7 @@
 openapi: 3.1.0
 info:
   title: opentmf-outbox-service /ops/outbox fragment
-  version: 1.11.1
+  version: 1.12.0
   description: >-
     Paste-in contract for the outbox ops surface served by opentmf-outbox-service.
     Not a standalone API document — a fragment the consumer's OAS absorbs. The library's
@@ -197,7 +197,7 @@ paths:
       security: [{ bearerAuth: [] }]
       summary: One row in full (payload + lastError — the pre-unpark forensic read)
       description: >-
-        With `opentmf.outbox.ops.sensitive-in-views=false` (1.11.1) `payload` is null here and
+        With `opentmf.outbox.ops.sensitive-in-views=false` (1.12.0) `payload` is null here and
         `lastError` holds the failure's kind only; `GET /ops/outbox/{id}/payload` serves the
         full text, so the consumer's path rules can give that path a stricter role.
       parameters:
@@ -220,7 +220,7 @@ paths:
     get:
       operationId: getOutboxRowPayload
       security: [{ bearerAuth: [] }]
-      summary: One row's sensitive text - its payload and lastError - on its own path (1.11.1)
+      summary: One row's sensitive text - its payload and lastError - on its own path (1.12.0)
       description: >-
         The customer's data of a row: the stored payload, and `lastError`, the failure's
         message - for an HTTP 4xx or 5xx the receiver's whole response body. On its own path so
@@ -308,7 +308,7 @@ paths:
       summary: Withdraw one unreleased row — never relayed from now on, retained for audit
       description: >-
         A row IN FLIGHT — claimed by a relay under a live lease: queued for its send (about a
-        second at most), waiting behind the earlier rows of its key's run (1.11.1), or
+        second at most), waiting behind the earlier rows of its key's run (1.12.0), or
         sending — is refused at once with a 409; it is cancellable once it
         is booked (a failed send in backoff is cancellable, a delivered one is relayed). A row whose lease has lapsed is
         cancellable; should its stale send still succeed, the row is booked
@@ -666,19 +666,19 @@ components:
           type: [string, 'null']
           description: >-
             The last failure's message; with `opentmf.outbox.ops.sensitive-in-views=false`
-            (1.11.1) its kind only - the exception's type name, `unclassified` for a text not led
+            (1.12.0) its kind only - the exception's type name, `unclassified` for a text not led
             by a name ending in `Exception` or `Error` or one of Spring's HTTP-status exceptions -
             and the full text is on `GET /ops/outbox/{id}/payload`.
         payload:
           type: [string, 'null']
           description: >-
             The stored payload, on the single-row inspect only; null with
-            `opentmf.outbox.ops.sensitive-in-views=false` (1.11.1).
+            `opentmf.outbox.ops.sensitive-in-views=false` (1.12.0).
 
     OutboxRowPayload:
       type: object
       description: >-
-        A row's sensitive text (`OutboxRowPayload`, 1.11.1): the stored payload and the last
+        A row's sensitive text (`OutboxRowPayload`, 1.12.0): the stored payload and the last
         failure's message. Never the stored headers.
       properties:
         id: { type: integer, format: int64 }

@@ -1498,7 +1498,7 @@ class OutboxRelayWorkerTests {
   }
 
   /**
-   * 1.11.1: once a stopping relay's grace has run out the worker books NOTHING - a send that
+   * 1.12.0: once a stopping relay's grace has run out the worker books NOTHING - a send that
    * returns afterwards leaves its row to its lease, redelivered once it lapses - so no booking
    * borrows a connection while the application's pool closes; the rest of an ORDERED batch is not
    * sent at all.
@@ -2701,7 +2701,7 @@ class OutboxRelayWorkerTests {
     assertThat(kindOf(event.getLastError())).isEqualTo("TerminalOutboxException");
   }
 
-  // ------------------------------------------------------------ a key's run as one unit, 1.11.1
+  // ------------------------------------------------------------ a key's run as one unit, 1.12.0
 
   /** A lane of two slots that claims up to eight rows ahead: room for a key's run. */
   private final OutboxConcurrentLane wide =

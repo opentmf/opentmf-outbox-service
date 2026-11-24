@@ -2,7 +2,7 @@ package org.opentmf.outbox.internal;
 
 /**
  * Application event published by the retention prune after each batch that COMMITTED and deleted
- * rows (1.11.1). {@code OutboxMetrics} adds them to the {@code opentmf.outbox.pruned} counter, so
+ * rows (1.12.0). {@code OutboxMetrics} adds them to the {@code opentmf.outbox.pruned} counter, so
  * the rows a call deleted are counted even when a later batch of the same call fails and the call
  * itself answers with an exception, not with its result.
  *

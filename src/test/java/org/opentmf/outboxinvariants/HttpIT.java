@@ -15,7 +15,7 @@ import org.opentmf.outboxinvariants.HttpReceiver.Request;
 
 /**
  * F - the library's own HTTP publisher against a programmable receiver, each scenario on both plain
- * clients (1.11.1): Apache HttpClient, which this classpath carries and so the library picks, and
+ * clients (1.12.0): Apache HttpClient, which this classpath carries and so the library picks, and
  * the JDK's, which a consumer without Apache gets ({@code it.http.client=jdk}, PodApp).
  */
 class HttpIT {

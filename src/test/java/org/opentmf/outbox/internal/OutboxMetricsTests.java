@@ -250,7 +250,7 @@ class OutboxMetricsTests {
   }
 
   /**
-   * 1.11.1: a stop waits for the refresh in flight - its queries and their connection - before it
+   * 1.12.0: a stop waits for the refresh in flight - its queries and their connection - before it
    * returns. Up to 1.11.0 it returned at once and the query went on while the pool closed.
    */
   @Test

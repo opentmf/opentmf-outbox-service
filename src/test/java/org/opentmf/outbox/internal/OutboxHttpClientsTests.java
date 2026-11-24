@@ -39,7 +39,7 @@ import org.springframework.web.client.RestClient;
 
 /**
  * The plain client's factory: the one RestClient.create() would pick, its timeouts set - the
- * CONNECT timeout too on Apache HttpClient (1.11.1,
+ * CONNECT timeout too on Apache HttpClient (1.12.0,
  * OUTBOX-HTTP-CONNECT-TIMEOUT-WITHIN-SEND-BOUND-1), whose own is three minutes.
  */
 class OutboxHttpClientsTests {
@@ -168,7 +168,7 @@ class OutboxHttpClientsTests {
     assertThat(took).isLessThan(CONNECT.plusSeconds(2));
   }
 
-  /** The JDK's client bounds a stalled connect too (a control: it did before 1.11.1 as well). */
+  /** The JDK's client bounds a stalled connect too (a control: it did before 1.12.0 as well). */
   @Test
   void jdk_endsAStalledConnectAtTheConnectTimeout() throws IOException {
     InetSocketAddress address = aStallingAddress();
@@ -258,7 +258,7 @@ class OutboxHttpClientsTests {
     assertThat(hitsOf("/elsewhere")).as("its Location never requested").isZero();
   }
 
-  /** Jetty never retried a 503 or a 429 (a control: it did not before 1.11.1 either). */
+  /** Jetty never retried a 503 or a 429 (a control: it did not before 1.12.0 either). */
   @ParameterizedTest(name = "{0}")
   @ValueSource(ints = {503, 429})
   void jetty_neverRetries(int status) throws IOException {

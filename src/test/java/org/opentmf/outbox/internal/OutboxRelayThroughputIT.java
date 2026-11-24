@@ -62,7 +62,7 @@ import org.testcontainers.toxiproxy.ToxiproxyContainer;
  * THROUGHPUT-FIGURES} and recorded in the README.
  *
  * <p>The rows/s bars measure the statement economy TIMES the CPU the relay gets, so another build
- * on the box moves them. Every run therefore also counts what load cannot move (1.11.1,
+ * on the box moves them. Every run therefore also counts what load cannot move (1.12.0,
  * OUTBOX-GATE-INDEPENDENT-OF-MACHINE-LOAD-1): the application's JDBC round trips - every statement
  * executed, every commit, rollback and isolation change on its DataSource - per relayed row, and
  * asserts them below {@link #ROUND_TRIPS_PER_ROW}. The 1.6.0 shape costs a row its booking (one
@@ -91,7 +91,7 @@ class OutboxRelayThroughputIT {
    * calibrated on the gate's box on a quiet machine, so they are the RELEASE build's (Gökhan,
    * #2720 and #4082): the {@code release} profile sets {@code true}; every other build, the
    * everyday gate included, prints the figures and asserts the round trips per row, which other
-   * load cannot move. Default false (1.11.1; true before).
+   * load cannot move. Default false (1.12.0; true before).
    */
   private static final boolean ABSOLUTE_BARS =
       Boolean.parseBoolean(System.getProperty("it.absolute-bars", "false"));

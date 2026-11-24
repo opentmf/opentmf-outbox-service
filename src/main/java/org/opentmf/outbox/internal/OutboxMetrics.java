@@ -47,7 +47,7 @@ import org.springframework.context.event.EventListener;
  *       claim-pause}), else 0 - read in this pod, no database; one series per transport a
  *       publisher names, from its first pause; alert when it stays 1
  *   <li>{@code opentmf.outbox.relay.running} - gauge, 1 while this pod's relay runs, else 0 - read
- *       in this pod, no database; alert when it reads 0 in a running service (1.11.1: a relay that
+ *       in this pod, no database; alert when it reads 0 in a running service (1.12.0: a relay that
  *       was stopped and is not running again)
  *   <li>{@code opentmf.outbox.relayed} - counter by {@code destination} (closed tag set)
  *   <li>{@code opentmf.outbox.dropped} - counter by {@code destination}: rows given up by a
@@ -55,7 +55,7 @@ import org.springframework.context.event.EventListener;
  *   <li>{@code opentmf.outbox.attempts} - summary, delivery attempts a relayed row took
  *   <li>{@code opentmf.outbox.pruned} - counter by {@code state} ({@code relayed} / {@code
  *       cancelled}: the kind of row the retention prune deleted, not an outcome of the prune),
- *       incremented by every batch that committed (1.11.1) - so the rows a call deleted are
+ *       incremented by every batch that committed (1.12.0) - so the rows a call deleted are
  *       counted even when a later batch of the call fails
  * </ul>
  *
@@ -124,7 +124,7 @@ class OutboxMetrics implements SmartLifecycle {
 
   private volatile State state = State.NEW;
 
-  /** How long a stop waits for a refresh in flight ({@code shutdown-join}, 1.11.1). */
+  /** How long a stop waits for a refresh in flight ({@code shutdown-join}, 1.12.0). */
   private Duration shutdownJoin = Duration.ofSeconds(5);
 
   OutboxMetrics(MeterRegistry registry, OutboxEventRepository repository, Duration refreshEvery) {
@@ -183,7 +183,7 @@ class OutboxMetrics implements SmartLifecycle {
 
   /**
    * Starts the refresher: the first refresh now, then every {@code metrics-refresh}. A {@link
-   * SmartLifecycle} in the relay's phase (1.11.1; a {@code @PostConstruct} up to 1.11.0). Again
+   * SmartLifecycle} in the relay's phase (1.12.0; a {@code @PostConstruct} up to 1.11.0). Again
    * after a stop, on a new thread, once the previous one has ended (the relay's rule,
    * OUTBOX-RELAY-RESTARTS-AFTER-A-STOP-1); refused, with an ERROR, while it still runs and after
    * the bean's destruction.
@@ -231,7 +231,7 @@ class OutboxMetrics implements SmartLifecycle {
   /**
    * Stops the refresher in the context's lifecycle stop, before the DataSource is destroyed, and
    * waits up to {@code shutdown-join} for a refresh in flight - its queries and their connection
-   * (1.11.1: up to 1.11.0 it returned at once and a query in flight went on while the pool closed).
+   * (1.12.0: up to 1.11.0 it returned at once and a query in flight went on while the pool closed).
    * Once per run; {@link #destroy} is the safety net of a context that never ran its lifecycle
    * stop.
    */
@@ -325,7 +325,7 @@ class OutboxMetrics implements SmartLifecycle {
     registry.summary(ATTEMPTS).record(attempts);
   }
 
-  /** Books one committed prune batch: its rows, on the counter of their state (1.11.1). */
+  /** Books one committed prune batch: its rows, on the counter of their state (1.12.0). */
   @EventListener
   public void recordPruned(OutboxPruned batch) {
     pruned(batch.state()).increment(batch.rows());

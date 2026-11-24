@@ -383,7 +383,7 @@ class OutboxOnboardingIT {
   }
 
   /**
-   * 1.11.1 over a database the RELEASED 1.11.0 changelog migrated (changeset 009,
+   * 1.12.0 over a database the RELEASED 1.11.0 changelog migrated (changeset 009,
    * OUTBOX-IDEMPOTENCY-KEY-REPEATS-AFTER-RESTORE-1): 001-008 keep their recorded checksums and 009
    * adds the nullable key_token with no default - a row booked before keeps a null token, so its
    * key is the 1.11.0 one; 010 (OUTBOX-THE-LOOKUP-BY-AGGREGATE-HAS-A-PLAN-ON-A-LOADED-TABLE-1)

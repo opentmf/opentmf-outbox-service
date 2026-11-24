@@ -104,7 +104,7 @@ public interface OutboxEventRepository
 
   /**
    * The open rows right behind each head, per key in {@code id} order, at most {@code limit} per
-   * key ({@link OutboxClaimSql#TAIL}, 1.11.1) - read inside the claim, after the re-check.
+   * key ({@link OutboxClaimSql#TAIL}, 1.12.0) - read inside the claim, after the re-check.
    *
    * @param heads the re-checked heads as a PostgreSQL array literal, e.g. {@code {7,12}}
    */
@@ -113,7 +113,7 @@ public interface OutboxEventRepository
 
   /**
    * Of a claim's run rows, those still due and leased by nobody, locked ({@link
-   * OutboxClaimSql#TAIL_LOCK}, 1.11.1); a row another transaction holds locked is skipped.
+   * OutboxClaimSql#TAIL_LOCK}, 1.12.0); a row another transaction holds locked is skipped.
    *
    * @param ids the rows as a PostgreSQL array literal, e.g. {@code {7,12}}
    */

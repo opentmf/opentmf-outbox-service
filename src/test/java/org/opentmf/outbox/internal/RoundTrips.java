@@ -12,7 +12,7 @@ import javax.sql.DataSource;
 import org.springframework.jdbc.datasource.DelegatingDataSource;
 
 /**
- * A DataSource that counts the application's JDBC ROUND TRIPS (OutboxRelayThroughputIT, 1.11.1):
+ * A DataSource that counts the application's JDBC ROUND TRIPS (OutboxRelayThroughputIT, 1.12.0):
  * every statement executed, every commit, rollback and isolation change - a figure no other load on
  * the machine can move. Connection and statement proxies over the pool's own; nothing else changes.
  */

@@ -29,7 +29,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * OUTBOX-RELAY-RESTARTS-AFTER-A-STOP-1: the relay and the gauges' refresher are {@code
- * SmartLifecycle} beans since 1.11.1, and a Lifecycle bean that was stopped is started again by
+ * SmartLifecycle} beans since 1.12.0, and a Lifecycle bean that was stopped is started again by
  * whoever stopped it - {@code ConfigurableApplicationContext.stop()/start()}, and Spring Framework
  * 7's test-context cache, which PAUSES a cached context when a test class switches to another one
  * and restarts it when a later class reuses it ({@code spring.test.context.cache.pause}, default

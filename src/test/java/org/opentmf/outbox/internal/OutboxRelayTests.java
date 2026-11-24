@@ -390,7 +390,7 @@ class OutboxRelayTests {
   }
 
   /**
-   * 1.11.1: the relay is a SmartLifecycle between the web server's stop and the Kafka producers'.
+   * 1.12.0: the relay is a SmartLifecycle between the web server's stop and the Kafka producers'.
    * It stops ONCE, on one deadline: the grace for what runs, then the worker closed (nothing more
    * is booked), the interrupt, and a join, so no thread of it is alive when the stop returns.
    */
