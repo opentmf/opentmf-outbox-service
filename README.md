@@ -1569,6 +1569,13 @@ routes pastes `META-INF/openapi/opentmf-outbox-ops.oas.yaml` into its own OAS
 A service whose tests compare its served OAS with the fragment goes red until
 it re-pastes. A service without such a test serves the old text unnoticed.
 
+**Third: regenerate a schema snapshot.** Two changesets join the library's
+changelog: `009-outbox-key-token` (a column, `key_token`) and
+`010-outbox-aggregate-lookup` (an index, `ix_outbox_aggregate`); items 2 and
+5. A service that keeps a copy of its schema, or a list of the changesets it
+expects (a schema-snapshot test, a baseline list of a wipe script), goes red
+until it regenerates or extends it with these two.
+
 1. **The idempotency key names the row.**
    Up to 1.11.0 the key was `<service>:outbox:<id>`, and an `id` repeats once
    the table is recreated or the database is restored to a point in time: a
@@ -1602,7 +1609,8 @@ it re-pastes. A service without such a test serves the old text unnoticed.
    as the id, say - must stop: the key is opaque.
 5. **The schema: changeset `010-outbox-aggregate-lookup`**, one index,
    `ix_outbox_aggregate (aggregate_type, aggregate_id, id)`, built
-   `CONCURRENTLY` - nothing to change in your service. It serves a lookup of
+   `CONCURRENTLY` - nothing to change in your service's code (a schema
+   snapshot gains the index: see "Third" above). It serves a lookup of
    an aggregate's rows, newest first and optionally above an id
    (`where aggregate_type = ? and aggregate_id = ? [and id > ?] order by id desc
    limit 1`): without it PostgreSQL walks the primary key back over every newer

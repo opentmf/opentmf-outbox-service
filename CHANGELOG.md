@@ -28,8 +28,10 @@
   1-6 % on an append's time and up to about twice the write-ahead log per append on a quiet table;
   the relay's statements keep their plans. The first 1.11.1 start builds it while the service
   runs (about 10 s at 5,000,000 rows; appends and the relay are not stopped). Nothing to change
-  in a service; a changelog run out of band applies the two statements outside a transaction
-  (README "Upgrading to 1.11.1", item 5). `OutboxAggregateLookupPlanIT` pins the lookup's plan
+  in a service's code; a changelog run out of band applies the two statements outside a
+  transaction (README "Upgrading to 1.11.1", item 5). **A service that keeps a schema snapshot,
+  or a list of the changesets it expects, regenerates or extends it with `009-outbox-key-token`
+  and `010-outbox-aggregate-lookup`** (README "Upgrading to 1.11.1", the third lead step). `OutboxAggregateLookupPlanIT` pins the lookup's plan
   and the relay's on a 1,000,000-row table.
 
 - **The rows the retention prune deletes are counted as each batch commits**
