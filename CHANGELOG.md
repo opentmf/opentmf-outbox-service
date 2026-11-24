@@ -27,7 +27,10 @@
   1.4 s at 5,000,000 on a seven-day table; 0.1 ms with the index. It costs about 80 bytes a row,
   1-6 % on an append's time and up to about twice the write-ahead log per append on a quiet table;
   the relay's statements keep their plans. The first 1.11.1 start builds it while the service
-  runs (about 10 s at 5,000,000 rows; appends and the relay are not stopped). Nothing to change
+  runs (about 10 s at 5,000,000 rows; appends and the relay are not stopped), and the start
+  lasts as long as the build: **a start-up probe shorter than the build kills the pod mid-build
+  and every restart builds again** - with millions of rows give the probe the time, or apply the
+  two statements out of band first (README "Upgrading to 1.11.1", item 5). Nothing to change
   in a service's code; a changelog run out of band applies the two statements outside a
   transaction (README "Upgrading to 1.11.1", item 5). **A service that keeps a schema snapshot,
   or a list of the changesets it expects, regenerates or extends it with `009-outbox-key-token`

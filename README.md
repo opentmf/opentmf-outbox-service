@@ -1622,13 +1622,24 @@ until it regenerates or extends it with these two.
      checkpoint; less under a steady stream of appends). The relay's claim,
      re-check, stamp, heartbeat, give-back and booking statements keep their
      plans - none of them filters on the aggregate.
-   - **At the upgrade:** the first 1.11.1 start builds the index while the
-     service runs - `CREATE INDEX CONCURRENTLY` takes no lock that stops appends
-     or the relay - in about 2 s at 1,000,000 rows and 10 s at 5,000,000 (it
-     reads the table twice and waits for transactions already open). Liquibase
-     holds its changelog lock meanwhile, so a second pod starting at the same
-     time waits for the build. A build that fails leaves an INVALID index and
-     the changeset unmarked; the next start drops it and builds it again.
+   - **At the upgrade, on an existing large table:** the index is built
+     `CONCURRENTLY` at the service's first start on 1.11.1, and the start lasts
+     as long as the build: about 2 s at 1,000,000 rows and about 10 s at
+     5,000,000 (it reads the table twice), plus the wait for transactions
+     already open on the table.
+     - Pods already running keep appending and relaying: the build takes no
+       lock that stops them.
+     - A second pod starting meanwhile waits on Liquibase's changelog lock.
+     - The disk grows about 80 bytes a row.
+     - A build that fails leaves an INVALID index and the changeset unmarked;
+       the next start drops it and builds it again.
+     - **A start-up probe shorter than the build kills the pod mid-build,
+       leaves an INVALID index, and every restart builds again.** With millions
+       of rows, either give the start-up probe the time, or apply the two
+       statements out of band first (next point).
+     - What is measured and what is not: the times above were measured on one
+       machine and no test asserts them. A build while other pods append, and a
+       build behind a long open transaction, are not tested.
    - **Changelog run out of band:** apply the two statements (`drop index
      concurrently if exists ix_outbox_aggregate;` then the `create index
      concurrently ...`) outside a transaction, before or after 1.11.1 starts -
