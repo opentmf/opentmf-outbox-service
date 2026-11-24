@@ -249,6 +249,8 @@
   4.2.0; a consumer's own parent wins at runtime. The library's code is unchanged and uses
   nothing that 4.1 lacks, so the requirement stays Spring Boot 4.1+.
 - sonar-maven-plugin 5.8.0.7211 → 5.9.0.7382 (build only).
+- tmf630-toolkit 3.5.1 → 3.6.0 (an optional dependency, behind the ops endpoints' list
+  filters): its case-insensitive filter operators no longer depend on the JVM's default locale.
 
 ### Build (contributors)
 
@@ -258,8 +260,8 @@
   rewrite each other's `-SNAPSHOT.jar` base file. The jar is unchanged.
 - The local SonarQube token goes only through the `SONAR_TOKEN` environment variable, never as
   `-Dsonar.token` on a command line (pom comment and README).
-- Every dependency and plugin is current (OTMF-OUTBOX-BUMPS-BEFORE-THE-BATCH-1): tmf630-toolkit
-  3.5.2 (an optional dependency) and pitest-maven 1.30.2. The pitest 1.19.6 hold is lifted. PIT
+- Every dependency and plugin is current (OTMF-OUTBOX-BUMPS-BEFORE-THE-BATCH-1): pitest-maven
+  1.30.2 (tmf630-toolkit: see Dependencies). The pitest 1.19.6 hold is lifted. PIT
   now runs without incremental history - from 1.20 it needs the commercial arcmutate plugin, and
   the bare `withHistory` flag fails the run - so every run is a full run. On 1.30.2 the daemon flag
   of the relay's, the metrics' and the ORDERED lane's thread factories is a killed mutant, and a
