@@ -1569,6 +1569,13 @@ routes pastes `META-INF/openapi/opentmf-outbox-ops.oas.yaml` into its own OAS
 A service whose tests compare its served OAS with the fragment goes red until
 it re-pastes. A service without such a test serves the old text unnoticed.
 
+**Third: regenerate a schema snapshot.** Two changesets join the library's
+changelog: `009-outbox-key-token` (a column, `key_token`) and
+`010-outbox-aggregate-lookup` (an index, `ix_outbox_aggregate`); items 2 and
+5. A service that keeps a copy of its schema, or a list of the changesets it
+expects (a schema-snapshot test, a baseline list of a wipe script), goes red
+until it regenerates or extends it with these two.
+
 1. **The idempotency key names the row.**
    Up to 1.11.0 the key was `<service>:outbox:<id>`, and an `id` repeats once
    the table is recreated or the database is restored to a point in time: a
@@ -1602,7 +1609,8 @@ it re-pastes. A service without such a test serves the old text unnoticed.
    as the id, say - must stop: the key is opaque.
 5. **The schema: changeset `010-outbox-aggregate-lookup`**, one index,
    `ix_outbox_aggregate (aggregate_type, aggregate_id, id)`, built
-   `CONCURRENTLY` - nothing to change in your service. It serves a lookup of
+   `CONCURRENTLY` - nothing to change in your service's code (a schema
+   snapshot gains the index: see "Third" above). It serves a lookup of
    an aggregate's rows, newest first and optionally above an id
    (`where aggregate_type = ? and aggregate_id = ? [and id > ?] order by id desc
    limit 1`): without it PostgreSQL walks the primary key back over every newer
@@ -1614,13 +1622,24 @@ it re-pastes. A service without such a test serves the old text unnoticed.
      checkpoint; less under a steady stream of appends). The relay's claim,
      re-check, stamp, heartbeat, give-back and booking statements keep their
      plans - none of them filters on the aggregate.
-   - **At the upgrade:** the first 1.11.1 start builds the index while the
-     service runs - `CREATE INDEX CONCURRENTLY` takes no lock that stops appends
-     or the relay - in about 2 s at 1,000,000 rows and 10 s at 5,000,000 (it
-     reads the table twice and waits for transactions already open). Liquibase
-     holds its changelog lock meanwhile, so a second pod starting at the same
-     time waits for the build. A build that fails leaves an INVALID index and
-     the changeset unmarked; the next start drops it and builds it again.
+   - **At the upgrade, on an existing large table:** the index is built
+     `CONCURRENTLY` at the service's first start on 1.11.1, and the start lasts
+     as long as the build: about 2 s at 1,000,000 rows and about 10 s at
+     5,000,000 (it reads the table twice), plus the wait for transactions
+     already open on the table.
+     - Pods already running keep appending and relaying: the build takes no
+       lock that stops them.
+     - A second pod starting meanwhile waits on Liquibase's changelog lock.
+     - The disk grows about 80 bytes a row.
+     - A build that fails leaves an INVALID index and the changeset unmarked;
+       the next start drops it and builds it again.
+     - **A start-up probe shorter than the build kills the pod mid-build,
+       leaves an INVALID index, and every restart builds again.** With millions
+       of rows, either give the start-up probe the time, or apply the two
+       statements out of band first (next point).
+     - What is measured and what is not: the times above were measured on one
+       machine and no test asserts them. A build while other pods append, and a
+       build behind a long open transaction, are not tested.
    - **Changelog run out of band:** apply the two statements (`drop index
      concurrently if exists ix_outbox_aggregate;` then the `create index
      concurrently ...`) outside a transaction, before or after 1.11.1 starts -
