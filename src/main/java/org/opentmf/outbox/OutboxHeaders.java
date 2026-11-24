@@ -28,7 +28,7 @@ public final class OutboxHeaders {
 
   /**
    * The idempotency key for one row (1.11.1): {@code <serviceName>:outbox:<id>:<key_token>} - the
-   * row's {@link OutboxEvent#getKeyToken() key token}, minted at booking, makes it unique even
+   * row's {@code key_token}, minted at booking, makes it unique even
    * where an {@code id} repeats (a recreated table, a restore to a point in time). A row without
    * one - booked before 1.11.1 - keeps {@code <serviceName>:outbox:<id>}, exactly the key it was
    * first sent with, so a retry across the upgrade is still recognised. Both built-in publishers
