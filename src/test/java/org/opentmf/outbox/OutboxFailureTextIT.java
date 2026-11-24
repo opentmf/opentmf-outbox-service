@@ -21,7 +21,7 @@ import org.springframework.web.servlet.function.RouterFunctions;
 import org.springframework.web.servlet.function.ServerResponse;
 
 /**
- * A service's own {@link OutboxFailureText} (1.11.1), against the real engines: the library's HTTP
+ * A service's own {@link OutboxFailureText} (1.12.0), against the real engines: the library's HTTP
  * publisher posts to the service's own web server, which refuses with a 400 whose body carries a
  * made-up value. The row parks after its one attempt; its stored and served {@code lastError} is
  * the service's text - the kind kept, the receiver's body not. A row the bean leaves to {@link

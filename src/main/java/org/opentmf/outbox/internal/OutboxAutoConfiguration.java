@@ -66,7 +66,7 @@ public class OutboxAutoConfiguration {
   static final String SCHEMA_CHECK = "outboxSchemaCheck";
 
   /**
-   * Refuses the start when the library's newest changeset has not been applied (1.11.1): after
+   * Refuses the start when the library's newest changeset has not been applied (1.12.0): after
    * the database initialisation (Liquibase applies the included changelog first), before the
    * EntityManagerFactory - see {@link OutboxSchemaCheck}. No single DataSource: nothing to check.
    */
@@ -219,7 +219,7 @@ public class OutboxAutoConfiguration {
   }
 
   /**
-   * The text a failed attempt stores as its row's {@code last_error} (1.11.1): exactly the text up
+   * The text a failed attempt stores as its row's {@code last_error} (1.12.0): exactly the text up
    * to 1.11.0, unless the consumer declares its own {@link OutboxFailureText}.
    */
   @Bean
@@ -256,7 +256,7 @@ public class OutboxAutoConfiguration {
   }
 
   /**
-   * The relay span's registry (1.11.1): the application's {@link ObservationRegistry}, found as
+   * The relay span's registry (1.12.0): the application's {@link ObservationRegistry}, found as
    * {@code KafkaTemplate} finds its own - the unique one, else none - so the relay span and the
    * template's observation share their handlers. No registry: the relay span is never opened.
    */
@@ -359,7 +359,7 @@ public class OutboxAutoConfiguration {
   }
 
   /**
-   * The trace context of an append (1.11.1), read from the application's Micrometer {@code Tracer}
+   * The trace context of an append (1.12.0), read from the application's Micrometer {@code Tracer}
    * and {@code Propagator} - name-guarded like the publisher defaults, so a consumer without
    * Micrometer Tracing links none of its types and its writer stores no trace context.
    */

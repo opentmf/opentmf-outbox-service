@@ -106,7 +106,7 @@ class LifecycleIT {
   /**
    * Whether G3's rows/s bar is asserted ({@code -Dit.absolute-bars}): it is ABSOLUTE, calibrated on
    * the gate's box on a quiet machine - the RELEASE build's, which the {@code release} profile
-   * sets (Gökhan, #4082); every other build prints the figure. Default false (1.11.1; true before).
+   * sets (Gökhan, #4082); every other build prints the figure. Default false (1.12.0; true before).
    */
   private static final boolean ABSOLUTE_BARS =
       Boolean.parseBoolean(System.getProperty("it.absolute-bars", "false"));

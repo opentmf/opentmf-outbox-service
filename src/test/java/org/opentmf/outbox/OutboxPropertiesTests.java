@@ -59,7 +59,7 @@ class OutboxPropertiesTests {
 
   /**
    * 1.9.0: the plain HTTP client's read timeout - derived below the send bound, or set below it;
-   * 1.11.1: the derived one leaves room for the connect, whose default scales with a short bound.
+   * 1.12.0: the derived one leaves room for the connect, whose default scales with a short bound.
    */
   @Test
   void theHttpReadTimeout_isDerivedBelowTheSendBound_orSetBelowIt() {

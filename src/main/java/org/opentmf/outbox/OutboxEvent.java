@@ -174,10 +174,10 @@ public class OutboxEvent {
   private String lastError;
 
   /**
-   * Minted by {@link OutboxWriter} at booking (1.11.1), frozen: part of the row's {@link
+   * Minted by {@link OutboxWriter} at booking (1.12.0), frozen: part of the row's {@link
    * OutboxHeaders#idempotencyKey(String, OutboxEvent) idempotency key}, so a reused {@code id} - a
    * recreated table, a restore to a point in time - never repeats a key a consumer already holds.
-   * Null = booked before 1.11.1 or not through the writer: the key is the id's alone, as before.
+   * Null = booked before 1.12.0 or not through the writer: the key is the id's alone, as before.
    */
   @Column(updatable = false)
   private UUID keyToken;

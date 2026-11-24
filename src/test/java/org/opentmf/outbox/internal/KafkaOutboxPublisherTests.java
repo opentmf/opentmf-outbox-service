@@ -206,7 +206,7 @@ class KafkaOutboxPublisherTests {
   }
 
   /**
-   * OUTBOX-TRANSACTIONAL-SEND-BOUND-1 (1.11.1): a TRANSACTIONAL send blocks up to {@code
+   * OUTBOX-TRANSACTIONAL-SEND-BOUND-1 (1.12.0): a TRANSACTIONAL send blocks up to {@code
    * max.block.ms} in each of three calls - {@code initTransactions} (a new producer), the record's
    * {@code send} (its metadata) and {@code commitTransaction} - so its bound counts it three times.
    * Up to 1.11.0 it counted it once, and the heartbeat interrupted a send whose every call was

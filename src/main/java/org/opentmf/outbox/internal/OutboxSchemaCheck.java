@@ -7,7 +7,7 @@ import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 /**
- * The start-time check that the library's newest changeset has been applied (1.11.1, changeset
+ * The start-time check that the library's newest changeset has been applied (1.12.0, changeset
  * {@value #CHANGESET}): one {@code select key_token from outbox limit 0}, before the JPA
  * EntityManagerFactory starts and after the application's database initialisation - Liquibase,
  * which applies the included changelog's missing changesets at that very start.

@@ -1,12 +1,12 @@
 package org.opentmf.outbox;
 
 /**
- * The text a failed attempt stores as its row's {@code last_error} (1.11.1). A failure's own
+ * The text a failed attempt stores as its row's {@code last_error} (1.12.0). A failure's own
  * message can quote what a service would rather keep out of its rows and logs - an HTTP receiver's
  * response body, an address with its path and query, a value a peer echoed - and the stored text is
  * served by the ops surface and printed in the relay's retry, park, drop and cancel log lines. A
  * consumer that declares a bean of this type gives that text itself; without one, {@link #DEFAULT}
- * stores exactly what every release before 1.11.1 stored.
+ * stores exactly what every release before 1.12.0 stored.
  *
  * <p>The relay calls the bean inside the booking transaction of the failed attempt, on the lane's
  * thread, with a read-only {@link Row} - the stored row itself is never handed out. Around the call

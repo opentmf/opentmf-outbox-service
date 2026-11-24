@@ -34,7 +34,7 @@ class OutboxHeadersTests {
         .isNotEqualTo(OutboxHeaders.idempotencyKey("svc", row(42, TOKEN)));
   }
 
-  /** A row booked before 1.11.1 has no token: its key is the one it was first sent with. */
+  /** A row booked before 1.12.0 has no token: its key is the one it was first sent with. */
   @Test
   void aRowWithoutAKeyToken_keepsThe1110Key() {
     assertThat(OutboxHeaders.idempotencyKey("svc", row(42, null))).isEqualTo("svc:outbox:42");

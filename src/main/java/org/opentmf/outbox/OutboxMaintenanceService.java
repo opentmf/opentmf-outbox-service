@@ -85,7 +85,7 @@ public class OutboxMaintenanceService {
    * the call with Spring's {@code QueryTimeoutException} (package {@code org.springframework.dao}):
    * that batch is rolled back whole, the batches before it stay deleted, and the next call
    * continues with the oldest expired rows. The call then answers no count; every committed
-   * batch's rows are on the {@code opentmf.outbox.pruned} counter (1.11.1), by the {@code state}
+   * batch's rows are on the {@code opentmf.outbox.pruned} counter (1.12.0), by the {@code state}
    * of the rows deleted.
    *
    * <p>A batch is planned on the table's statistics: with them it reads only the expired rows,
@@ -126,7 +126,7 @@ public class OutboxMaintenanceService {
     return result;
   }
 
-  /** A batch has committed: its rows go on the {@code opentmf.outbox.pruned} counter (1.11.1). */
+  /** A batch has committed: its rows go on the {@code opentmf.outbox.pruned} counter (1.12.0). */
   private void counted(String state, int deleted) {
     if (deleted > 0) {
       eventPublisher.publishEvent(new OutboxPruned(state, deleted));
@@ -318,7 +318,7 @@ public class OutboxMaintenanceService {
   }
 
   /**
-   * One row's sensitive text - its payload and {@code last_error} - on its own (1.11.1): what the
+   * One row's sensitive text - its payload and {@code last_error} - on its own (1.12.0): what the
    * row views leave out with {@code opentmf.outbox.ops.sensitive-in-views=false}, served whatever
    * that says.
    *

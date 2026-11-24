@@ -237,7 +237,7 @@ public class OutboxOpsController {
   /**
    * One row in full (payload + last_error) - the pre-unpark forensic read. The payload rides
    * here by ruling: this surface sits behind the consumer's admin role; the LIST stays
-   * metadata-only. With {@code opentmf.outbox.ops.sensitive-in-views=false} (1.11.1) neither
+   * metadata-only. With {@code opentmf.outbox.ops.sensitive-in-views=false} (1.12.0) neither
    * rides here: {@link #payload} serves them.
    */
   @GetMapping(path = "/outbox/{id:\\d+}", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -246,7 +246,7 @@ public class OutboxOpsController {
   }
 
   /**
-   * One row's sensitive text - payload and last_error - on its own path (1.11.1), so the
+   * One row's sensitive text - payload and last_error - on its own path (1.12.0), so the
    * consumer's path rules can give it a stricter role than the row views; served whatever {@code
    * sensitive-in-views} says. Never the stored headers.
    */

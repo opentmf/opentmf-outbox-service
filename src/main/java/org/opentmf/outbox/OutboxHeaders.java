@@ -13,7 +13,7 @@ public final class OutboxHeaders {
 
   /**
    * The consumer's dedup key: {@code <spring.application.name>:outbox:<id>:<key_token>}, or {@code
-   * <spring.application.name>:outbox:<id>} for a row without a key token (booked before 1.11.1) -
+   * <spring.application.name>:outbox:<id>} for a row without a key token (booked before 1.12.0) -
    * see {@link #idempotencyKey(String, OutboxEvent)}.
    */
   public static final String IDEMPOTENCY_KEY = "x-idempotency-key";
@@ -27,10 +27,10 @@ public final class OutboxHeaders {
   private OutboxHeaders() {}
 
   /**
-   * The idempotency key for one row (1.11.1): {@code <serviceName>:outbox:<id>:<key_token>} - the
-   * row's {@link OutboxEvent#getKeyToken() key token}, minted at booking, makes it unique even
+   * The idempotency key for one row (1.12.0): {@code <serviceName>:outbox:<id>:<key_token>} - the
+   * row's {@code key_token}, minted at booking, makes it unique even
    * where an {@code id} repeats (a recreated table, a restore to a point in time). A row without
-   * one - booked before 1.11.1 - keeps {@code <serviceName>:outbox:<id>}, exactly the key it was
+   * one - booked before 1.12.0 - keeps {@code <serviceName>:outbox:<id>}, exactly the key it was
    * first sent with, so a retry across the upgrade is still recognised. Both built-in publishers
    * use this; so should a consumer's own.
    */
@@ -43,12 +43,12 @@ public final class OutboxHeaders {
   /**
    * The idempotency key of an {@code id} alone: {@code <serviceName>:outbox:<outboxId>}.
    *
-   * @deprecated since 1.11.1 - an {@code id} repeats once the table is recreated or the database is
+   * @deprecated since 1.12.0 - an {@code id} repeats once the table is recreated or the database is
    *     restored to a point in time, and a consumer that already holds this key drops the new event
    *     as a duplicate. Use {@link #idempotencyKey(String, OutboxEvent)}, which builds the row's
-   *     key - and this very key for a row booked before 1.11.1.
+   *     key - and this very key for a row booked before 1.12.0.
    */
-  @Deprecated(since = "1.11.1")
+  @Deprecated(since = "1.12.0")
   public static String idempotencyKey(String serviceName, long outboxId) {
     return keyById(serviceName, outboxId);
   }

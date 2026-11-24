@@ -128,7 +128,7 @@ class Profile681HubIT {
     @Bean
     @Order(Ordered.HIGHEST_PRECEDENCE)
     OutboxPublisher hubSender(ObjectMapper objectMapper) {
-      // the consumer's own client, built on Apache HttpClient as the README advises (1.11.1):
+      // the consumer's own client, built on Apache HttpClient as the README advises (1.12.0):
       // Apache's defaults would re-send the hub's 503 inside the call and follow a 3xx - the
       // budget below would then count one attempt for two POSTs
       RestClient client =

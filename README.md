@@ -157,7 +157,7 @@ sequenceDiagram
   Kafka row again. CONCURRENT rows keep **no order** against ORDERED rows, nor
   against CONCURRENT rows with another **ordering key**. Rows sharing a key
   are never in flight together and go in `id` order on the happy path (a
-  failed row backs off, and later rows of its key may pass it). Since 1.11.1
+  failed row backs off, and later rows of its key may pass it). Since 1.12.0
   one claim takes up to `concurrent.key-run` (default 8) consecutive due rows
   of a key together and one slot sends them in order (see "A key's run"). The HTTP
   publisher's key is the destination, so rows to one receiver keep their order.
@@ -317,7 +317,7 @@ sequenceDiagram
   the producer's delivery timeout (120 s by default, plus 60 s of
   `max.block.ms`) — lower them on the producer to fail faster.
   **A transactional producer (`transaction-id-prefix`) counts `max.block.ms`
-  three times (1.11.1):** `initTransactions` (a new producer — the first send,
+  three times (1.12.0):** `initTransactions` (a new producer — the first send,
   or the next one after a failure closed it), the record's `send` and
   `commitTransaction` each block up to it on their own. Up to 1.11.0 the bound
   counted it once, so with a lowered delivery timeout a slow transaction
@@ -344,9 +344,9 @@ sequenceDiagram
   means redelivery once the row's lease lapses (seconds on the ORDERED lane,
   up to the lease on the CONCURRENT lane); `x-idempotency-key =
   <spring.application.name>:outbox:<id>:<key_token>` makes consumer dedup
-  trivial. The key token is a random value minted per row at booking (1.11.1),
+  trivial. The key token is a random value minted per row at booking (1.12.0),
   so an `id` that repeats - a recreated table, a restore to a point in time -
-  never repeats a key; a row booked before 1.11.1 has none and keeps
+  never repeats a key; a row booked before 1.12.0 has none and keeps
   `<spring.application.name>:outbox:<id>`. **The key is a cross-service
   contract** (downstream dedup tables key on it): store and compare it as an
   opaque string, never parse it; the constants and the formatter
@@ -383,10 +383,10 @@ sequenceDiagram
   meanwhile, because the send is still running. A row in backoff lets later
   rows of its key pass. A held row waits for its hold; a cancelled or parked
   row never comes back on its own.
-- **A key's run (1.11.1, `concurrent.key-run`, default 8).** Up to 1.11.0 a
+- **A key's run (1.12.0, `concurrent.key-run`, default 8).** Up to 1.11.0 a
   claim took ONE row of a key, its head: a key's three rows left as three
   rounds of claim, send and booking, each next claim of the key waiting for
-  the booking before it, plus the relay's next pass. Since 1.11.1 the claim
+  the booking before it, plus the relay's next pass. Since 1.12.0 the claim
   also takes up to `key-run - 1` due rows of the key right behind its head and
   leases them with it; one slot sends them in `id` order. `key-run: 1` takes
   one row of a key per claim again.
@@ -510,7 +510,7 @@ sequenceDiagram
   throwable leaves a relay, lane or heartbeat thread. Up to 1.8.0 an `Error`
   killed the sending thread and booked nothing, and a hook that threw on every
   booking booked nothing either: both rows were re-sent every lease, forever.
-- **Shutdown (one deadline, every thread joined, since 1.11.1).** The relay and
+- **Shutdown (one deadline, every thread joined, since 1.12.0).** The relay and
   the gauges' refresher are `SmartLifecycle`s in a phase after the web server's
   stop (nothing new is appended over HTTP meanwhile) and before Spring Kafka's
   producers' (still open while the sends drain), so they stop in the context's
@@ -542,7 +542,7 @@ sequenceDiagram
   load; the `attempts` summary, registered earlier, has them all). A push
   registry's final push misses them; a scrape never sees them anyway. No
   change — recorded so a dashboard's dip at a restart is understood.
-- **A stop is not the end (1.11.1).** A context that is stopped and started
+- **A stop is not the end (1.12.0).** A context that is stopped and started
   again (`stop()`/`start()`, or Spring's test-context cache, which pauses a
   cached context when a test class switches to another and restarts it when a
   later class reuses it) restarts the relay and the gauges' refresher on new
@@ -583,7 +583,7 @@ sequenceDiagram
   home-grown. That observation replaces a stored `traceparent` with its own
   producer span's; the relay span (next point) is what keeps it in the stored
   trace.
-- **Trace continuity: the `outbox relay` span (1.11.1).** A row whose stored
+- **Trace continuity: the `outbox relay` span (1.12.0).** A row whose stored
   headers carry a W3C `traceparent` (any letter case) is relayed inside a
   CONSUMER-kind span named **`outbox relay`**, the child of the stored span.
   The send's own observation opens inside it - Spring Kafka's template
@@ -649,7 +649,7 @@ key ever had two sends overlapping and that each key's rows went in `id` order.
   slots and slow statements a larger batch keeps them fed.
 - The ORDERED lane is unchanged in kind: its rows go one by one on one thread (its own
   since 1.8.0), and one send plus its booking sets its pace.
-- **The bars are absolute, and the release build's (1.11.1).** `OutboxRelayThroughputIT`
+- **The bars are absolute, and the release build's (1.12.0).** `OutboxRelayThroughputIT`
   (500 rows/s at 8 slots, 10,000 rows in under 15 s at 64) and the invariants suite's G3
   (500 rows/s for two pods on a 100k backlog) are calibrated on the gate's box - Linux,
   native Docker - on a quiet machine, so another build beside them moves them. The
@@ -689,9 +689,9 @@ opentmf:
     send-timeout: 10s        # the shortest bound a send has before it is presumed hung (1.9.0)
     lease: 2m                # CONCURRENT lane default lease - renewed while a send runs
     shutdown-grace: 10s      # how long a stopping relay lets sends in flight finish
-    shutdown-join: 5s        # then how long it waits for its threads to end (1.11.1)
+    shutdown-join: 5s        # then how long it waits for its threads to end (1.12.0)
     metrics-refresh: 15s     # how often the gauges are re-read (a scrape never queries)
-    stamp-trace-context: true  # a row appended without a traceparent stores the current one (1.11.1)
+    stamp-trace-context: true  # a row appended without a traceparent stores the current one (1.12.0)
     claim-pause:             # a pod whose transport is down leaves its rows to others (1.11.0)
       after-failures: 5      # failed sends over a transport in a row that pause it; 0 = never
       max: 1m                # longest wait between two probe rows; a row due longer is taken
@@ -704,7 +704,7 @@ opentmf:
       max-in-flight: 8       # CONCURRENT sends at once per pod (also the thread bound) - the
                              # send-side lever; size the connection pool above it
       key-run: 8             # rows of one ordering key one claim takes and one slot sends in
-                             # order (1.11.1); 1 = one row of a key per claim, as up to 1.11.0
+                             # order (1.12.0); 1 = one row of a key per claim, as up to 1.11.0
     kafka:                   # the default Kafka publisher (1.5.0)
       lane: ORDERED          # ORDERED | CONCURRENT - CONCURRENT for per-key order across pods
       ordering-key: AGGREGATE_ID  # on CONCURRENT: AGGREGATE_ID | NONE
@@ -715,7 +715,7 @@ opentmf:
     ops-endpoints: true      # serve the /ops surface (see below) - a conditional switch,
                              # not a field of OutboxProperties
     ops:
-      sensitive-in-views: true  # false: views drop the payload, lastError = the kind only (1.11.1)
+      sensitive-in-views: true  # false: views drop the payload, lastError = the kind only (1.12.0)
 ```
 
 | Property         | Type       | Default | Notes                                                                 |
@@ -729,24 +729,24 @@ opentmf:
 | `retention`      | `Duration` | `7d`    | Used by the prune (`OutboxMaintenanceService.prune()`): relayed AND cancelled rows. |
 | `send-timeout`   | `Duration` | `10s`   | A send's bound is the larger of its lease and this (or its publisher's `sendTimeout(event)`): the heartbeat renews a running send's lease up to it, then the send is presumed hung (1.9.0). The Kafka publisher awaits at least this long. |
 | `lease`          | `Duration` | `2m`    | Lease of a CONCURRENT row when its publisher declares none: how long a claimed row stays its holder's without a word from it. Renewed every third of it while a send runs (1.9.0); up to 1.8.0 it had to exceed the lane's longest call. |
-| `http.connect-timeout` | `Duration` | unset | The HTTP publisher's plain client (1.9.0; none before). Unset (1.11.1) = 10 s, or a quarter of the send bound - the larger of `lease` and `send-timeout` - when that is shorter; a fixed 10 s up to 1.11.0. Positive when set (validated at boot). |
-| `http.read-timeout` | `Duration` | unset | The plain client's read timeout (1.9.0; none before). Unset = the send bound less the connect timeout and a tenth of the bound (at least 1 s) - 98 s on the defaults (1.11.1; 108 s up to 1.11.0). When set it must be below the bound, and **the connect and read timeouts together must end before it** (1.11.1; validated at boot - see "Timeouts"). A profile's client keeps its own. |
+| `http.connect-timeout` | `Duration` | unset | The HTTP publisher's plain client (1.9.0; none before). Unset (1.12.0) = 10 s, or a quarter of the send bound - the larger of `lease` and `send-timeout` - when that is shorter; a fixed 10 s up to 1.11.0. Positive when set (validated at boot). |
+| `http.read-timeout` | `Duration` | unset | The plain client's read timeout (1.9.0; none before). Unset = the send bound less the connect timeout and a tenth of the bound (at least 1 s) - 98 s on the defaults (1.12.0; 108 s up to 1.11.0). When set it must be below the bound, and **the connect and read timeouts together must end before it** (1.12.0; validated at boot - see "Timeouts"). A profile's client keeps its own. |
 | `ordered.lease`  | `Duration` | `15s`   | Lease of an ORDERED row when its publisher declares none. Short on purpose: after a pod stop the row waits this long. Must exceed `send-timeout` (validated at boot). |
 | `concurrent.max-in-flight` | `int` | `8` | CONCURRENT sends in flight per pod (also the thread bound). Since 1.6.0 the claim runs ahead of the slots, so this is the lever for the lane's throughput; each send holds a connection while it books, so the pool must exceed it. |
-| `concurrent.key-run` | `int` | `8` | Consecutive due rows of one ordering key that one claim takes and one slot sends in `id` order (1.11.1; see "A key's run"). `1` = one row of a key per claim, as up to 1.11.0. Positive (validated at boot). |
+| `concurrent.key-run` | `int` | `8` | Consecutive due rows of one ordering key that one claim takes and one slot sends in `id` order (1.12.0; see "A key's run"). `1` = one row of a key per claim, as up to 1.11.0. Positive (validated at boot). |
 | `kafka.lane`     | `ORDERED`/`CONCURRENT` | `ORDERED` | The default Kafka publisher's lane (1.5.0). `CONCURRENT` = per-aggregate order across pods (see "Running several relays with Kafka"). Stamped at append. |
 | `kafka.ordering-key` | `AGGREGATE_ID`/`NONE` | `AGGREGATE_ID` | On `CONCURRENT`: what orders a Kafka row. Ignored on `ORDERED`. The record key is the `aggregateId` either way. |
 | `kafka.lease`    | `Duration` | `15s`   | On `CONCURRENT`: a Kafka row's lease. Must exceed `send-timeout` (validated at boot). Ignored on `ORDERED`. |
-| `shutdown-grace` | `Duration` | `10s`   | On stop: the time the relay thread, the ORDERED batch and the in-flight CONCURRENT sends get, together, to finish and book (one deadline since 1.11.1; each in turn before); the rest lapse by lease. |
-| `shutdown-join`  | `Duration` | `5s`    | On stop, after the grace (1.11.1): how long the relay waits for its interrupted threads - the lanes, the heartbeat, the gauges' refresher - to end, so none uses the pool while it closes. The whole stop takes at most `shutdown-grace + shutdown-join`. |
+| `shutdown-grace` | `Duration` | `10s`   | On stop: the time the relay thread, the ORDERED batch and the in-flight CONCURRENT sends get, together, to finish and book (one deadline since 1.12.0; each in turn before); the rest lapse by lease. |
+| `shutdown-join`  | `Duration` | `5s`    | On stop, after the grace (1.12.0): how long the relay waits for its interrupted threads - the lanes, the heartbeat, the gauges' refresher - to end, so none uses the pool while it closes. The whole stop takes at most `shutdown-grace + shutdown-join`. |
 | `metrics-refresh` | `Duration` | `15s`  | How often the gauges are re-read from the database; a scrape reads the last values. |
-| `stamp-trace-context` | `boolean` | `true` | A row appended without a `traceparent` header stores the trace context current at the append (1.11.1; see "Append events"). `false` stores only the headers the caller gives, as up to 1.11.0. |
+| `stamp-trace-context` | `boolean` | `true` | A row appended without a `traceparent` header stores the trace context current at the append (1.12.0; see "Append events"). `false` stores only the headers the caller gives, as up to 1.11.0. |
 | `claim-pause.after-failures` | `int` | `5` | Failed sends over one transport in a row (the publisher says the transport was out of reach), with no success between them, after which this pod leaves that transport's rows to the other pods (1.11.0; see "A pod whose transport is down"). `0` switches the pause off. |
 | `claim-pause.max` | `Duration` | `1m` | While paused, the pod takes one probe row: the first `backoff-base` after the pause, each next one twice as long after the one before, never longer apart than this. A paused transport's row due for longer than this is taken anyway - no pod is sending it. Positive (validated at boot). |
 | `maintenance.batch-size` | `int`    | `5000`  | Rows per batch of a bulk operation (prune, unpark by filter); each batch is its own transaction, no entity loaded. |
 | `maintenance.time-budget` | `Duration` | `10s` | One bulk call runs batches until none are left or this is spent - it is not one batch per call; the answer says `moreToPrune` / `moreToUnpark` and the caller calls again. Set it below any statement or call limit on the prune's path. |
 | `ops-endpoints`  | `boolean`  | `true`  | `false` removes the library's `/ops` controller entirely. A `@ConditionalOnProperty` key read at boot, not a bound field. |
-| `ops.sensitive-in-views` | `boolean` | `true` | Whether the row views (inspect and the three lists) carry the row's sensitive text (1.11.1). `false`: `payload` null and `lastError` the failure's kind only, the full text on `GET /ops/outbox/{id}/payload` - see "Ops endpoints". |
+| `ops.sensitive-in-views` | `boolean` | `true` | Whether the row views (inspect and the three lists) carry the row's sensitive text (1.12.0). `false`: `payload` null and `lastError` the failure's kind only, the full text on `GET /ops/outbox/{id}/payload` - see "Ops endpoints". |
 
 ## Metrics
 
@@ -784,17 +784,17 @@ reads the relayed history.
 | Metric                     | Type    | Meaning                                            |
 |----------------------------|---------|----------------------------------------------------|
 | `opentmf.outbox.pending`   | gauge by `lane` | Rows not yet relayed nor cancelled (held, parked and in-flight included) |
-| `opentmf.outbox.in-flight` | gauge by `lane` | Pending rows under a live lease, across pods — claimed, send not booked yet (1.3.0); since 1.6.0 that includes CONCURRENT rows waiting in a hand-off queue - since 1.9.0 only as many as the slots start within about a second, so behind slow sends it counts the sending rows alone; since 1.11.1 also the rows of a key's run waiting behind its earlier rows |
+| `opentmf.outbox.in-flight` | gauge by `lane` | Pending rows under a live lease, across pods — claimed, send not booked yet (1.3.0); since 1.6.0 that includes CONCURRENT rows waiting in a hand-off queue - since 1.9.0 only as many as the slots start within about a second, so behind slow sends it counts the sending rows alone; since 1.12.0 also the rows of a key's run waiting behind its earlier rows |
 | `opentmf.outbox.parked`    | gauge by `lane` | Rows with `parked_on` stamped — **alert when > 0** |
 | `opentmf.outbox.metrics-age` | gauge | Seconds since the gauges were last refreshed successfully — **alert when above a few refresh periods** (e.g. > 60 s with the default 15 s): the values above are stale or NaN |
 | `opentmf.outbox.relay-lag` | gauge by `lane` | Seconds the lane's oldest *released* pending row has been deliverable (a held row is not lagging) |
-| `opentmf.outbox.relay.running` | gauge | 1 while THIS pod's relay runs, else 0 (1.11.1) — read in the pod, no database; 0 while the context is stopped or paused, and after a stop whose restart was refused (an ERROR names the thread of the previous run still running); **alert when it reads 0 in a running service** |
+| `opentmf.outbox.relay.running` | gauge | 1 while THIS pod's relay runs, else 0 (1.12.0) — read in the pod, no database; 0 while the context is stopped or paused, and after a stop whose restart was refused (an ERROR names the thread of the previous run still running); **alert when it reads 0 in a running service** |
 | `opentmf.outbox.claims.paused` | gauge by `transport` | 1 while THIS pod leaves the transport's rows to the other pods after failed sends in a row, else 0 (1.11.0) — read in the pod, no database; a series per transport from its first pause (`kafka` for the library's Kafka publisher); **alert when it stays 1** on one pod while others relay: that pod cannot reach the transport |
 | `opentmf.outbox.relayed`   | counter | Successful relays, tagged by `destination`         |
 | `opentmf.outbox.dropped`   | counter | Rows given up by a publisher's DROP policy, tagged by `destination` (never counted as relayed) |
 | `opentmf.outbox.attempts`  | summary | Delivery attempts a relayed row took               |
-| `opentmf.outbox.pruned`    | counter by `state` | Rows the retention prune deleted (1.11.1), every committed batch's rows as it commits - so a call that ends in an error still has its earlier batches counted. `state` is the kind of ROW deleted, `relayed` or `cancelled` (a row withdrawn by `cancel`), not an outcome of the prune: `state="cancelled"` does not count cancelled prunes |
-| `opentmf.outbox.relay`     | timer   | The `outbox relay` span's observation (1.11.1) - a row's round: renewal, send, booking - tagged by `outbox.transport` and `error`: recorded only when the application's `ObservationRegistry` has a meter handler, and only for rows that stored a `traceparent` - a trace aid, not a throughput figure |
+| `opentmf.outbox.pruned`    | counter by `state` | Rows the retention prune deleted (1.12.0), every committed batch's rows as it commits - so a call that ends in an error still has its earlier batches counted. `state` is the kind of ROW deleted, `relayed` or `cancelled` (a row withdrawn by `cancel`), not an outcome of the prune: `state="cancelled"` does not count cancelled prunes |
+| `opentmf.outbox.relay`     | timer   | The `outbox relay` span's observation (1.12.0) - a row's round: renewal, send, booking - tagged by `outbox.transport` and `error`: recorded only when the application's `ObservationRegistry` has a meter handler, and only for rows that stored a `traceparent` - a trace aid, not a throughput figure |
 
 ## Usage
 
@@ -839,8 +839,8 @@ the onboarding adds below, the index recreated to the 1.2.0 predicate),
 lanes' claim indexes), `005-outbox-gauge-and-prune-indexes` (1.3.0) and
 `006-outbox-lane-gauge-indexes` (1.4.0: the per-lane gauge indexes),
 `007-outbox-sending-since` and `008-outbox-claim-plan-fences` (1.9.0),
-`009-outbox-key-token` (1.11.1: `key_token`, part of the idempotency key) and
-`010-outbox-aggregate-lookup` (1.11.1: `ix_outbox_aggregate` on
+`009-outbox-key-token` (1.12.0: `key_token`, part of the idempotency key) and
+`010-outbox-aggregate-lookup` (1.12.0: `ix_outbox_aggregate` on
 `(aggregate_type, aggregate_id, id)`, for a service's lookup of an aggregate's
 rows). 004–006, 008 and 010 build their indexes `CONCURRENTLY`.
 
@@ -921,7 +921,7 @@ Pass the payload as a fact object — it is serialized at write time. Extra
 `x-producer` on top, replacing same-named stored ones on both legs. Anything
 that must NOT reach the wire goes in `withReference`.
 
-**The trace of an append (1.11.1).** A row appended without a `traceparent`
+**The trace of an append (1.12.0).** A row appended without a `traceparent`
 header (in any letter case) stores the trace context current at the append:
 the W3C `traceparent` - and `tracestate`, when the context has one - exactly as
 the application's Micrometer `Propagator` writes them for the current span of
@@ -1003,7 +1003,7 @@ marks the pause and the resume; `opentmf.outbox.claims.paused{transport}` reads 
   every pod, and pausing would hold back every other receiver's rows (a lane-wide pause let
   354 of 1,000 healthy rows through in a minute beside one dead subscriber; without, all
   1,000). A consumer publisher names one only where a failure can be one pod's.
-- **A send that outran its bound counts (1.11.1).** The send heartbeat interrupts a send
+- **A send that outran its bound counts (1.12.0).** The send heartbeat interrupts a send
   still running at its bound (the larger of its lease and its send timeout); that failure
   counts towards the pause whatever the publisher makes of the interrupt - the transport did
   not answer in time. Up to 1.11.0 it counted only when `transportDown` said so, and the Kafka
@@ -1100,7 +1100,7 @@ client. **A row that NAMES a profile the resolver does not know (1.9.0)** —
 goes out through the plain client, without the profile's authentication (up
 to 1.8.0 it did).
 
-**Timeouts (1.9.0; within the send bound since 1.11.1).** The plain client has
+**Timeouts (1.9.0; within the send bound since 1.12.0).** The plain client has
 a connect timeout (`opentmf.outbox.http.connect-timeout`) and a read timeout
 (`opentmf.outbox.http.read-timeout`), and **together they end before the send
 bound**, the larger of `lease` and `send-timeout`: at the bound the send
@@ -1116,8 +1116,8 @@ from the classpath, its timeouts set:
 
 | Client (picked in this order) | Connect timeout | Read timeout | Past the send bound | Redirects, retries, connections |
 |---|---|---|---|---|
-| Apache HttpClient 5 | set on its connections (1.11.1; Apache's own 3 min before) | **per read** (inactivity) | the connect and each read end in time; a receiver that drips its response slower than the read timeout but never stops can outlast the bound, and on a platform thread the blocking read ignores the interrupt - virtual threads (Boot's `spring.threads.virtual.enabled`) honour it | the library builds it (1.11.1): a 3xx is **not followed**, Apache **never retries** (the relay does), and its pool holds `concurrent.max-in-flight` connections per route and in all |
-| Jetty | set | a **total** from the request's queueing, the connect included | ends in time | the library builds it (1.11.1): a 3xx is **not followed** (Jetty's own default follows it), it never retries, and it holds `concurrent.max-in-flight` connections per destination |
+| Apache HttpClient 5 | set on its connections (1.12.0; Apache's own 3 min before) | **per read** (inactivity) | the connect and each read end in time; a receiver that drips its response slower than the read timeout but never stops can outlast the bound, and on a platform thread the blocking read ignores the interrupt - virtual threads (Boot's `spring.threads.virtual.enabled`) honour it | the library builds it (1.12.0): a 3xx is **not followed**, Apache **never retries** (the relay does), and its pool holds `concurrent.max-in-flight` connections per route and in all |
+| Jetty | set | a **total** from the request's queueing, the connect included | ends in time | the library builds it (1.12.0): a 3xx is **not followed** (Jetty's own default follows it), it never retries, and it holds `concurrent.max-in-flight` connections per destination |
 | Reactor Netty | set | after the request is sent | the two add up, and the check above keeps the sum in the bound | Reactor's defaults (no redirect, no retry) |
 | the JDK's (none of the above present) | set | a **total** from the request's start, the connect included | ends in time | the JDK's defaults (no redirect, no retry, no pool limit) |
 
@@ -1149,7 +1149,7 @@ own exceptions), and so does a 3xx — a `RestClientResponseException` naming
 the status and the `Location`; a redirect is never followed into a second
 POST (up to 1.8.0 a 3xx was booked RELAYED). Up to 1.11.0 that held for the
 JDK's and Reactor's clients only: Apache HttpClient and Jetty, the plain
-client's other two, followed a 3xx by their own defaults; since 1.11.1 the
+client's other two, followed a 3xx by their own defaults; since 1.12.0 the
 library builds both with redirects off.
 
 ### Post-relay bookkeeping (`OutboxRelayedListener`)
@@ -1196,9 +1196,9 @@ surface):
 | GET    | `/ops/outbox/state/{state}`   | The list narrowed to one derived-state leg (`pending`, `parked`, `relayed`, `cancelled`; unknown → 400), same filtering + paging on top |
 | GET    | `/ops/outbox/parked`          | Runbook alias of `/ops/outbox/state/parked`                           |
 | GET    | `/ops/outbox/{id}`            | One row in full — payload + `last_error`, the pre-unpark forensic read (behind the consumer's admin role, by ruling); without them under `ops.sensitive-in-views=false` |
-| GET    | `/ops/outbox/{id}/payload`    | The row's sensitive text alone, on its own path (1.11.1): `{"id", "payload", "lastError"}` - the stored payload and the full failure text; never the stored headers |
+| GET    | `/ops/outbox/{id}/payload`    | The row's sensitive text alone, on its own path (1.12.0): `{"id", "payload", "lastError"}` - the stored payload and the full failure text; never the stored headers |
 
-**The sensitive text on its own path (1.11.1).** A row's payload is the customer's data, and so
+**The sensitive text on its own path (1.12.0).** A row's payload is the customer's data, and so
 is its `lastError`: it is the failure's message, and for an HTTP 4xx or 5xx Spring puts the
 receiver's whole response body into it - a receiver that echoes the request echoes the
 customer. Up to 1.11.0 an administrator who could read the views read both: the payload on the
@@ -1217,7 +1217,7 @@ the response record at all, so a `fields=` selection cannot bring them back. The
 the payload path its stricter role in its own rules, **matching `/ops/outbox/*/payload` before
 `/ops/outbox/*`** (Spring Security takes the first match).
 
-**The failure's text is the service's to give (1.11.1).** What a failed attempt stores as
+**The failure's text is the service's to give (1.12.0).** What a failed attempt stores as
 `last_error` - and what the relay's retry, park, drop and cancel log lines print - is the
 `OutboxFailureText` bean's text. Without a bean of its own a service stores exactly the text up
 to 1.11.0: the failure's simple type name, `": "` and its own message. A service that keeps a
@@ -1270,7 +1270,7 @@ binding refusal, a 400.
   call with Spring's `org.springframework.dao.QueryTimeoutException`. That batch is rolled back
   whole (its own transaction); the batches before it in the same call stay deleted, and the
   next call continues with the oldest expired rows. The call answers no count then: the rows it
-  did delete are on the `opentmf.outbox.pruned` counter (1.11.1), every committed batch's rows
+  did delete are on the `opentmf.outbox.pruned` counter (1.12.0), every committed batch's rows
   as it commits. `OutboxPruneBoundedIT` pins all of this.
 - **Planned on the table's statistics.** With statistics (autovacuum's, or an `ANALYZE`) a
   batch takes its rows from `ix_outbox_relayed_on` / `ix_outbox_cancelled_on`, never from a scan
@@ -1544,7 +1544,7 @@ The library is self-contained for consumer testing — no test-jar needed:
   lease, lane, backlog and onboarding ITs — the contracts above are pinned there, so a consumer gap
   is a red library build, not a discovery after the cut.
 
-### Upgrading to 1.11.1
+### Upgrading to 1.12.0
 
 **First: one behaviour changes by default, and one property switches it
 back.** A key's consecutive due rows now leave as one unit (item 7); a
@@ -1555,7 +1555,7 @@ undo).
 **Second: re-paste the ops OAS fragment.** A service that publishes the ops
 routes pastes `META-INF/openapi/opentmf-outbox-ops.oas.yaml` into its own OAS
 (see "OAS fragment"); take this version's text verbatim. It changes in
-1.11.1:
+1.12.0:
 - `info.version`;
 - one new operation, `GET /ops/outbox/{id}/payload` (`getOutboxRowPayload`),
   and its schema `OutboxRowPayload`;
@@ -1580,7 +1580,7 @@ until it regenerates or extends it with these two.
    Up to 1.11.0 the key was `<service>:outbox:<id>`, and an `id` repeats once
    the table is recreated or the database is restored to a point in time: a
    consumer that already held the key dropped the NEW event as a duplicate,
-   without a word. A row booked from 1.11.1 on carries a random key token, and
+   without a word. A row booked from 1.12.0 on carries a random key token, and
    its key is `<service>:outbox:<id>:<key_token>` (about 37 characters
    longer: `dnms-email-adapter:outbox:123:<36-character uuid>` is 66 characters;
    at most the service name + 64, for a 19-digit id). A row booked before keeps
@@ -1590,17 +1590,17 @@ until it regenerates or extends it with these two.
    `alter table outbox add column if not exists key_token uuid;` - nullable,
    no default, no table rewrite (6 ms on a million rows).
    - **Changelog included by reference** (the documented way, above):
-     **nothing to do** - Liquibase applies 009 at the first start of 1.11.1,
+     **nothing to do** - Liquibase applies 009 at the first start of 1.12.0,
      before anything reads the table.
    - **Changelog run out of band** (a migration job, `spring.liquibase.enabled=false`):
-     **apply that one statement before 1.11.1 starts.** A 1.11.1 pod that starts
+     **apply that one statement before 1.12.0 starts.** A 1.12.0 pod that starts
      on the 1.11.0 schema refuses to start, with one error naming changeset 009
      and the statement - the column is mapped, so every read and every booking
      would fail otherwise.
 3. **A rolling start costs at most one duplicate per row, and only for rows a
-   1.11.1 pod booked and both versions sent** (a retry or a lapsed lease that
+   1.12.0 pod booked and both versions sent** (a retry or a lapsed lease that
    crosses versions): a 1.11.0 pod sends such a row under `<service>:outbox:<id>`,
-   a 1.11.1 pod under the token key. A row a 1.11.0 pod booked has no token and
+   a 1.12.0 pod under the token key. A row a 1.11.0 pod booked has no token and
    both versions key it alike. Roll at a low backlog.
 4. **A publisher of your own** that calls `OutboxHeaders.idempotencyKey(serviceName,
    id)` still sends the 1.11.0 key and stays exposed to the repeat: switch to
@@ -1623,7 +1623,7 @@ until it regenerates or extends it with these two.
      re-check, stamp, heartbeat, give-back and booking statements keep their
      plans - none of them filters on the aggregate.
    - **At the upgrade, on an existing large table:** the index is built
-     `CONCURRENTLY` at the service's first start on 1.11.1, and the start lasts
+     `CONCURRENTLY` at the service's first start on 1.12.0, and the start lasts
      as long as the build: about 2 s at 1,000,000 rows and about 10 s at
      5,000,000 (it reads the table twice), plus the wait for transactions
      already open on the table.
@@ -1642,8 +1642,8 @@ until it regenerates or extends it with these two.
        build behind a long open transaction, are not tested.
    - **Changelog run out of band:** apply the two statements (`drop index
      concurrently if exists ix_outbox_aggregate;` then the `create index
-     concurrently ...`) outside a transaction, before or after 1.11.1 starts -
-     1.11.1 runs without the index too, only the lookup stays slow.
+     concurrently ...`) outside a transaction, before or after 1.12.0 starts -
+     1.12.0 runs without the index too, only the lookup stays slow.
 6. **A row appended inside a span stores its trace context.** With Micrometer
    Tracing in the service (a `Tracer` and a W3C `Propagator` bean), a row
    appended without a `traceparent` header stores the current span's, and its
@@ -1761,7 +1761,7 @@ Kafka-only consumers change nothing but the version.
    "Adopting with an existing `outbox` table" above): the library onboards the
    table in place; only your own constraints/defaults and extra columns need a
    cut-over changeset of yours. Prefer that over a schema rebuild. A rebuild
-   restarts the identity at 1; since 1.11.1 the rows the library books carry a
+   restarts the identity at 1; since 1.12.0 the rows the library books carry a
    key token, so their keys never repeat, but rows a hand-written writer booked
    had `<service>:outbox:<id>` keys, and a consumer that still remembers them
    would drop a new row whose key matched one. After a table rebuild in an
@@ -1787,7 +1787,7 @@ Quality gates on this repo:
   (`OutboxRelayThroughputIT`, `OutboxPruneAtScaleIT`, `OutboxBacklogIT`) and the
   JaCoCo check. It runs before every merge and in every release:
   `release:prepare` and `release:perform` pass `-Pinvariants`, and the `release`
-  profile refuses to build without it. **Which asserts what (1.11.1):** the everyday
+  profile refuses to build without it. **Which asserts what (1.12.0):** the everyday
   gate prints the rows/s figures and asserts the round trips per row, so it needs no
   quiet machine; the release build (`release:perform`, the `release` profile) also asserts
   the absolute rows/s bars, on the quiet machine a release is given (see "Relay
@@ -1892,7 +1892,7 @@ Accepted survivors, each reviewed:
 | `OutboxRelay.start` / `stop`, `OutboxRelayWorker.send` | removed the send heartbeat's wiring (`onBeat`, `start`, `stop`, `started`, `finished`) | The heartbeat's own tests use it directly; the wiring is the invariants suite's (B1, B4, K1 assert renewals, the bound and the give-back) - PIT runs unit tests only |
 | `OutboxRelayWorker.renew` | a lapsed ORDERED row's `return true` → `false` | Harmless: the booking then renews the NEXT row one turn early - nothing is sent out of turn, and the lapsed row is still counted, never sent |
 | `OutboxSendHeartbeat.finished` | removed `unlock` | Equivalent: a finished row leaves the sending set and is never locked by the heartbeat again |
-| `OutboxHttpClients` | the Jetty and Reactor branches (no coverage); the clients' read timeouts; `present` → false | Neither client is on the unit-test classpath, by design; Apache's (picked here since 1.11.1) and the JDK's connect timeouts are the stalled-connect cells of `OutboxHttpClientsTests`, their read timeouts the suite's F4 on both clients |
+| `OutboxHttpClients` | the Jetty and Reactor branches (no coverage); the clients' read timeouts; `present` → false | Neither client is on the unit-test classpath, by design; Apache's (picked here since 1.12.0) and the JDK's connect timeouts are the stalled-connect cells of `OutboxHttpClientsTests`, their read timeouts the suite's F4 on both clients |
 
 `NO_COVERAGE` entries (the Kafka publisher bean method) are exercised by the
 Testcontainers ITs, which the posture deliberately keeps out of PIT (unit tests

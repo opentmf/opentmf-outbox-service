@@ -92,7 +92,7 @@ class OutboxSendHeartbeat {
   /**
    * Stops it - after the lanes, so the sends of a graceful stop keep their leases - and waits for a
    * tick in flight, its clock measure or its renewal and their connection, up to {@code deadline}
-   * (1.11.1: up to 1.11.0 the stop returned at once and a tick in flight went on while the
+   * (1.12.0: up to 1.11.0 the stop returned at once and a tick in flight went on while the
    * application's pool closed); its thread, while it still runs.
    */
   List<String> stopUntil(long deadline) {

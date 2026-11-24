@@ -182,7 +182,7 @@ class OutboxConcurrentLane {
   }
 
   /**
-   * {@link #submit(long, Runnable)} for a unit of {@code rows} sends on one slot (1.11.1: a key's
+   * {@link #submit(long, Runnable)} for a unit of {@code rows} sends on one slot (1.12.0: a key's
    * run, {@code rowId} its head): it counts as that many rows in the queue's depth.
    */
   boolean submit(long rowId, int rows, Runnable send) {
@@ -196,7 +196,7 @@ class OutboxConcurrentLane {
   }
 
   /**
-   * The calling worker starts the next send of its unit (1.11.1, a key's run): the send before is
+   * The calling worker starts the next send of its unit (1.12.0, a key's run): the send before is
    * measured as a send of its own, and the slot counts as live again for the horizon.
    */
   void nextRow() {

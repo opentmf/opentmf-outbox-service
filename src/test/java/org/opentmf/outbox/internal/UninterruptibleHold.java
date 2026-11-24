@@ -6,7 +6,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * A call that takes its time and ignores interrupts, as a JDBC socket read does: the stimulus of
- * the stop cells (1.11.1) - a thread that an interrupt does not end at once, so only a stop that
+ * the stop cells (1.12.0) - a thread that an interrupt does not end at once, so only a stop that
  * waits for it sees it end. A timed wait on a latch nobody opens; the interrupt flag is restored.
  */
 final class UninterruptibleHold {

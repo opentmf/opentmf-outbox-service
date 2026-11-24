@@ -4,7 +4,7 @@ import java.util.Map;
 
 /**
  * The trace context current where a row is appended, as the W3C trace-context headers the row
- * stores (1.11.1). The writer asks for it only when the caller gave the row no {@value
+ * stores (1.12.0). The writer asks for it only when the caller gave the row no {@value
  * #TRACEPARENT} of its own; the relay later parents the row's {@code outbox relay} span on what was
  * stored. The library's implementation reads the application's Micrometer {@code Tracer} and
  * {@code Propagator}; it exists only where Micrometer Tracing is on the classpath.

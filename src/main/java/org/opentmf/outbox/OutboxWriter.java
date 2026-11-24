@@ -24,7 +24,7 @@ import tools.jackson.databind.ObjectMapper;
  * through the relay's own router - frozen at write time like the headers. The router is
  * resolved lazily, so a publisher that itself appends through this writer creates no cycle.
  *
- * <p>Since 1.11.1 a row the caller gives no {@code traceparent} header (in any letter case) stores
+ * <p>Since 1.12.0 a row the caller gives no {@code traceparent} header (in any letter case) stores
  * the trace context current at the append, as the application's tracing writes it: the relay then
  * sends the event in the trace of the work that appended it. A header the caller gives is stored as
  * it is. Without a current trace context - no tracing on the classpath, no current span - nothing
@@ -73,7 +73,7 @@ public class OutboxWriter {
   }
 
   /**
-   * The library's writer with the trace context of each append (1.11.1): a row the caller gives no
+   * The library's writer with the trace context of each append (1.12.0): a row the caller gives no
    * {@code traceparent} stores the one {@code traceContext} names as current - resolved at each
    * append; a null supplier result stores none.
    */
@@ -171,7 +171,7 @@ public class OutboxWriter {
     event.setNextAttemptOn(now);
     event.setReleaseAt(request.releaseAt());
     event.setReference(request.reference());
-    event.setKeyToken(UUID.randomUUID()); // the row's own part of its idempotency key (1.11.1)
+    event.setKeyToken(UUID.randomUUID()); // the row's own part of its idempotency key (1.12.0)
     OutboxLaneStamper stamper = laneStamper.get();
     if (stamper != null) {
       stamper.stamp(event);

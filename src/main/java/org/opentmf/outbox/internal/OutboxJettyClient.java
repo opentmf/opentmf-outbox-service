@@ -6,7 +6,7 @@ import org.springframework.http.client.ClientHttpRequestFactory;
 import org.springframework.http.client.JettyClientHttpRequestFactory;
 
 /**
- * Jetty's HTTP client for the plain client (1.11.1, OUTBOX-JETTY-FOLLOWS-NO-REDIRECT-1), linked
+ * Jetty's HTTP client for the plain client (1.12.0, OUTBOX-JETTY-FOLLOWS-NO-REDIRECT-1), linked
  * only when Jetty is on the classpath and Apache HttpClient is not: {@link OutboxHttpClients} names
  * this class only on that branch, so a classpath without Jetty never loads its types.
  *

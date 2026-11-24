@@ -74,13 +74,13 @@ public class OutboxProperties {
   /**
    * How long a stopping relay lets in-flight claims, batches and sends finish (and book) before it
    * gives up on them; a send still running then is booked by nobody and its row is redelivered
-   * once its lease lapses. Since 1.11.1 ONE grace for the whole relay (up to 1.11.0 one per
+   * once its lease lapses. Since 1.12.0 ONE grace for the whole relay (up to 1.11.0 one per
    * executor, in turn). Default 10s.
    */
   @NotNull private Duration shutdownGrace = Duration.ofSeconds(10);
 
   /**
-   * After the grace, how long a stopping relay waits for its interrupted threads to END (1.11.1) -
+   * After the grace, how long a stopping relay waits for its interrupted threads to END (1.12.0) -
    * the relay, the lanes, the heartbeat and the gauges' refresher - so none borrows a connection
    * while the application's pool closes; a thread still running then is named in one warning.
    * The whole stop takes at most {@code shutdown-grace + shutdown-join}. Default 5s.
@@ -96,7 +96,7 @@ public class OutboxProperties {
 
   /**
    * Whether a row appended without a {@code traceparent} header stores the trace context current
-   * at the append (1.11.1), so the relay sends the event in the trace of the work that appended it.
+   * at the append (1.12.0), so the relay sends the event in the trace of the work that appended it.
    * Needs Micrometer Tracing with a {@code Tracer} and a W3C {@code Propagator}; without them, or
    * without a current span, nothing is stored. With it the stored headers - and so the ops views
    * and the headers a built-in publisher forwards - gain {@code traceparent} (and {@code
@@ -126,7 +126,7 @@ public class OutboxProperties {
   /** The library's HTTP publisher's plain client ({@code opentmf.outbox.http.*}, 1.9.0). */
   @Valid private final Http http = new Http();
 
-  /** The /ops surface's row views ({@code opentmf.outbox.ops.*}, 1.11.1). */
+  /** The /ops surface's row views ({@code opentmf.outbox.ops.*}, 1.12.0). */
   @Valid private final Ops ops = new Ops();
 
   /**
@@ -137,12 +137,12 @@ public class OutboxProperties {
     return lease.compareTo(sendTimeout) >= 0 ? lease : sendTimeout;
   }
 
-  /** The connect timeout of the plain HTTP client when none is set, and its most (1.11.1). */
+  /** The connect timeout of the plain HTTP client when none is set, and its most (1.12.0). */
   static final Duration DEFAULT_HTTP_CONNECT_TIMEOUT = Duration.ofSeconds(10);
 
   /**
    * The plain HTTP client's connect timeout: {@code http.connect-timeout} when set, else ten
-   * seconds or a quarter of the send bound, the shorter (1.11.1; a fixed ten seconds before) - so
+   * seconds or a quarter of the send bound, the shorter (1.12.0; a fixed ten seconds before) - so
    * the connect and the read together end before the bound also when the bound is short.
    */
   public Duration httpConnectTimeout() {
@@ -199,7 +199,7 @@ public class OutboxProperties {
 
   /**
    * The plain HTTP client's connect and read timeouts must END BEFORE the send bound together
-   * (1.11.1): the send heartbeat interrupts a send at its bound, and a client whose connect or read
+   * (1.12.0): the send heartbeat interrupts a send at its bound, and a client whose connect or read
    * ignores the interrupt keeps running while the lease lapses and another relay sends the row.
    * Only what the consumer SET can fail here - the defaults always fit: null when they fit, else
    * the computed figures, which the boot failure shows as the rejected value.
@@ -349,7 +349,7 @@ public class OutboxProperties {
   public static class Http {
 
     /**
-     * Connect timeout of the plain client; positive. Unset (the default, 1.11.1) = 10s or a
+     * Connect timeout of the plain client; positive. Unset (the default, 1.12.0) = 10s or a
      * quarter of the send bound - the larger of {@code lease} and {@code send-timeout} - the
      * shorter; a fixed 10s up to 1.11.0.
      */
@@ -364,7 +364,7 @@ public class OutboxProperties {
   }
 
   /**
-   * The /ops surface's row views (1.11.1). A row's payload and its {@code last_error} are the
+   * The /ops surface's row views (1.12.0). A row's payload and its {@code last_error} are the
    * customer's data: the payload whole, and {@code last_error} as the failure's message - for an
    * HTTP 4xx or 5xx that is the receiver's whole response body.
    */
@@ -406,7 +406,7 @@ public class OutboxProperties {
 
     /**
      * How many consecutive due rows of one ordering key one claim takes and one slot sends, in
-     * {@code id} order (1.11.1): the key's head and up to {@code key-run - 1} rows behind it,
+     * {@code id} order (1.12.0): the key's head and up to {@code key-run - 1} rows behind it,
      * each sent once the one before is booked, every lease renewed in the booking before. The run
      * ends at the first row behind the head that is not due (backing off, held, its send lapsed);
      * a failed send ends it too, and the rows after it are released, due at once. Default 8: a key

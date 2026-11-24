@@ -4,7 +4,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The bounded waits of a stopping relay (1.11.1, OUTBOX-SHUTDOWN-THREADS-BEFORE-DATASOURCE-1): each
+ * The bounded waits of a stopping relay (1.12.0, OUTBOX-SHUTDOWN-THREADS-BEFORE-DATASOURCE-1): each
  * waits until a DEADLINE on {@link System#nanoTime()}, shared by everything the relay stops, so the
  * whole stop is one grace plus one join - not a grace per executor in turn.
  */

@@ -328,7 +328,7 @@ public final class Receiver {
 
   /**
    * The row id an {@code x-idempotency-key} names: the number after {@code :outbox:} - {@code
-   * <service>:outbox:<id>:<key_token>} since 1.11.1, {@code <service>:outbox:<id>} before.
+   * <service>:outbox:<id>:<key_token>} since 1.12.0, {@code <service>:outbox:<id>} before.
    */
   static long rowIdOf(String key) {
     String afterPrefix = key.substring(key.indexOf(":outbox:") + ":outbox:".length());

@@ -423,7 +423,7 @@ class OutboxMaintenanceServiceTests {
         .withMessageContaining("99");
   }
 
-  /** 1.11.1: with the sensitive text kept off the views, inspect and the lists carry neither. */
+  /** 1.12.0: with the sensitive text kept off the views, inspect and the lists carry neither. */
   @Test
   void withTheSensitiveTextOffTheViews_inspectAndTheLists_carryNeither_thePayloadPathBoth() {
     OutboxProperties properties = new OutboxProperties();

@@ -23,7 +23,7 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * A service's lookup of an aggregate's rows on a loaded table (1.11.1, changeset 010,
+ * A service's lookup of an aggregate's rows on a loaded table (1.12.0, changeset 010,
  * OUTBOX-THE-LOOKUP-BY-AGGREGATE-HAS-A-PLAN-ON-A-LOADED-TABLE-1): the newest row of an aggregate,
  * and its newest row above a given id, over 1,000,000 rows of a seven-day mix - three rows per
  * aggregate as a service writes them, nearly all relayed. Up to 1.11.0 the planner answered both by

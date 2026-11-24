@@ -26,7 +26,7 @@ import lombok.extern.slf4j.Slf4j;
  * pod that books it claimed the row next and never sent it) and a {@link
  * org.opentmf.outbox.TerminalOutboxException} (the receiver answered - the transport works)
  * neither pause nor resume. A send the heartbeat interrupted at its bound counts as a failure over
- * its transport (1.11.1); the lapse it leaves does not. Thread-safe: the senders record, the relay thread asks.
+ * its transport (1.12.0); the lapse it leaves does not. Thread-safe: the senders record, the relay thread asks.
  */
 @Slf4j
 final class OutboxClaimPause {

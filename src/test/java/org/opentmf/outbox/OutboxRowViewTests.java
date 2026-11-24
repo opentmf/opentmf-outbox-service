@@ -38,7 +38,7 @@ class OutboxRowViewTests {
     assertThat(OutboxRowView.of(row(now.plusMinutes(1), now), false).inFlight()).isFalse();
   }
 
-  // ---------------------------------------------------- OUTBOX-OPS-PAYLOAD-OWN-PATH-1 (1.11.1)
+  // ---------------------------------------------------- OUTBOX-OPS-PAYLOAD-OWN-PATH-1 (1.12.0)
 
   private static final OffsetDateTime AT = OffsetDateTime.parse("2026-11-13T10:00:00Z");
 
@@ -123,7 +123,7 @@ class OutboxRowViewTests {
     String unclassified = OutboxRowView.UNCLASSIFIED;
     Map<String, String> kinds = new LinkedHashMap<>();
     // a type name's shape is not enough: a receiver's word, a name or a dotted name before a colon
-    // has it, and the kind is shown to a role that may not read the error (1.11.1)
+    // has it, and the kind is shown to a role that may not read the error (1.12.0)
     kinds.put("boom", unclassified);
     kinds.put("boom: x", unclassified);
     kinds.put("Mueller: not found", unclassified);

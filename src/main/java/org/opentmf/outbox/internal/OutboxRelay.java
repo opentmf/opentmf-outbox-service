@@ -34,7 +34,7 @@ import org.springframework.context.SmartLifecycle;
  * flag waits; the lane nudges the relay when the batch is done. A CONCURRENT-only deployment thus
  * pays one claim per pass, not two.
  *
- * <p>Lifecycle (1.11.1, OUTBOX-SHUTDOWN-THREADS-BEFORE-DATASOURCE-1): a {@link SmartLifecycle} in
+ * <p>Lifecycle (1.12.0, OUTBOX-SHUTDOWN-THREADS-BEFORE-DATASOURCE-1): a {@link SmartLifecycle} in
  * phase {@link #PHASE}, so it starts when the context starts and stops in the context's lifecycle
  * stop, BEFORE any bean is destroyed - the DataSource among them. The phase lies after the web
  * server's stop ({@code DEFAULT_PHASE - 2048}: nothing new is appended over HTTP while the relay
@@ -210,7 +210,7 @@ class OutboxRelay implements SmartLifecycle {
   }
 
   /**
-   * Stops the relay on ONE deadline (1.11.1): it takes no work from now on - no claim, no batch,
+   * Stops the relay on ONE deadline (1.12.0): it takes no work from now on - no claim, no batch,
    * no send - and gives the claims, the ORDERED batch and the sends in flight the shutdown grace,
    * together, to finish and book. Then nothing more is sent or booked (a send that returns later
    * books nothing; its row is redelivered once its lease lapses), what still runs is interrupted,

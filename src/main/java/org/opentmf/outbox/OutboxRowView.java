@@ -16,7 +16,7 @@ import java.util.Set;
  * (null in lists) - the list exists for triage, not bulk export; the TMF630 fields param can
  * narrow further.
  *
- * <p>With {@code opentmf.outbox.ops.sensitive-in-views=false} (1.11.1) no view carries the row's
+ * <p>With {@code opentmf.outbox.ops.sensitive-in-views=false} (1.12.0) no view carries the row's
  * sensitive text - {@code payload} is null and {@code lastError} holds only the failure's KIND, its
  * exception's type name, never its message (for an HTTP 4xx or 5xx that message holds the
  * receiver's whole response body); {@link OutboxRowPayload} serves the full text. It is in the
@@ -106,7 +106,7 @@ public record OutboxRowView(
    * for none. A type name's shape is not enough: a receiver's word, a person's name or a dotted
    * name before a colon has it too. So the name's last segment must name a throwable as Java names
    * them - ending in {@code Exception} or {@code Error} - or be one of Spring's HTTP-status
-   * exceptions (1.11.1). A consumer's own exception named otherwise shows as {@link #UNCLASSIFIED};
+   * exceptions (1.12.0). A consumer's own exception named otherwise shows as {@link #UNCLASSIFIED};
    * its full text is on the payload path.
    */
   static String kindOf(String lastError) {

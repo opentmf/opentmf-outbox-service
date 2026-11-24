@@ -30,7 +30,7 @@ import tools.jackson.databind.ObjectMapper;
  * stamped by Micrometer's Kafka observation - which the CONSUMER enables with
  * {@code spring.kafka.template.observation-enabled=true} - never home-grown: it replaces a stored
  * one. A row that stored a {@code traceparent} is sent inside the relay span ({@link
- * OutboxRelayObservation}, 1.11.1), so the header that leaves is the producer span's, a child in
+ * OutboxRelayObservation}, 1.12.0), so the header that leaves is the producer span's, a child in
  * the stored trace; up to 1.11.0 it was a new trace's root, and the dispatch's trace ended at the
  * outbox. The record value is the stored JSON STRING: the consumer's value serializer must be
  * string-compatible.
@@ -46,7 +46,7 @@ import tools.jackson.databind.ObjectMapper;
  * each Kafka send holds its slot up to the producer's delivery timeout (120 s by default - lower
  * it on the producer to fail faster). {@link #sendTimeout} declares the whole wait, the producer's
  * {@code max.block.ms} included, so the send heartbeat keeps the lease through it - three times for
- * a transactional producer (1.11.1): {@code initTransactions}, the record's {@code send} and {@code
+ * a transactional producer (1.12.0): {@code initTransactions}, the record's {@code send} and {@code
  * commitTransaction} each block up to it on their own.
  *
  * <p>Lane ({@code opentmf.outbox.kafka.lane}, 1.5.0): ORDERED by default - the single relay

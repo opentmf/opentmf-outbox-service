@@ -20,7 +20,7 @@ import org.springframework.web.client.RestClient;
  * connect and a read timeout. Up to 1.8.0 it was {@code RestClient.create()} itself, with no
  * timeout at all.
  *
- * <p>Apache HttpClient (1.11.1): Spring 7's factory takes only the read timeout - Apache's per-read
+ * <p>Apache HttpClient (1.12.0): Spring 7's factory takes only the read timeout - Apache's per-read
  * response timeout - so up to 1.11.0 the connect timeout stayed Apache's own three minutes, past
  * the default send bound, and a blocking connect on a platform thread ignores the send heartbeat's
  * interrupt: the lease lapsed while the connect went on, another relay sent the row, and the first
@@ -29,7 +29,7 @@ import org.springframework.web.client.RestClient;
  * connections. What remains is Apache's: its response timeout counts per read, so a receiver that
  * drips its response can outlast the bound on a platform thread.
  *
- * <p>Three more of Apache's defaults are off on that client (1.11.1), each a 1.11.0 defect for a
+ * <p>Three more of Apache's defaults are off on that client (1.12.0), each a 1.11.0 defect for a
  * consumer with Apache on its classpath: it re-sent a 503 or a 429 once inside the call, so one
  * attempt POSTed twice and the relay's budget never counted the second; it FOLLOWED a 3xx, into a
  * second request booked RELAYED although the receiver never processed the first; and its pool let

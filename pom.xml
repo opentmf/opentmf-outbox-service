@@ -13,7 +13,7 @@
 
   <groupId>org.opentmf.util</groupId>
   <artifactId>opentmf-outbox-service</artifactId>
-  <version>1.11.1-SNAPSHOT</version>
+  <version>1.12.0-SNAPSHOT</version>
   <packaging>jar</packaging>
 
   <name>opentmf-outbox-service</name>
@@ -73,7 +73,7 @@
     <!-- An opentmf library never imports the opentmf-versions BOM (the BOM
          aggregates the libraries — a library importing it would be a cycle in
          spirit and a lockstep coupling in practice). Direct property pin. -->
-    <tmf630-toolkit.version>3.5.2</tmf630-toolkit.version>
+    <tmf630-toolkit.version>3.6.0</tmf630-toolkit.version>
 
     <!-- Non-BOM-managed pins live here so versions:display-property-updates sees them. -->
     <archunit.version>1.5.1</archunit.version>
@@ -183,12 +183,12 @@
       <groupId>io.micrometer</groupId>
       <artifactId>micrometer-core</artifactId>
     </dependency>
-    <!-- The relay span (1.11.1) uses the Observation API directly; micrometer-core brings it too. -->
+    <!-- The relay span (1.12.0) uses the Observation API directly; micrometer-core brings it too. -->
     <dependency>
       <groupId>io.micrometer</groupId>
       <artifactId>micrometer-observation</artifactId>
     </dependency>
-    <!-- The writer stamps the current trace context on a row (1.11.1) through the application's
+    <!-- The writer stamps the current trace context on a row (1.12.0) through the application's
          Tracer and Propagator - optional: a consumer without tracing links none of it. -->
     <dependency>
       <groupId>io.micrometer</groupId>
@@ -273,7 +273,7 @@
       <artifactId>spring-kafka-test</artifactId>
       <scope>test</scope>
     </dependency>
-    <!-- The relay span's proof (1.11.1): a real OpenTelemetry tracer behind Micrometer's handlers,
+    <!-- The relay span's proof (1.12.0): a real OpenTelemetry tracer behind Micrometer's handlers,
          wired by the tests themselves (TestTracing) - no Boot tracing auto-configuration, so no
          other test context traces anything. -->
     <dependency>

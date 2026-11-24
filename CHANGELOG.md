@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.11.1 - 2026-11-12
+## 1.12.0 - 2026-11-24
 
 ### Added
 
@@ -26,15 +26,15 @@
   every newer row - every row for an aggregate not written yet: 250 ms at 1,000,000 rows and
   1.4 s at 5,000,000 on a seven-day table; 0.1 ms with the index. It costs about 80 bytes a row,
   1-6 % on an append's time and up to about twice the write-ahead log per append on a quiet table;
-  the relay's statements keep their plans. The first 1.11.1 start builds it while the service
+  the relay's statements keep their plans. The first 1.12.0 start builds it while the service
   runs (about 10 s at 5,000,000 rows; appends and the relay are not stopped), and the start
   lasts as long as the build: **a start-up probe shorter than the build kills the pod mid-build
   and every restart builds again** - with millions of rows give the probe the time, or apply the
-  two statements out of band first (README "Upgrading to 1.11.1", item 5). Nothing to change
+  two statements out of band first (README "Upgrading to 1.12.0", item 5). Nothing to change
   in a service's code; a changelog run out of band applies the two statements outside a
-  transaction (README "Upgrading to 1.11.1", item 5). **A service that keeps a schema snapshot,
+  transaction (README "Upgrading to 1.12.0", item 5). **A service that keeps a schema snapshot,
   or a list of the changesets it expects, regenerates or extends it with `009-outbox-key-token`
-  and `010-outbox-aggregate-lookup`** (README "Upgrading to 1.11.1", the third lead step). `OutboxAggregateLookupPlanIT` pins the lookup's plan
+  and `010-outbox-aggregate-lookup`** (README "Upgrading to 1.12.0", the third lead step). `OutboxAggregateLookupPlanIT` pins the lookup's plan
   and the relay's on a 1,000,000-row table.
 
 - **The rows the retention prune deletes are counted as each batch commits**
@@ -105,7 +105,7 @@
   the consumer dropped the new event as a duplicate - no error, no lag, nothing in a log (measured
   on PostgreSQL with a real point-in-time recovery: 100 of 100 rows booked after the restore).
   Now the writer mints a random key token per row at booking, and the key is
-  `<service>:outbox:<id>:<key_token>`. Upgrade notes (README "Upgrading to 1.11.1"):
+  `<service>:outbox:<id>:<key_token>`. Upgrade notes (README "Upgrading to 1.12.0"):
   - **schema:** changeset `009-outbox-key-token`, one statement,
     `alter table outbox add column if not exists key_token uuid;` - nullable, no default, no
     rewrite. Nothing to do where the changelog is included by reference. Where it runs out of
@@ -249,6 +249,8 @@
   4.2.0; a consumer's own parent wins at runtime. The library's code is unchanged and uses
   nothing that 4.1 lacks, so the requirement stays Spring Boot 4.1+.
 - sonar-maven-plugin 5.8.0.7211 → 5.9.0.7382 (build only).
+- tmf630-toolkit 3.5.1 → 3.6.0 (an optional dependency, behind the ops endpoints' list
+  filters): its case-insensitive filter operators no longer depend on the JVM's default locale.
 
 ### Build (contributors)
 
@@ -258,8 +260,8 @@
   rewrite each other's `-SNAPSHOT.jar` base file. The jar is unchanged.
 - The local SonarQube token goes only through the `SONAR_TOKEN` environment variable, never as
   `-Dsonar.token` on a command line (pom comment and README).
-- Every dependency and plugin is current (OTMF-OUTBOX-BUMPS-BEFORE-THE-BATCH-1): tmf630-toolkit
-  3.5.2 (an optional dependency) and pitest-maven 1.30.2. The pitest 1.19.6 hold is lifted. PIT
+- Every dependency and plugin is current (OTMF-OUTBOX-BUMPS-BEFORE-THE-BATCH-1): pitest-maven
+  1.30.2 (tmf630-toolkit: see Dependencies). The pitest 1.19.6 hold is lifted. PIT
   now runs without incremental history - from 1.20 it needs the commercial arcmutate plugin, and
   the bare `withHistory` flag fails the run - so every run is a full run. On 1.30.2 the daemon flag
   of the relay's, the metrics' and the ORDERED lane's thread factories is a killed mutant, and a
